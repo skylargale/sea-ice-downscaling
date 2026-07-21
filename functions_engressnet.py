@@ -654,9 +654,20 @@ class UNet(nn.Module):
         # artifact once the domain is wide enough to show several repeats. up3/up2/up1
         # already use this upsample+conv pattern for exactly this reason; final_up was the
         # one decoder stage that didn't.
+        # Two stacked convs (not one) after the upsample: every other decoder stage
+        # (up3/up2/up1) pairs its upsample+conv with a full conv_block (two conv+norm+relu
+        # layers, via dec3/dec2/dec1) for refinement capacity. final_up was left with a single
+        # bare conv, and also does a bigger 4x jump in one step (vs. 2x for the others) --
+        # that capacity mismatch is the likely cause of the accuracy regression seen after
+        # first replacing ConvTranspose2d with a single upsample+conv (see FOSI_tile_fix
+        # results vs. FOSI_land_fix4). This restores refinement capacity while keeping the
+        # smooth bilinear upsample that avoids the tiling artifact.
         self.final_up = nn.Sequential(
             nn.Upsample(scale_factor=4, mode='bilinear', align_corners=False),
             nn.Conv2d(64, 32, 3, padding=1),
+            nn.InstanceNorm2d(32, affine=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, 3, padding=1),
         )
         # High-res land mask is concatenated directly as extra input channels
         # to the final conv, instead of being processed by a separate fusion

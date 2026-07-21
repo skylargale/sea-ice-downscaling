@@ -15,13 +15,14 @@
 #PBS -l select=1:ncpus=16:ngpus=1:mem=64GB:gpu_type=v100
 #PBS -l walltime=06:00:00
 #PBS -j oe
+#PBS -o logs/
 #PBS -m abe
 #PBS -M skycgale@uw.edu
 
-# No -o here on purpose: a fixed log filename would be shared (and clobbered) across
-# concurrently-submitted jobs, e.g. a batch of runs with different TRAIN_YEARS/TEST_YEARS.
-# Omitting -o falls back to PBS's own default, which embeds the job ID
-# (FOSI_nopatches.o<jobid>), so every submission gets its own log file automatically.
+# -o logs/ (trailing slash) keeps PBS's own default filename (FOSI_nopatches.o<jobid>, unique
+# per job so concurrently-submitted jobs in a sweep never clobber each other) but routes it into
+# logs/ instead of dumping it in the project root next to the code. Resolved relative to the
+# submission directory, so logs/ must exist there before qsub runs (it's checked in below).
 
 set -euo pipefail
 
