@@ -1,3 +1,8 @@
 *.nc
 .ipynb_checkpoints/
-*.nc
+__pycache__/
+results/
+saved_figs/
+logs/
+hpo_echo/
+

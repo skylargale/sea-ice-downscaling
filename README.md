@@ -3,86 +3,104 @@
 Deep learning stochastic downscaling of Arctic sea ice thickness (SIT) for regional,
 coastal sea ice. A coarse CESM/reanalysis-forced "low-res" field is downscaled onto a
 high-res target grid with a stochastic UNet trained via an energy-score ("EngressNet")
-loss, targeting the Kivalina/Shishmaref/Kotzebue/Nome coastal region of Alaska.
+loss, targeting the Kivalina/Shishmaref/Kotzebue/Nome/Point Hope coastal region of
+Alaska.
 
-This is research code developed on NCAR HPC (Casper/Derecho), organized as a sequence of
-dated experiment directories rather than a single packaged library. There is no single
-"the code" -- check which directory below is relevant before reading further.
+This is research code developed and run on NCAR HPC (Casper). The repository was
+previously organized as a sequence of dated experiment directories (`Version2`,
+`Version3`, ...); it has been flattened down to this single, current pipeline
+(formerly `Version4`) since that's the only actively-trained-against line.
 
 ## Repository Contents
 
-- **`data_access/`** -- notebooks for pulling raw source data (CORDEX, MESACLIP).
-- **`2d_models/`, `3d_models/`** -- early exploratory notebooks (2D single-timestep and 3D
-  spatiotemporal CNN/UNet experiments) that predate the `Version2+` refactor.
-  `3d_models/build_X_Y_from_HR.ipynb` builds the perfect-model X/Y training pair
-  currently used by `Version4` (FOSI_BGC HR, JRA55-forced, single realization).
-- **`make_plots/`** -- standalone validation/plotting notebooks (SIC spatial/timeseries
-  validation against MESACLIP, CESM tutorial, prescribed-atmosphere checks). Not wired
-  into the training pipeline; run independently against saved output.
-- **`Version2/`** -- a from-scratch, importable-package refactor of the original one-off
-  notebook pipeline (see `Version2/README.md` for the bugs it fixes and why). Kept for
-  reference; not the currently-trained-against line.
-- **`Version3/`** -- the first single-file EngressNet line (`functions_engressnet.py` +
-  `train_engressnet.py` + `hpo_engressnet.py` + a PBS submit script). Kept for
-  reference/reproducibility.
-- **`Version4/`** -- **the current, actively-trained version.** Adds candidate-coastal-point
-  time series, an `eval_data/` dump for re-plotting without re-running the model, and
-  `engressnet_evaluation_plots.ipynb` for notebook-side figure regeneration.
+- **`functions_engressnet.py`** -- all pipeline logic: data loading, land-sea masking
+  (regridded POP `KMT` ocean mask), sliding-window patch extraction (or single
+  sub-domain cropping when patches are disabled), the stochastic residual UNet model,
+  the energy-score training loss, evaluation metrics (MAE/RMSE, coastal MAE/RMSE,
+  IIEE, spread/error), figure generation, and candidate-coastal-point / domain-mean SIT
+  time series output. `run_pipeline()` is the single entry point everything else calls.
+- **`train_engressnet.py`** -- CLI entry point. Parses training/test years, patches vs.
+  single sub-domain, sub-domain bounds, and model/training hyperparameters, then hands
+  off to `run_pipeline()`. Run `python train_engressnet.py --help` for the full set of
+  options.
+- **`submit_engressnet.sh`** -- PBS batch submission wrapper for Casper (`qsub
+  submit_engressnet.sh`). All hyperparameters are overridable at submit time via
+  environment variables, e.g.:
+  ```bash
+  qsub -v TRAIN_YEARS="1980-2005",TEST_YEARS="2006-2014",BETA=0.8,K=20,K_EVAL=20 submit_engressnet.sh
+  ```
+- **`objective_engressnet.py`** -- [ECHO](https://github.com/NCAR/echo-opt) objective
+  for distributed-PBS hyperparameter search over `run_pipeline()` (lr, k, batch_size,
+  latent_channels), optimizing test-set RMSE of the stochastic UNet mean.
+- **`rename_results.py`** -- one-off utility that renames `results/<run>/` folders to
+  be self-describing (mode, train years, test years, job id) from `run_config.json` /
+  `eval_data/meta.json`.
+- **`compare_runs.ipynb`** -- notebook for loading `metrics.csv` across multiple
+  `results/` runs side by side (e.g. comparing a hyperparameter sweep).
+- **`evaluation_plots.ipynb`** -- notebook-side figure regeneration from a saved
+  `eval_data/` dump, without re-running the model.
+- **`process_data/`** -- data-preparation notebooks: `build_X_Y_from_HR.ipynb` builds
+  the perfect-model low-res/high-res training pair from raw FOSI_BGC CICE history
+  files (JRA55-forced, single realization); `cice_wind_rotation_check.ipynb` and
+  `compare_avg_grid_methods.ipynb` are supporting validation notebooks for that build
+  step.
 
-Weight caches produced by xESMF (regridding weight matrices, land-sea masks) are not
-tracked in this repository -- they're large binaries reused across runs and regenerated
-locally on first use (see `.gitignore`). Likewise, training/intermediate data (the FOSI
-HR X/Y pair, MESACLIP perfect-model files, etc.) live on NCAR GLADE scratch space, not
-in this repo.
+Large run outputs are not tracked in this repository (see `.gitignore`):
+`results/` (per-run model checkpoints, `eval_data/` dumps, figures, `metrics.csv`),
+`hpo_echo/` (ECHO hyperparameter-search trial logs/results), `saved_figs/`, `logs/`
+(PBS stdout/stderr), and `__pycache__/`. These live on NCAR GLADE scratch/work space
+alongside the code. Likewise, training/intermediate data (the FOSI HR X/Y pair) and
+xESMF regridding weight caches are not tracked -- they're large binaries regenerated
+or reused locally on first use.
 
 ## Setup
 
-All code assumes a conda environment with `torch`, `pop_tools`, `xesmf`, `numpy`,
-`xarray`, `matplotlib`, `zarr`, and `pyproj` available (see `Version2/requirements.txt`).
-Regridding depends on `pop_tools`/`xesmf`, which in turn expect NCAR-internal grid/data
-paths (`/glade/...`) -- this code is not expected to run outside NCAR HPC without
-adapting those paths.
+Assumes a conda environment with `torch`, `pop_tools`, `xesmf`, `numpy`, `xarray`,
+`matplotlib`, and `cartopy` available. Regridding depends on `pop_tools`/`xesmf`, which
+in turn expect NCAR-internal grid/data paths (`/glade/...`) -- this code is not
+expected to run outside NCAR HPC without adapting those paths (see the `DEFAULT_*`
+constants near the top of `functions_engressnet.py`).
 
-Train the current pipeline:
+Train directly:
 
 ```bash
-cd Version4
 python train_engressnet.py --train-years 1958-2000 --test-years 2001-2022 --patches
 ```
 
-or submit as a PBS batch job via `Version4/submit_engressnet.sh`. See the docstrings in
-`Version4/functions_engressnet.py` and `Version4/train_engressnet.py --help` for the
-full set of options (sub-domain vs. patch extraction, hyperparameters, splicing in
-SSP/RCP8.5 continuation data for `Version3`, etc.).
-
-Hyperparameter search (Optuna, reuses the same pipeline):
+or on a single lat/lon sub-domain (also produces a domain-mean SIT time series and the
+candidate-coastal-point time series, which are skipped under `--patches`):
 
 ```bash
-cd Version4
-python hpo_engressnet.py --train-years 1980-2005 --test-years 2006-2014 --patches --n-trials 30
+python train_engressnet.py --train-years 1980-2005 --test-years 2006-2014 \
+    --no-patches --lat-min 60 --lat-max 75 --lon-min -182 --lon-max -151
 ```
 
-`Version2` has an actual test suite (`Version2/functions/test_pipeline_logic.py`, run via
-`pytest`) covering pipeline logic that doesn't need GLADE/`pop_tools`/`xesmf`/GPU access.
+or submit as a PBS batch job via `submit_engressnet.sh`.
+
+Hyperparameter search via ECHO (distributed across PBS jobs):
+
+```bash
+echo-run objective_engressnet.py  # see objective_engressnet.py / ECHO docs for the config file it expects
+```
 
 ## Data Availability
 
-Source data (CESM-LE, MESACLIP, FOSI_BGC HR) is accessed from NCAR's GLADE/campaign
-storage and is not distributed with this repository. `data_access/` documents how the
-raw CORDEX/MESACLIP inputs are pulled; `3d_models/build_X_Y_from_HR.ipynb` documents how
-the current FOSI-based perfect-model training pair is built from raw CICE history files.
+Source data (FOSI_BGC HR, JRA55-forced) is accessed from NCAR's GLADE/campaign storage
+and is not distributed with this repository. `process_data/build_X_Y_from_HR.ipynb`
+documents how the perfect-model training pair is built from raw CICE history files.
 
 ## Notes
 
-- When working on "the" training pipeline with no version specified, assume `Version4`.
-  `Version3` and `Version2` are kept for reference/reproducibility, not active
-  development.
-- `Version2/README.md` documents several real bugs found and fixed during that refactor
-  (undefined regridders, hardcoded positional channel indices, longitude-seam bugs,
-  silent time-misalignment, `DataParallel`-only `.module` access) -- worth reading before
-  assuming any given behavior in the original notebook pipeline was intentional.
+- The model predicts entirely in normalized (z-scored) space; de-normalization
+  (`* Y_std + Y_mean`) and land-masking of predictions both happen downstream, in
+  `run_pipeline`, on the physical-space tensors -- not inside the model's `forward()`.
+  Hard-zeroing land inside the model instead is a real (previously hit) regression:
+  normalized zero is not physical zero.
+- IIEE (Integrated Ice Edge Error, Goessling et al. 2016) is computed ocean-only.
+  Including land inflates it spuriously, since de-normalizing truth doesn't round-trip
+  land's normalized ~0 back to an exact `0.0`.
 
 ## Citation
 
-If you use this code, please cite this repository. A formal citation (paper/DOI) will be
-added here once available.
+If you use this code, please cite this repository. A formal citation (paper/DOI) will
+be added here once available.

@@ -11,13 +11,13 @@ the single entry point both scripts call, so the full pipeline only lives
 in one place.
 """
 
+import datetime
+import json
 import os
+import pickle
 import re
 import warnings
-
 import matplotlib
-matplotlib.use("Agg")
-
 import numpy as np
 import pandas as pd
 import torch
@@ -32,41 +32,80 @@ import cartopy.feature as cfeature
 import matplotlib.path as mpath
 import matplotlib.pyplot as plt
 
+matplotlib.use("Agg")
 warnings.filterwarnings("ignore", message=r"Latitude is outside of \[-90, 90\]")
 
 # ==============================================================
 # Defaults (all overridable via the config object passed to run_pipeline)
 # ==============================================================
 
-DEFAULT_DATA_DIR = "/glade/derecho/scratch/skygale/Downscaling_Data/Kivalina"
-DEFAULT_X_PATH = os.path.join(DEFAULT_DATA_DIR, "X_perfmodexp_interp.nc")
-DEFAULT_Y_PATH = os.path.join(DEFAULT_DATA_DIR, "Y_perfmodexp.nc")
-
-# Future/SSP-scenario continuation of the same 10-member ensemble
-# (2006-02 to 2101-01), same grid/channel layout as the historical files
-# above. Pass config.x_path_future/y_path_future (or the submit script's
-# X_PATH_FUTURE/Y_PATH_FUTURE) to splice this onto the end of the
-# historical time axis in run_pipeline() before any train/test year split,
-# so --test-years can reach into the future (e.g. "2020-2040") or straddle
-# the 2006 historical/SSP boundary (e.g. "2000-2020"). Left unset, only the
-# historical file is used, same as before.
-DEFAULT_X_PATH_SSP = os.path.join(DEFAULT_DATA_DIR, "X_perfmodexp_SSP_interp.nc")
-DEFAULT_Y_PATH_SSP = os.path.join(DEFAULT_DATA_DIR, "Y_perfmodexp_SSP.nc")
-
-# NOTE: train_engressnet.py / submit_engressnet.sh now live in a different
-# folder than weighted_grids/. Regridding weight files (expensive to
-# compute with xesmf) are cached here so repeated jobs -- including every
-# HPO trial -- reuse them instead of recomputing from scratch each time.
+DEFAULT_DATA_DIR = "/glade/derecho/scratch/skygale/Downscaling_Data"
+DEFAULT_X_PATH = os.path.join(DEFAULT_DATA_DIR, "X_FOSI_HR_JRA55_interp.nc")
+DEFAULT_Y_PATH = os.path.join(DEFAULT_DATA_DIR, "Y_FOSI_HR_JRA55.nc")
 DEFAULT_WEIGHTED_GRIDS_DIR = "/glade/work/skygale/_projects/SeaIceDownscaling/weighted_grids"
+DEFAULT_RESULTS_DIR = "/glade/work/skygale/_projects/SeaIceDownscaling/Version4/results"
 
 DEFAULT_BBOX = {"lon_min": -190, "lon_max": -140, "lat_min": 60, "lat_max": 80}
 DEFAULT_BBOX_REGRID = {"lon_min": -200, "lon_max": -130, "lat_min": 55, "lat_max": 85}
 KIVALINA_LAT = 67.7269
 KIVALINA_LON_360 = -164.5333 % 360
 
+# Coastal-community "candidate points" for point time series (in addition
+# to the domain-mean time series). Lon stored in [0, 360) to match
+# llon/hlon as loaded from the .nc files.
+CANDIDATE_POINTS = {
+    "Kivalina": {"lat": KIVALINA_LAT, "lon": KIVALINA_LON_360},
+    "Shishmaref": {"lat": 66.2567, "lon": -166.0719 % 360},
+    "Kotzebue": {"lat": 66.8983, "lon": -162.5967 % 360},
+    "Nome": {"lat": 64.5011, "lon": -165.4064 % 360},
+    "Point Hope": {"lat": 68.3415, "lon": -166.7578 % 360},
+}
+
 DEFAULT_CONTEXT_SIZE = (16, 24)
 DEFAULT_TARGET_SIZE = (8, 12)
 DEFAULT_STRIDE = 4
+
+
+def save_run_config(config):
+    """
+    Write the full run config to <output_dir>/run_config.json (machine-
+    readable, everything needed to reproduce the run) and a short
+    <output_dir>/description.txt (human-readable one-glance summary),
+    so a results/ folder is self-describing regardless of what its
+    directory name happens to be. Called at the very start of
+    run_pipeline(), before any data loading, so it's written even if the
+    run later crashes.
+    """
+    cfg_dict = dict(vars(config))
+    cfg_dict["pbs_jobid"] = os.environ.get("PBS_JOBID")
+    cfg_dict["pbs_jobname"] = os.environ.get("PBS_JOBNAME")
+    cfg_dict["written_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+
+    with open(os.path.join(config.output_dir, "run_config.json"), "w") as f:
+        json.dump(cfg_dict, f, indent=2, default=str)
+
+    if config.use_patches:
+        domain_desc = f"patches (context {tuple(config.context_size)}, target {tuple(config.target_size)}, stride {config.stride})"
+    else:
+        sd = config.subdomain
+        domain_desc = f"no-patches sub-domain (lat {sd['lat_min']} to {sd['lat_max']}, lon {sd['lon_min']} to {sd['lon_max']})"
+
+    train_desc = ",".join(str(y) for y in config.train_years) if config.train_years else f"random {config.train_frac:.0%} split"
+    test_desc = ",".join(str(y) for y in config.test_years) if config.test_years else f"random {1 - config.train_frac:.0%} split"
+
+    lines = [
+        f"X data: {config.x_path}",
+        f"Y data: {config.y_path}",
+        f"Train years: {train_desc}",
+        f"Test years: {test_desc}",
+        f"Domain: {domain_desc}",
+        f"k (train) / k_eval: {config.k} / {config.k_eval}",
+        f"num_epochs: {config.num_epochs}   batch_size: {config.batch_size}   lr: {config.lr}",
+        f"PBS job: {cfg_dict['pbs_jobname']} ({cfg_dict['pbs_jobid']})",
+        f"Written: {cfg_dict['written_at']}",
+    ]
+    with open(os.path.join(config.output_dir, "description.txt"), "w") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 def save_fig(fig, output_dir, name, dpi=200):
@@ -154,24 +193,6 @@ def split_train_test(X, Y, time_coord, train_years, test_years, train_frac, seed
             raise ValueError("No timestamps in the data match the requested train_years.")
         if not test_mask_t.any():
             raise ValueError("No timestamps in the data match the requested test_years.")
-
-        # A *partial* miss (some requested years present, some not) doesn't
-        # trip the .any() checks above and would otherwise silently train/test
-        # on fewer years than asked for -- most likely because a requested
-        # year falls in the SSP/future period but x_path_future/y_path_future
-        # wasn't supplied to splice it in. Warn explicitly rather than let it
-        # pass quietly.
-        available_years = set(time_coord.dt.year.values.tolist())
-        for label, years in (("train_years", train_years), ("test_years", test_years)):
-            missing = sorted(set(years) - available_years)
-            if missing:
-                warnings.warn(
-                    f"{label} requested {missing}, which have no matching timestamps in the "
-                    f"loaded data (loaded data covers {min(available_years)}-{max(available_years)}). "
-                    "If these years fall in the future/SSP period, check that "
-                    "x_path_future/y_path_future were supplied."
-                )
-
         if np.any(train_mask_t & test_mask_t):
             n_overlap = int(np.sum(train_mask_t & test_mask_t))
             raise ValueError(f"train_years and test_years overlap at {n_overlap} timestamps; they must be disjoint.")
@@ -216,12 +237,23 @@ def split_train_test(X, Y, time_coord, train_years, test_years, train_frac, seed
 # Land-sea mask
 # ==============================================================
 
-def build_land_sea_mask(hlat, hlon, bbox, bbox_regrid, weighted_grids_dir):
+def build_land_sea_mask(hlat, hlon, bbox, bbox_regrid, weighted_grids_dir, land_threshold=0.1):
     """
     Regrid the native POP ocean/land mask onto the high-res (Y) target grid
     and clip it to bbox. Regridding weights are cached in
     weighted_grids_dir (keyed by bbox) so repeated jobs don't recompute the
     xesmf weights every run.
+
+    land_threshold: a destination cell is called "land" only if its regridded ocean
+        fraction is below this value (default 0.1, i.e. >90% land). Originally a 0.5
+        majority-rule threshold, tightened because that let mixed coastal cells
+        (e.g. 40% ocean / 60% land) get classified as land, even though they still
+        carry real, nonzero truth ice signal from their ocean fraction -- hard-zeroing
+        the model's predictions there (see run_pipeline's `ocean_test` masking) then
+        disagreed with that residual truth signal on every such cell, inflating IIEE
+        (an ice presence/absence metric) even though domain-wide accuracy was fine.
+        Lowering the threshold reclassifies most of those mixed cells as ocean, where
+        the model is allowed to predict ice and isn't forced to zero.
 
     Returns a (1, 1, H, W) float32 torch tensor: 1 = land, 0 = ocean.
     """
@@ -265,7 +297,7 @@ def build_land_sea_mask(hlat, hlon, bbox, bbox_regrid, weighted_grids_dir):
     )
 
     ocean_frac_reg = regridder_ice_to_0p1deg(ocean_frac_src)
-    land_mask = (ocean_frac_reg < 0.5).astype(np.float32)  # 1 = land, 0 = ocean
+    land_mask = (ocean_frac_reg < land_threshold).astype(np.float32)  # 1 = land, 0 = ocean
 
     land_mask = land_mask.sel(
         lat=slice(bbox["lat_min"], bbox["lat_max"]),
@@ -279,24 +311,32 @@ def build_land_sea_mask(hlat, hlon, bbox, bbox_regrid, weighted_grids_dir):
 # Projection helper + domain diagnostic figure
 # ==============================================================
 
+def rounded_boundary_path(proj, lon_min, lon_max, lat_min, lat_max, n=50):
+    """Quadrilateral Axes-boundary path (in projected coords) tracing the given lon/lat box.
+    Under a polar projection this comes out curved along the lat edges, so panels clipped to
+    it read as "map-shaped" rather than a plain rectangular Axes frame."""
+    lons = np.concatenate([
+        np.linspace(lon_min, lon_max, n),
+        np.full(n, lon_max),
+        np.linspace(lon_max, lon_min, n),
+        np.full(n, lon_min),
+    ])
+    lats = np.concatenate([
+        np.full(n, lat_min),
+        np.linspace(lat_min, lat_max, n),
+        np.full(n, lat_max),
+        np.linspace(lat_max, lat_min, n),
+    ])
+    boundary_pts = proj.transform_points(ccrs.PlateCarree(), lons, lats)
+    return mpath.Path(boundary_pts[:, :2])
+
+
 def make_polar_proj(bbox, n=50):
     central_lon = (bbox["lon_min"] + bbox["lon_max"]) / 2
     proj = ccrs.NorthPolarStereo(central_longitude=central_lon)
-
-    lons = np.concatenate([
-        np.linspace(bbox["lon_min"], bbox["lon_max"], n),
-        np.full(n, bbox["lon_max"]),
-        np.linspace(bbox["lon_max"], bbox["lon_min"], n),
-        np.full(n, bbox["lon_min"]),
-    ])
-    lats = np.concatenate([
-        np.full(n, bbox["lat_min"]),
-        np.linspace(bbox["lat_min"], bbox["lat_max"], n),
-        np.full(n, bbox["lat_max"]),
-        np.linspace(bbox["lat_max"], bbox["lat_min"], n),
-    ])
-    boundary_pts = proj.transform_points(ccrs.PlateCarree(), lons, lats)
-    boundary_path = mpath.Path(boundary_pts[:, :2])
+    boundary_path = rounded_boundary_path(
+        proj, bbox["lon_min"], bbox["lon_max"], bbox["lat_min"], bbox["lat_max"], n
+    )
     return proj, boundary_path, central_lon
 
 
@@ -305,7 +345,11 @@ def style_polar_ax(ax, proj, boundary_path, bbox, lon_=None, lat_=None, pad_frac
     styling for every panel plotted on the NorthPolarStereo domain.
 
     If lon_/lat_ are given, the extent is zoomed to that panel's actual data
-    bounds (with a small padding margin) instead of the full bbox domain."""
+    bounds (with a small padding margin) instead of the full bbox domain --
+    the boundary is then recomputed for that same zoomed box (rather than
+    reusing `boundary_path`, which is sized for the full `bbox` and would
+    fall outside the zoomed view, leaving the panel with matplotlib's
+    default square Axes frame instead of the intended map-shaped one)."""
     lon_min = bbox["lon_min"] % 360
     lon_max = bbox["lon_max"] % 360
 
@@ -317,11 +361,15 @@ def style_polar_ax(ax, proj, boundary_path, bbox, lon_=None, lat_=None, pad_frac
         la0, la1 = float(np.min(lat_)), float(np.max(lat_))
         pad_lo = (lo1 - lo0) * pad_frac or 0.5
         pad_la = (la1 - la0) * pad_frac or 0.5
-        ax.set_extent([lo0 - pad_lo, lo1 + pad_lo, la0 - pad_la, la1 + pad_la], crs=ccrs.PlateCarree())
+        ext_lo0, ext_lo1 = lo0 - pad_lo, lo1 + pad_lo
+        ext_la0, ext_la1 = la0 - pad_la, la1 + pad_la
+        ax.set_extent([ext_lo0, ext_lo1, ext_la0, ext_la1], crs=ccrs.PlateCarree())
+        panel_boundary = rounded_boundary_path(proj, ext_lo0, ext_lo1, ext_la0, ext_la1)
     else:
         ax.set_extent([lon_min, lon_max, bbox["lat_min"], bbox["lat_max"]], crs=ccrs.PlateCarree())
+        panel_boundary = boundary_path
 
-    ax.set_boundary(boundary_path, transform=proj)
+    ax.set_boundary(panel_boundary, transform=proj)
     ax.plot(KIVALINA_LON_360, KIVALINA_LAT, marker="*", color="red", markersize=10, transform=ccrs.PlateCarree())
     ax.text(KIVALINA_LON_360 + 1, KIVALINA_LAT + 0.35, "Kivalina", color="red", fontsize=7, transform=ccrs.PlateCarree())
     ax.gridlines(draw_labels=False, linestyle="--", alpha=0.4)
@@ -375,8 +423,7 @@ def plot_domain_diagnostic(output_dir, bbox, llat, llon, hlat, hlon, land_mask, 
 # Patch extraction (sliding-window) and single sub-domain cropping
 # ==============================================================
 
-def extract_patches(X, Y, land_mask, context_size, target_size, stride,
-                     llon=None, llat=None, hlon=None, hlat=None):
+def extract_patches(X, Y, land_mask, context_size, target_size, stride, llon=None, llat=None, hlon=None, hlat=None):
     """
     llon/llat/hlon/hlat are optional 1D coordinate arrays for the low-res (X)
     and high-res (Y) grids. When supplied, the function additionally returns
@@ -505,6 +552,20 @@ def extract_full_domain(X, Y, land_mask, llon, llat, hlon, hlat, subdomain):
             "Widen the sub-domain, or nudge lat/lon bounds so the low-res "
             "crop lands on a multiple of 8 in both directions."
         )
+    # Additionally, the bottleneck (H/8, W/8) must have MORE THAN ONE total
+    # spatial element, or InstanceNorm2d inside enc4/bottleneck raises
+    # "Expected more than 1 spatial element when training" -- this bites
+    # exactly the (8, 8) case (bottleneck collapses to a single 1x1 pixel),
+    # which the check above alone doesn't catch.
+    if (lr_h // 8) * (lr_w // 8) <= 1:
+        raise ValueError(
+            f"Sub-domain {subdomain} crops to a low-res grid of shape "
+            f"({lr_h}, {lr_w}), whose bottleneck ({lr_h // 8}, {lr_w // 8}) has only "
+            "one spatial element -- InstanceNorm2d can't compute a variance over a "
+            "single point and will raise during training. Widen at least one "
+            "dimension to 16+ (e.g. keep H=8 but use W=16) so the bottleneck has "
+            "more than one pixel."
+        )
 
     X_crop = X[:, :, li0:li1, lj0:lj1]
     Y_crop = Y[:, :, hi0:hi1, hj0:hj1]
@@ -586,7 +647,17 @@ class UNet(nn.Module):
 
         # Output
         self.mask_channels = mask_channels
-        self.final_up = nn.ConvTranspose2d(64, 32, kernel_size=4, stride=4)
+        # Upsample-then-conv instead of a ConvTranspose2d(kernel_size=stride=4): with
+        # kernel_size == stride, every 4x4 output block is generated independently from a
+        # single input pixel through the same shared kernel, so any asymmetry the kernel
+        # learns repeats identically in every block -- a visible tiling/checkerboard
+        # artifact once the domain is wide enough to show several repeats. up3/up2/up1
+        # already use this upsample+conv pattern for exactly this reason; final_up was the
+        # one decoder stage that didn't.
+        self.final_up = nn.Sequential(
+            nn.Upsample(scale_factor=4, mode='bilinear', align_corners=False),
+            nn.Conv2d(64, 32, 3, padding=1),
+        )
         # High-res land mask is concatenated directly as extra input channels
         # to the final conv, instead of being processed by a separate fusion
         # head (no more mask_fuse conv/ReLU block in between).
@@ -650,9 +721,12 @@ class UNet(nn.Module):
         out = self.out_conv(out)
         out = F.interpolate(out, size=up_size, mode="bilinear", align_corners=False)
 
-        # Residual prediction
+        # Residual prediction. NOTE: this is in normalized (z-scored) space, like
+        # everything else the model sees -- 0 here is NOT physical zero SIT, it's
+        # whatever the training-set mean maps to after de-normalization
+        # (`* Y_std + Y_mean`, done later in run_pipeline). Hard-zeroing land has to
+        # happen after that de-normalization, on the physical-space tensors, not here.
         base = F.interpolate(x[:, 0:1], size=up_size, mode="bilinear", align_corners=False)
-
         return base + out
 
 
@@ -660,13 +734,17 @@ class UNet(nn.Module):
 # Losses
 # ==============================================================
 
-def energy_loss(preds, y, beta=1.0):
+def energy_loss(preds, y, weight=None, beta=1.0):
     """
-    Energy-score loss used for stochastic prediction.
+    Energy-score loss used for stochastic prediction, optionally per-pixel weighted.
 
     Args:
         preds (torch.Tensor): Ensemble predictions of shape [B, K, C, H, W].
         y (torch.Tensor): Ground-truth targets of shape [B, C, H, W].
+        weight: optional non-negative weight map, either (H, W) (shared across the
+            batch) or (B, H, W) (per-sample, e.g. when patches carry different land
+            masks). None = uniform, identical to the original unweighted loss. Assumes
+            a single-channel target (C == 1, true for SIT-only Y here).
         beta (float, optional): Power parameter of the energy score. Default is 1.
 
     Returns:
@@ -677,6 +755,20 @@ def energy_loss(preds, y, beta=1.0):
     flat_preds = preds.reshape(B, K_, -1)
     flat_y = y.reshape(B, 1, -1)
 
+    if weight is not None:
+        assert C == 1, "per-pixel `weight` assumes a single-channel target (Y is SIT-only)."
+        # sqrt(weight) rescaling turns a weighted L2 distance into a plain L2 distance of
+        # the rescaled vectors: ||sqrt(w)*(a-b)||_2 == sqrt(sum(w*(a-b)**2)), so the
+        # existing (efficient) vector_norm/cdist calls below stay exact and unchanged.
+        w = torch.as_tensor(weight, dtype=preds.dtype, device=preds.device)
+        sqrt_w = torch.sqrt(w).reshape(*w.shape[:-2], H * W)
+        if sqrt_w.dim() == 1:
+            flat_preds = flat_preds * sqrt_w
+            flat_y = flat_y * sqrt_w
+        else:  # (B, H*W) per-sample -> broadcast over the K/ensemble axis
+            flat_preds = flat_preds * sqrt_w.unsqueeze(1)
+            flat_y = flat_y * sqrt_w.unsqueeze(1)
+
     EPS = 0.0 if float(beta).is_integer() else 1e-5
 
     s1 = (torch.linalg.vector_norm(flat_preds - flat_y, ord=2, dim=2) + EPS).pow(beta).mean()
@@ -685,11 +777,51 @@ def energy_loss(preds, y, beta=1.0):
     return s1 - 0.5 * s2
 
 
+def coastal_band_mask(land_mask, coastal_width=5):
+    """
+    Boolean (..., H, W) mask: True for ocean cells within `coastal_width` pixels of land,
+    False for land cells and for open-ocean cells farther from land. Dilation is done via
+    max-pool on the binary land mask -- a dependency-free stand-in for
+    scipy.ndimage.binary_dilation. `land_mask` can carry leading batch dims (e.g. (N, H, W)
+    for per-sample masks that vary across patches).
+    """
+    land = torch.as_tensor(land_mask, dtype=torch.float32)
+    lead_shape = land.shape[:-2]
+    H, W = land.shape[-2:]
+    land_dilated = F.max_pool2d(
+        land.reshape(-1, 1, H, W), kernel_size=2 * coastal_width + 1, stride=1, padding=coastal_width
+    )
+    land_dilated = land_dilated.reshape(*lead_shape, H, W)
+    return (land_dilated > 0.5) & (land <= 0.5)
+
+
+def build_coastal_weight_map(land_mask, coastal_width=5, coastal_boost=2.0):
+    """
+    Per-pixel loss weight: 1 everywhere by default, boosted to `coastal_boost` over ocean
+    cells within `coastal_width` pixels of land (see `coastal_band_mask`). Supports the
+    same leading batch dims as `coastal_band_mask`.
+
+    Land is deliberately NOT zeroed out here. An earlier version weighted land at 0 (on
+    the reasoning that it's ~constant and just dilutes the gradient), but land is over
+    half of this domain, and the model's residual architecture (base + correction, with
+    no other supervision over land) has nothing else forcing its land predictions toward
+    the correct ~0 -- excluding land from the loss let those predictions drift to
+    physically nonsensical values (~0.4m mean, vs. ~0.02m when land stays in the loss),
+    which swamped every domain-wide metric even though ocean-only accuracy genuinely
+    improved. Keeping land at the baseline weight of 1 preserves that ocean/coastal gain
+    without breaking the rest of the domain.
+    """
+    land = torch.as_tensor(land_mask, dtype=torch.float32)
+    band = coastal_band_mask(land, coastal_width=coastal_width)
+    return torch.where(band, torch.full_like(land, coastal_boost), torch.ones_like(land))
+
+
 # ==============================================================
 # Train / evaluate
 # ==============================================================
 
-def train_model(model, optimizer, X_train, Y_train, mask_train, device, K, num_epochs, batch_size, verbose=True):
+def train_model(model, optimizer, X_train, Y_train, mask_train, device, K, num_epochs, batch_size,
+                 coastal_width=5, coastal_boost=2.0, beta=1.0, verbose=True):
     loss_array = []
 
     for epoch in range(num_epochs):
@@ -712,7 +844,14 @@ def train_model(model, optimizer, X_train, Y_train, mask_train, device, K, num_e
             preds = model(X_rep, up_size=Y_batch.shape[-2:], mask=mask_rep)
             preds = preds.reshape(B, K, preds.shape[1], preds.shape[2], preds.shape[3])
 
-            loss = energy_loss(preds, Y_batch)
+            # Per-sample loss weight: land at baseline weight 1, coastal ocean band
+            # up-weighted -- built fresh per batch since mask_batch can vary across
+            # samples (sliding-window patches each cover a different piece of coastline).
+            # Land is now also hard-masked to exactly 0 in the model's forward() itself
+            # (see UNet.forward), so its weight here mostly just keeps its near-zero loss
+            # contribution from being silently dropped.
+            coastal_weight = build_coastal_weight_map(mask_batch[:, 0], coastal_width, coastal_boost)
+            loss = energy_loss(preds, Y_batch, weight=coastal_weight, beta=beta)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -863,57 +1002,79 @@ def ssim(pred, truth, window_size=11, sigma=1.5, data_range=None):
     return ssim_map.mean().item()
 
 
-def ice_edge_error(pred, truth, threshold=0.0):
+def ice_edge_error(pred, truth, threshold=0.0, mask_bool=None):
     """
     Integrated Ice Edge Error (IIEE; Goessling et al., 2016), adapted for a
-    thickness field: fraction of domain pixels where the predicted and true
+    thickness field: fraction of ocean pixels where the predicted and true
     binary ice masks (SIT > threshold) disagree. Reported here as a
-    fraction of domain pixels (0 = perfect edge placement); the literature
-    version weights by physical cell area, which would need the POP grid's
-    TAREA regridded the same way as land_mask.
+    fraction of ocean-domain pixels (0 = perfect edge placement); the
+    literature version weights by physical cell area, which would need the
+    POP grid's TAREA regridded the same way as land_mask.
+
+    mask_bool (N, H, W), optional: restrict to these cells (typically "not
+    land"). IIEE is conceptually an ocean-only diagnostic in the literature.
+    Without this, land gets included too, and de-normalizing Y_test_phys
+    (`* Y_std + Y_mean`) doesn't round-trip land's normalized ~0 back to an
+    exact float32 0.0 -- that leftover ~1e-6-scale noise is still ">
+    threshold", so it reads as "ice truth present" over virtually all of
+    land, while the model's hard-zeroed land predictions read as "ice
+    absent". That mismatched practically every land cell and inflated IIEE
+    by roughly the land fraction of the domain, even though nothing was
+    physically wrong with either the truth or the prediction.
     """
-    ice_pred = (pred > threshold).float()
-    ice_truth = (truth > threshold).float()
-    overestimate = (ice_pred * (1 - ice_truth)).sum()
-    underestimate = ((1 - ice_pred) * ice_truth).sum()
-    return ((overestimate + underestimate) / torch.numel(pred)).item()
+    ice_pred = pred[:, 0] > threshold
+    ice_truth = truth[:, 0] > threshold
+    if mask_bool is not None:
+        ice_pred = ice_pred[mask_bool]
+        ice_truth = ice_truth[mask_bool]
+    overestimate = (ice_pred & ~ice_truth).sum()
+    underestimate = (~ice_pred & ice_truth).sum()
+    return ((overestimate + underestimate).float() / ice_pred.numel()).item()
 
 
-def compute_metrics_table(Y_base_phys, Y_pred_det_phys, Y_pred_phys, Y_spread_phys, Y_test_phys):
-    metrics = [
-        {
-            "Method": "Bilinear",
-            "MAE": mae(Y_base_phys, Y_test_phys),
-            "RMSE": rmse(Y_base_phys, Y_test_phys),
-            "Bias": bias(Y_base_phys, Y_test_phys),
-            "Grad MAE": grad_mae(Y_base_phys, Y_test_phys),
-            "Pattern Corr": pattern_corr(Y_base_phys, Y_test_phys),
-            "SSIM": ssim(Y_base_phys, Y_test_phys),
-            "IIEE": ice_edge_error(Y_base_phys, Y_test_phys),
-            "Spread/Error": np.nan,
-        }, {
-            "Method": "Deterministic UNet",
-            "MAE": mae(Y_pred_det_phys, Y_test_phys),
-            "RMSE": rmse(Y_pred_det_phys, Y_test_phys),
-            "Bias": bias(Y_pred_det_phys, Y_test_phys),
-            "Grad MAE": grad_mae(Y_pred_det_phys, Y_test_phys),
-            "Pattern Corr": pattern_corr(Y_pred_det_phys, Y_test_phys),
-            "SSIM": ssim(Y_pred_det_phys, Y_test_phys),
-            "IIEE": ice_edge_error(Y_pred_det_phys, Y_test_phys),
-            "Spread/Error": np.nan,
-        }, {
-            "Method": "Stochastic UNet Mean",
-            "MAE": mae(Y_pred_phys, Y_test_phys),
-            "RMSE": rmse(Y_pred_phys, Y_test_phys),
-            "Bias": bias(Y_pred_phys, Y_test_phys),
-            "Grad MAE": grad_mae(Y_pred_phys, Y_test_phys),
-            "Pattern Corr": pattern_corr(Y_pred_phys, Y_test_phys),
-            "SSIM": ssim(Y_pred_phys, Y_test_phys),
-            "IIEE": ice_edge_error(Y_pred_phys, Y_test_phys),
-            "Spread/Error": spread_skill_ratio(Y_pred_phys, Y_spread_phys, Y_test_phys),
-        }
-    ]
-    return pd.DataFrame(metrics).round(4)
+def masked_mae(pred, truth, mask_bool):
+    """MAE over channel 0 (SIT), restricted to cells where mask_bool (N, H, W) is True."""
+    sel = torch.abs(pred[:, 0] - truth[:, 0])[mask_bool]
+    return sel.mean().item() if sel.numel() > 0 else float("nan")
+
+
+def masked_rmse(pred, truth, mask_bool):
+    """RMSE over channel 0 (SIT), restricted to cells where mask_bool (N, H, W) is True."""
+    sel = ((pred[:, 0] - truth[:, 0]) ** 2)[mask_bool]
+    return torch.sqrt(sel.mean()).item() if sel.numel() > 0 else float("nan")
+
+
+def compute_metrics_table(Y_base_phys, Y_pred_det_phys, Y_pred_phys, Y_spread_phys, Y_test_phys,
+                           mask_test=None, coastal_width=5):
+    """
+    Per-method metrics table (Bilinear / Deterministic UNet / Stochastic UNet Mean).
+
+    If `mask_test` (N, C_mask, H, W) is given, also reports "Coastal MAE"/"Coastal RMSE" --
+    the same MAE/RMSE but restricted to ocean cells within `coastal_width` pixels of land
+    (per-sample, via `coastal_band_mask`, so this works whether every test sample shares
+    one land mask [--no-patches] or each has its own [--patches, sliding-window tiles]).
+    """
+    coastal_band = coastal_band_mask(mask_test[:, 0], coastal_width=coastal_width) if mask_test is not None else None
+    ocean_bool = (mask_test[:, 0] <= 0.5) if mask_test is not None else None
+
+    rows = []
+    for label, pred in [
+        ("Bilinear", Y_base_phys), ("Deterministic UNet", Y_pred_det_phys), ("Stochastic UNet Mean", Y_pred_phys),
+    ]:
+        rows.append({
+            "Method": label,
+            "MAE": mae(pred, Y_test_phys),
+            "RMSE": rmse(pred, Y_test_phys),
+            "Bias": bias(pred, Y_test_phys),
+            "Grad MAE": grad_mae(pred, Y_test_phys),
+            "Pattern Corr": pattern_corr(pred, Y_test_phys),
+            "SSIM": ssim(pred, Y_test_phys),
+            "IIEE": ice_edge_error(pred, Y_test_phys, mask_bool=ocean_bool),
+            "Coastal MAE": masked_mae(pred, Y_test_phys, coastal_band) if coastal_band is not None else np.nan,
+            "Coastal RMSE": masked_rmse(pred, Y_test_phys, coastal_band) if coastal_band is not None else np.nan,
+            "Spread/Error": spread_skill_ratio(Y_pred_phys, Y_spread_phys, Y_test_phys) if label == "Stochastic UNet Mean" else np.nan,
+        })
+    return pd.DataFrame(rows).round(4)
 
 
 # ==============================================================
@@ -970,6 +1131,217 @@ def compute_domain_timeseries(Y_pred_phys, Y_pred_det_phys, Y_base_phys, Y_test_
     save_fig(fig, output_dir, "sit_timeseries.png")
 
     return df
+
+
+# ==============================================================
+# Candidate-point (coastal community) time series
+# ==============================================================
+
+def nearest_grid_index(lat_grid, lon_grid, point_lat, point_lon_360, land_mask_hw=None):
+    """
+    Nearest-neighbor (iy, ix) index into a rectilinear (lat, lon) grid for a
+    single point. lon_grid and point_lon_360 must both be in [0, 360)
+    convention (matches hlon/llon as loaded from the .nc files).
+
+    Uses a simple equirectangular approximation (great for picking the
+    nearest of a handful of nearby grid cells at these latitudes; not meant
+    for precise geodesic distance work). Returns (iy, ix, approx_dist_km).
+
+    If `land_mask_hw` ((H, W); 1 = land, 0 = ocean) is given, land cells are
+    excluded from the search so the nearest OCEAN cell is returned instead.
+    Without this, a coastal point can snap to a land cell, which the data
+    pipeline fills with a constant 0 (see process_scalar's `.fillna(0)` in
+    build_X_Y_from_HR.ipynb) -- silently producing a flat "truth" time
+    series with no error, just a `nearest_cell_is_land` flag nobody read.
+    """
+    lat_grid = np.asarray(lat_grid)
+    lon_grid = np.asarray(lon_grid) % 360
+
+    dlat_deg = lat_grid[:, None] - point_lat  # (H, 1)
+    dlon_deg = (lon_grid[None, :] - point_lon_360 + 180) % 360 - 180  # (1, W), wrapped
+    dlon_deg = dlon_deg * np.cos(np.deg2rad(point_lat))
+
+    dist2 = dlat_deg ** 2 + dlon_deg ** 2  # (H, W), broadcasts fine
+
+    if land_mask_hw is not None:
+        land_mask_hw = np.asarray(land_mask_hw)
+        ocean = land_mask_hw <= 0.5
+        if not ocean.any():
+            raise ValueError("land_mask_hw has no ocean cells -- can't find a nearest ocean grid point.")
+        dist2 = np.where(ocean, dist2, np.inf)
+
+    iy, ix = np.unravel_index(np.argmin(dist2), dist2.shape)
+    approx_dist_km = float(np.sqrt(dist2[iy, ix])) * 111.0  # ~111 km / degree
+    return int(iy), int(ix), approx_dist_km
+
+
+def extract_candidate_point_timeseries(fields_phys, lat_grid, lon_grid, land_mask_hw, sample_times, points=None, channel=0, flat_std_tol=1e-6):
+    """
+    Nearest-grid-cell time series at named candidate points (e.g. Kivalina,
+    Shishmaref, Kotzebue, Nome) for one or more physical-space fields, all
+    assumed to share the same (lat_grid, lon_grid) target grid -- i.e.
+    intended for the no-patch, single-sub-domain case (see the note in
+    save_evaluation_data about why patch mode is skipped).
+
+    The nearest-cell search excludes both (a) cells flagged land by
+    `land_mask_hw` and (b) cells where the "truth" field is ~constant over
+    time (std < flat_std_tol). (b) matters because bilinear regridding onto
+    the high-res target grid bleeds the land-side fill value (0) into
+    cells immediately adjacent to the coast -- these get flagged as ocean
+    by `land_mask_hw` (their regridded ocean fraction is > 0.5) but still
+    come out numerically flat, which a land-only exclusion doesn't catch.
+
+    Args:
+        fields_phys: dict of {method_name: (Nsamples, C, H, W) array/tensor},
+            e.g. {"truth": Y_test_phys, "stochastic_unet_mean": Y_pred_phys, ...}.
+            Must include a "truth" key so the flat-cell check has something
+            to test variance against.
+        lat_grid, lon_grid: 1D coord arrays matching the H, W dims above.
+        land_mask_hw: (H, W) array, 1 = land, 0 = ocean, or None to skip the
+            land/flat-cell exclusion entirely (nearest cell wins regardless).
+        sample_times: length-Nsamples array with one timestamp per sample.
+        points: dict of {name: {"lat":.., "lon":..}} (lon in [0, 360)).
+            Defaults to CANDIDATE_POINTS.
+        channel: channel index into each field's C axis (0 = SIT).
+        flat_std_tol: truth cells with temporal std below this (in the same
+            physical units as the field, e.g. meters of SIT) are treated as
+            invalid, same as land.
+
+    Returns:
+        (df, locations) where df is a long-format DataFrame with columns
+        [point, method, time, value, grid_iy, grid_ix, dist_km,
+        nearest_cell_is_land], and locations is {point: (iy, ix, dist_km)}.
+    """
+    if points is None:
+        points = CANDIDATE_POINTS
+
+    try:
+        time_index = pd.to_datetime(sample_times)
+    except Exception:
+        time_index = [str(t) for t in sample_times]
+
+    exclude_hw = None
+    if land_mask_hw is not None:
+        exclude_hw = np.asarray(land_mask_hw) > 0.5
+        truth_field = fields_phys.get("truth")
+        if truth_field is not None:
+            truth_np = truth_field.numpy() if hasattr(truth_field, "numpy") else np.asarray(truth_field)
+            flat_hw = truth_np[:, channel].std(axis=0) < flat_std_tol
+            exclude_hw = exclude_hw | flat_hw
+
+    locations = {}
+    rows = []
+    for point_name, pt in points.items():
+        iy, ix, dist_km = nearest_grid_index(lat_grid, lon_grid, pt["lat"], pt["lon"], land_mask_hw=exclude_hw)
+        locations[point_name] = (iy, ix, dist_km)
+        is_land = bool(land_mask_hw[iy, ix] > 0.5) if land_mask_hw is not None else None
+
+        for method_name, field in fields_phys.items():
+            field_np = field.numpy() if hasattr(field, "numpy") else np.asarray(field)
+            values = field_np[:, channel, iy, ix]
+            for t, v in zip(time_index, values):
+                rows.append({
+                    "point": point_name, "method": method_name, "time": t, "value": float(v),
+                    "grid_iy": iy, "grid_ix": ix, "dist_km": dist_km, "nearest_cell_is_land": is_land,
+                })
+
+    df = pd.DataFrame(rows).sort_values(["point", "method", "time"]).reset_index(drop=True)
+    return df, locations
+
+
+# ==============================================================
+# Save evaluation data (for later, customizable notebook plotting)
+# ==============================================================
+
+def save_evaluation_data(output_dir, X_test_sit_phys, Y_base_phys, Y_pred_det_phys, preds_all_phys,
+                          Y_pred_phys, Y_test_phys, mask_test, test_tile_ids, tile_geometry,
+                          time_test, land_mask, hlat, hlon, llat, llon, bbox, use_patches,
+                          candidate_points=None):
+    """
+    Dump everything needed to rebuild/customize the time-series, ensemble,
+    and error figures later in a notebook, without re-running the model:
+    the physical-space prediction/truth tensors, per-sample tile geometry
+    (lon/lat of each tile's context+target windows), the full-domain land
+    mask and coordinate grids, and per-sample timestamps. Also computes and
+    saves candidate-point (coastal community) time series when running in
+    no-patch mode.
+
+    Writes to <output_dir>/eval_data/:
+        fields.npz                      - all gridded tensors, as float32 numpy arrays
+        tile_geometry.pkl               - list of dicts of lon/lat arrays, one per tile
+        meta.json                       - bbox, use_patches, candidate point definitions
+        sample_times.csv                - one row per test sample: sample_idx, time, tile_id
+        candidate_point_timeseries.csv  - long-format point time series (no-patch mode only)
+
+    Returns the eval_data directory path.
+    """
+    eval_dir = os.path.join(output_dir, "eval_data")
+    os.makedirs(eval_dir, exist_ok=True)
+
+    def to_np(t):
+        return t.numpy() if hasattr(t, "numpy") else np.asarray(t)
+
+    np.savez_compressed(
+        os.path.join(eval_dir, "fields.npz"),
+        X_test_sit_phys=to_np(X_test_sit_phys).astype(np.float32),
+        Y_base_phys=to_np(Y_base_phys).astype(np.float32),
+        Y_pred_det_phys=to_np(Y_pred_det_phys).astype(np.float32),
+        preds_all_phys=to_np(preds_all_phys).astype(np.float32),
+        Y_pred_phys=to_np(Y_pred_phys).astype(np.float32),
+        Y_test_phys=to_np(Y_test_phys).astype(np.float32),
+        mask_test=to_np(mask_test).astype(np.float32),
+        test_tile_ids=to_np(test_tile_ids).astype(np.int64),
+        land_mask=to_np(land_mask).astype(np.float32),
+        hlat=np.asarray(hlat), hlon=np.asarray(hlon),
+        llat=np.asarray(llat), llon=np.asarray(llon),
+    )
+
+    with open(os.path.join(eval_dir, "tile_geometry.pkl"), "wb") as f:
+        pickle.dump(tile_geometry, f)
+
+    try:
+        time_index = pd.to_datetime(time_test)
+    except Exception:
+        time_index = [str(t) for t in time_test]
+    pd.DataFrame({
+        "sample_idx": np.arange(len(time_test)),
+        "time": time_index,
+        "tile_id": to_np(test_tile_ids),
+    }).to_csv(os.path.join(eval_dir, "sample_times.csv"), index=False)
+
+    points = candidate_points or CANDIDATE_POINTS
+    with open(os.path.join(eval_dir, "meta.json"), "w") as f:
+        json.dump({
+            "bbox": bbox,
+            "use_patches": use_patches,
+            "n_samples": int(to_np(Y_test_phys).shape[0]),
+            "candidate_points": points,
+        }, f, indent=2)
+
+    if not use_patches:
+        # A single coherent sub-domain grid makes point extraction
+        # meaningful (same reasoning as compute_domain_timeseries); with
+        # tiled patches, a given point may not fall inside any individual
+        # test tile, and tiles can overlap, so we skip it there.
+        fields_phys = {
+            "truth": Y_test_phys, "bilinear": Y_base_phys,
+            "deterministic_unet": Y_pred_det_phys, "stochastic_unet_mean": Y_pred_phys,
+        }
+        geo = tile_geometry[0]
+        point_df, locations = extract_candidate_point_timeseries(
+            fields_phys, geo["target_lat"], geo["target_lon"], to_np(mask_test)[0, 0],
+            time_test, points=points,
+        )
+        point_df.to_csv(os.path.join(eval_dir, "candidate_point_timeseries.csv"), index=False)
+        print(f"Saved candidate-point time series for: {list(locations.keys())}")
+        for name, (iy, ix, dist_km) in locations.items():
+            print(f"  {name}: nearest grid cell ({iy}, {ix}), ~{dist_km:.1f} km away")
+    else:
+        print("use_patches=True: skipping candidate-point time series "
+              "(no single coherent target grid to search across all test tiles).")
+
+    print(f"Saved evaluation data for notebook plotting to: {eval_dir}")
+    return eval_dir
 
 
 # ==============================================================
@@ -1078,10 +1450,7 @@ def run_pipeline(config):
     fine) providing: x_path, y_path, output_dir, weighted_grids_dir, bbox,
     bbox_regrid, use_patches, subdomain, context_size, target_size, stride,
     train_years, test_years, train_frac, k, num_epochs, batch_size, lr,
-    latent_channels, k_eval, eval_batch_size, make_figures, seed. Optionally
-    x_path_future/y_path_future (default None/unset) to splice a future/SSP
-    continuation onto the historical time axis before splitting -- see
-    DEFAULT_X_PATH_SSP/DEFAULT_Y_PATH_SSP.
+    latent_channels, k_eval, eval_batch_size, make_figures, seed.
 
     Returns a dict with the key results (metrics_df, loss_array, etc.) so
     callers like hpo_engressnet.py can pull out a metric without re-reading
@@ -1090,6 +1459,7 @@ def run_pipeline(config):
     torch.manual_seed(config.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(config.output_dir, exist_ok=True)
+    save_run_config(config)
     print("Number of GPUs:", torch.cuda.device_count())
     print("Output directory:", config.output_dir)
 
@@ -1110,61 +1480,6 @@ def run_pipeline(config):
             "Update the reshape logic in run_pipeline() if your dimension order differs."
         )
 
-    # ------------------------------------------------------------
-    # Splice in a future/SSP continuation, if given, so train/test years
-    # can span the historical/SSP boundary (e.g. a spliced test period of
-    # "2000-2020") or land entirely in the future (e.g. "2020-2040").
-    #
-    # ASSUMES ensemble member i in x_path/y_path is the same physical
-    # ensemble member as index i in x_path_future/y_path_future (true for
-    # CESM-LE-style historical -> RCP/SSP continuations where each member
-    # keeps its number across the scenario boundary) -- this isn't
-    # independently verified here, only that the member COUNT matches.
-    # ------------------------------------------------------------
-    x_path_future = getattr(config, "x_path_future", None)
-    y_path_future = getattr(config, "y_path_future", None)
-    if x_path_future or y_path_future:
-        if not (x_path_future and y_path_future):
-            raise ValueError("Provide both x_path_future and y_path_future, or neither.")
-
-        print(f"Splicing in future/SSP data: {x_path_future}")
-        X_ds_future = xr.open_dataset(x_path_future)
-        Y_ds_future = xr.open_dataset(y_path_future)
-        X_da_future, Y_da_future = X_ds_future.X, Y_ds_future.Y
-
-        if list(X_da.channel.values) != list(X_da_future.channel.values):
-            raise ValueError(
-                f"X channel order mismatch: {config.x_path} has {list(X_da.channel.values)}, "
-                f"{x_path_future} has {list(X_da_future.channel.values)} -- can't splice."
-            )
-        if X_da.sizes["ensemble"] != X_da_future.sizes["ensemble"]:
-            raise ValueError(
-                f"Ensemble-member count mismatch: {config.x_path} has {X_da.sizes['ensemble']}, "
-                f"{x_path_future} has {X_da_future.sizes['ensemble']} -- can't splice along time "
-                "unless both cover the same members (see the ordering caveat above)."
-            )
-        if X_da.shape[-2:] != X_da_future.shape[-2:] or Y_da.shape[-2:] != Y_da_future.shape[-2:]:
-            raise ValueError(
-                f"Spatial grid shape mismatch between historical and future data "
-                f"(X: {X_da.shape[-2:]} vs {X_da_future.shape[-2:]}, "
-                f"Y: {Y_da.shape[-2:]} vs {Y_da_future.shape[-2:]}) -- can't splice."
-            )
-
-        overlap = np.intersect1d(X_da["time"].values, X_da_future["time"].values)
-        if overlap.size:
-            raise ValueError(
-                f"Historical and future time coordinates overlap at {overlap.size} timestamps "
-                f"({overlap.min()} to {overlap.max()}) -- expected disjoint periods."
-            )
-
-        X_da = xr.concat([X_da, X_da_future], dim="time")
-        Y_da = xr.concat([Y_da, Y_da_future], dim="time")
-        print(
-            f"  Spliced {X_da_future.sizes['time']} future timesteps "
-            f"({str(X_da_future.time.values[0])[:10]} to {str(X_da_future.time.values[-1])[:10]}); "
-            f"combined time range now {str(X_da.time.values[0])[:10]} to {str(X_da.time.values[-1])[:10]}."
-        )
-
     X_time = X_da["time"]
 
     llat, llon = X_da.lat.values, X_da.lon.values
@@ -1181,7 +1496,7 @@ def run_pipeline(config):
     # Land-sea mask
     # ------------------------------------------------------------
     print("Building land-sea mask...")
-    land_mask = build_land_sea_mask(hlat, hlon, config.bbox, config.bbox_regrid, config.weighted_grids_dir)
+    land_mask = build_land_sea_mask(hlat, hlon, config.bbox, config.bbox_regrid, config.weighted_grids_dir, land_threshold=config.land_threshold)
     print(X.shape, Y.shape, land_mask.shape)
 
     proj, boundary_path, central_lon = make_polar_proj(config.bbox)
@@ -1260,7 +1575,10 @@ def run_pipeline(config):
     # Train
     # ------------------------------------------------------------
     print("Starting training...")
-    loss_array = train_model(model, optimizer, X_train, Y_train, mask_train, device, config.k, config.num_epochs, config.batch_size)
+    loss_array = train_model(
+        model, optimizer, X_train, Y_train, mask_train, device, config.k, config.num_epochs, config.batch_size,
+        coastal_width=config.coastal_width, coastal_boost=config.coastal_boost, beta=config.beta,
+    )
 
     torch.save(model.module.state_dict(), os.path.join(config.output_dir, "model_state_dict.pt"))
     np.save(os.path.join(config.output_dir, "loss_array.npy"), np.array(loss_array))
@@ -1281,6 +1599,20 @@ def run_pipeline(config):
     Y_pred_det_phys = (Y_pred_det * Y_std + Y_mean).clamp(min=0.0)
     preds_all_phys = (preds_all * Y_std + Y_mean).clamp(min=0.0)
 
+    # Hard-zero land in the model's own physical-space predictions (not the bilinear
+    # baseline or truth). This can't be done inside UNet.forward(): the model operates
+    # in normalized (z-scored) space there, where 0 isn't physical zero SIT, it's
+    # whatever the training-set mean maps to after this de-normalization -- an earlier
+    # attempt to hard-mask inside forward() actually forced land onto Y_mean (~0.4-0.5m),
+    # not zero, which showed up as a large positive domain-wide bias. Doing it here,
+    # after `* Y_std + Y_mean`, guarantees literal zero ice over land in every metric and
+    # plot, instead of relying on the coastal loss weight to merely encourage `out` to
+    # cancel non-zero bleed from the bilinear `base` term near the coast.
+    ocean_test = (1.0 - mask_test.to(Y_pred_phys.dtype)).clamp(0.0, 1.0)
+    Y_pred_phys = Y_pred_phys * ocean_test
+    Y_pred_det_phys = Y_pred_det_phys * ocean_test
+    preds_all_phys = preds_all_phys * ocean_test.unsqueeze(1)
+
     sit_idx = 0
     X_test_sit_phys = X_test[:, sit_idx:sit_idx + 1] * X_std[:, sit_idx:sit_idx + 1] + X_mean[:, sit_idx:sit_idx + 1]
     Y_base_phys = F.interpolate(X_test_sit_phys, size=Y_test.shape[-2:], mode="bilinear", align_corners=False).cpu()
@@ -1290,7 +1622,10 @@ def run_pipeline(config):
     # ------------------------------------------------------------
     # Metrics
     # ------------------------------------------------------------
-    metrics_df = compute_metrics_table(Y_base_phys, Y_pred_det_phys, Y_pred_phys, Y_spread_phys, Y_test_phys)
+    metrics_df = compute_metrics_table(
+        Y_base_phys, Y_pred_det_phys, Y_pred_phys, Y_spread_phys, Y_test_phys,
+        mask_test=mask_test, coastal_width=config.coastal_width,
+    )
     metrics_df.to_csv(os.path.join(config.output_dir, "metrics.csv"), index=False)
     print(metrics_df)
 
@@ -1311,6 +1646,21 @@ def run_pipeline(config):
             Y_pred_phys, Y_pred_det_phys, Y_base_phys, Y_test_phys, mask_test[0:1], time_test, config.output_dir,
         )
         result["timeseries_df"] = timeseries_df
+
+    # ------------------------------------------------------------
+    # Save raw evaluation data for later, customizable notebook plotting
+    # (time series, ensemble figure, error figure, candidate points).
+    # Independent of config.make_figures, since the point is to have the
+    # data available even when the quick-look PNGs weren't rendered.
+    # ------------------------------------------------------------
+    if getattr(config, "save_eval_data", True):
+        print("Saving evaluation data for notebook plotting...")
+        eval_dir = save_evaluation_data(
+            config.output_dir, X_test_sit_phys, Y_base_phys, Y_pred_det_phys, preds_all_phys,
+            Y_pred_phys, Y_test_phys, mask_test, test_tile_ids, tile_geometry,
+            time_test, land_mask, hlat, hlon, llat, llon, config.bbox, config.use_patches,
+        )
+        result["eval_data_dir"] = eval_dir
 
     # ------------------------------------------------------------
     # Figures
