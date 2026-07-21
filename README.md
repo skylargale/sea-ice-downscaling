@@ -4,12 +4,7 @@ Deep learning stochastic downscaling of Arctic sea ice thickness (SIT) for regio
 coastal sea ice. A coarse CESM/reanalysis-forced "low-res" field is downscaled onto a
 high-res target grid with a stochastic UNet trained via an energy-score ("EngressNet")
 loss, targeting the Kivalina/Shishmaref/Kotzebue/Nome/Point Hope coastal region of
-Alaska.
-
-This is research code developed and run on NCAR HPC (Casper). The repository was
-previously organized as a sequence of dated experiment directories (`Version2`,
-`Version3`, ...); it has been flattened down to this single, current pipeline
-(formerly `Version4`) since that's the only actively-trained-against line.
+Alaska. This is research code developed and run on NCAR HPC (Casper).
 
 ## Repository Contents
 
