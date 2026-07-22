@@ -27,18 +27,17 @@ Alaska. This is research code developed and run on NCAR HPC (Casper).
 - **`objective_engressnet.py`** -- [ECHO](https://github.com/NCAR/echo-opt) objective
   for distributed-PBS hyperparameter search over `run_pipeline()` (lr, k, batch_size,
   latent_channels), optimizing test-set RMSE of the stochastic UNet mean.
-- **`rename_results.py`** -- one-off utility that renames `results/<run>/` folders to
-  be self-describing (mode, train years, test years, job id) from `run_config.json` /
-  `eval_data/meta.json`.
 - **`compare_runs.ipynb`** -- notebook for loading `metrics.csv` across multiple
   `results/` runs side by side (e.g. comparing a hyperparameter sweep).
 - **`evaluation_plots.ipynb`** -- notebook-side figure regeneration from a saved
   `eval_data/` dump, without re-running the model.
-- **`process_data/`** -- data-preparation notebooks: `build_X_Y_from_HR.ipynb` builds
+- **`comp_plots/`** -- simulated and observational data comparison notebooks:
+  `mesaclip_fosi_validate_sic_spatial.ipynb` evaluates both MESACLIP and FOSI against
+  NOAA CDR SIC spatially; `mesaclip_fosi_validate_sic_timeseries.ipynb` does the same for the
+  shared period time series.
+- **`process_data/`** -- data-preparation notebooks: `build_X_Y_from_XXXX-HR_daily.ipynb` builds
   the perfect-model low-res/high-res training pair from raw FOSI_BGC CICE history
-  files (JRA55-forced, single realization); `cice_wind_rotation_check.ipynb` and
-  `compare_avg_grid_methods.ipynb` are supporting validation notebooks for that build
-  step.
+  files (JRA55-forced, single realization) or MESACLIP output for daily frequency.
 
 Large run outputs are not tracked in this repository (see `.gitignore`):
 `results/` (per-run model checkpoints, `eval_data/` dumps, figures, `metrics.csv`),
