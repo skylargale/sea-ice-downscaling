@@ -5,4 +5,5 @@ results/
 saved_figs/
 logs/
 hpo_echo/
+optimization/log.txt
 

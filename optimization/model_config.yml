@@ -1,0 +1,58 @@
+# model_config.yml
+#
+# Fixed settings for every EngressNet trial (everything that used to come
+# from hpo_engressnet.py's CLI flags, minus the four hyperparameters --
+# those are sampled per-trial from hyperparameters.yml instead). Values
+# below mirror functions_engressnet.py's DEFAULT_* constants and the
+# --patches example usage from the original script's docstring; adjust
+# train_years / test_years / use_patches / subdomain for your actual run.
+
+model:
+  # Base output directory -- each trial gets its own "trial_<n>"
+  # subdirectory under this, same convention as the original script.
+  output_dir: "/glade/work/skygale/_projects/SeaIceDownscaling/Version4/hpo_echo"
+
+  data_dir: "/glade/derecho/scratch/skygale/Downscaling_Data"
+  x_path: null
+  y_path: null
+  weighted_grids_dir: "/glade/work/skygale/_projects/SeaIceDownscaling/weighted_grids"
+
+  bbox:
+    lon_min: -190
+    lon_max: -140
+    lat_min: 60
+    lat_max: 80
+  bbox_regrid:
+    lon_min: -200
+    lon_max: -130
+    lat_min: 55
+    lat_max: 85
+
+  use_patches: false            # set false + fill in subdomain below to search in no-patch mode
+  # subdomain: null
+  subdomain:
+    lat_min: 62
+    lat_max: 69
+    lon_min: -172
+    lon_max: -157
+
+  context_size: [16, 24]
+  target_size: [8, 12]
+  stride: 4
+
+  train_years: "1980-2005"
+  test_years: "2006-2014"
+  train_frac: 0.8
+
+  trial_epochs: 8
+  k_eval: 3
+  eval_batch_size: 16
+
+  # Coastal-band-weighted energy loss (added to functions_engressnet.py
+  # after this HPO config was first written) -- values mirror
+  # train_engressnet.py's --coastal-width/--coastal-boost/--beta defaults.
+  coastal_width: 5
+  coastal_boost: 2.0
+  beta: 1.0
+
+  seed: 0
