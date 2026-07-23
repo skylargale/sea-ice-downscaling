@@ -1,0 +1,73 @@
+# hyperparameters.yml
+#
+# ECHO config for the EngressNet hyperparameter search. Launch with:
+#     echo-opt hyperparameters.yml model_config.yml
+#
+# This submits `pbs.jobs` separate PBS jobs on Casper, each pulling trials
+# from the same shared Optuna study, so trials run in parallel instead of
+# queued up one after another the way the old single-job
+# `study.optimize(..., n_trials=30)` loop did.
+
+log: True
+save_path: "/glade/work/skygale/_projects/SeaIceDownscaling/Version4/hpo_echo"
+
+pbs:
+  jobs: 8
+  bash:
+    # echo_opt's generated launch script never cds into the submission
+    # directory the way submit_engressnet.sh does -- without this,
+    # `echo-run hyperparameters.yml model_config.yml` (relative paths)
+    # can't find either file at job runtime.
+    - "cd \"$PBS_O_WORKDIR\""
+    - "module load conda"
+    - "conda activate downscaling_env"
+  batch:
+    l: ["select=1:ncpus=8:ngpus=1:mem=64GB:gpu_type=a100_80gb", "walltime=04:00:00"]
+    A: "P93300065"
+    q: "casper"
+    N: "echo_engressnet"
+    # No o/e here on purpose: echo_opt 1.3.1's path-joining for single-char
+    # PBS args (see prepare_pbs_launch_script in echo/optimize.py) mangles
+    # save_path + a bare filename into one un-separated path, and a fixed
+    # filename would be shared (clobbered) across all 8 concurrent workers
+    # anyway. Omitting -o/-e falls back to PBS's own default naming, which
+    # embeds the job ID (echo_engressnet.o<jobid>), same fix already used in
+    # submit_engressnet.sh.
+
+optuna:
+  # GLADE (/glade/work, /glade/derecho/scratch) is Lustre-backed, where
+  # SQLite's file locking can be unreliable under concurrent writers from
+  # multiple PBS jobs -- using the NFS journal backend instead of sqlite.
+  storage: "study_journal.log"
+  storage_type: "nfs"
+  study_name: "engressnet_hpo_coastal_v2"
+  objective: "objective_engressnet.py"
+  metric: "rmse"
+  direction: "minimize"
+  n_trials: 30                  # matches the old --n-trials default
+  gpu: True
+  sampler:
+    type: "TPESampler"          # matches optuna.create_study()'s implicit default sampler
+  parameters:
+    lr:
+      type: "float"
+      settings:
+        name: "lr"
+        low: 0.00001
+        high: 0.001
+        log: True
+    k:
+      type: "categorical"
+      settings:
+        name: "k"
+        choices: [3, 6, 9]
+    batch_size:
+      type: "categorical"
+      settings:
+        name: "batch_size"
+        choices: [16, 32, 64]
+    latent_channels:
+      type: "categorical"
+      settings:
+        name: "latent_channels"
+        choices: [4, 8, 16]
