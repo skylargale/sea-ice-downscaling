@@ -14,7 +14,7 @@
 #PBS -N build_MESA_HR_daily
 #PBS -A P93300065
 #PBS -q casper
-#PBS -l select=1:ncpus=64:mem=256GB
+#PBS -l select=1:ncpus=8:mem=256GB
 #PBS -l walltime=24:00:00
 #PBS -j oe
 #PBS -o logs/

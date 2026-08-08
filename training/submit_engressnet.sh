@@ -93,6 +93,21 @@ COASTAL_BOOST="${COASTAL_BOOST:-2.0}"
 # inflated IIEE, even though domain-wide accuracy and the visual land artifact were fine.
 LAND_THRESHOLD="${LAND_THRESHOLD:-0.1}"
 
+# Sensitivity-test-only architecture toggles (all default off = unchanged
+# architecture/behavior). See train_engressnet.py --extra-layer /
+# --stochastic-refine / --enscale-net / --noise-sigma for details.
+EXTRA_LAYER="${EXTRA_LAYER:-false}"
+STOCHASTIC_REFINE="${STOCHASTIC_REFINE:-false}"
+ENSCALE_NET="${ENSCALE_NET:-false}"
+NOISE_SIGMA="${NOISE_SIGMA:-1.0}"
+
+# Optional batch folder name. When set, --output-dir is passed explicitly so
+# this run's output lands under results/<BATCH_NAME>/<run_tag> instead of the
+# default flat results/<run_tag> -- lets a sweep of sensitivity-test jobs
+# organize itself into one folder per test, matching how existing batches
+# (FOSI_2conv, FOSI_tile_fix, ...) are laid out. Leave unset for ordinary runs.
+BATCH_NAME="${BATCH_NAME:-}"
+
 # ==============================================================
 
 echo "Job started on $(hostname) at $(date)"
@@ -104,6 +119,9 @@ echo "Beta: ${BETA}"
 echo "Coastal width / boost: ${COASTAL_WIDTH} / ${COASTAL_BOOST}"
 echo "Land threshold: ${LAND_THRESHOLD}"
 echo "Sub-domain: lat ${LAT_MIN}-${LAT_MAX}, lon ${LON_MIN}-${LON_MAX}"
+echo "Extra layer (1024ch): ${EXTRA_LAYER}   Stochastic refine (EnScale-lite): ${STOCHASTIC_REFINE}"
+echo "EnScaleNet: ${ENSCALE_NET}   Noise sigma: ${NOISE_SIGMA}"
+echo "Batch name: ${BATCH_NAME:-<none, flat results/>}"
 
 module load conda
 conda activate downscaling_env
@@ -118,6 +136,16 @@ if [ "$USE_PATCHES" = true ]; then
     ARGS+=(--patches)
 else
     ARGS+=(--no-patches --lat-min "$LAT_MIN" --lat-max "$LAT_MAX" --lon-min "$LON_MIN" --lon-max "$LON_MAX")
+fi
+
+[ "$EXTRA_LAYER" = true ] && ARGS+=(--extra-layer)
+[ "$STOCHASTIC_REFINE" = true ] && ARGS+=(--stochastic-refine)
+[ "$ENSCALE_NET" = true ] && ARGS+=(--enscale-net)
+ARGS+=(--noise-sigma "$NOISE_SIGMA")
+
+if [ -n "$BATCH_NAME" ]; then
+    RUN_TAG="${PBS_JOBNAME}_${TRAIN_YEARS}_${TEST_YEARS}_${PBS_JOBID}"
+    ARGS+=(--output-dir "results/${BATCH_NAME}/${RUN_TAG}")
 fi
 
 python train_engressnet.py "${ARGS[@]}"

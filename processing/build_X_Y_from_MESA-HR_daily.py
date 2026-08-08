@@ -49,6 +49,12 @@ high_res_dirs = sorted(
     glob.glob('/glade/campaign/collections/gdex/data/d651007/b.e13.*')  # /d651007 or /d651009
 )
 
+# Member .001 (b.e13...sehires38-1850-2005.001) only archives ice/ output at
+# ice/proc/tseries/month_1 (monthly), not day_1 -- zero daily hi_d/aice_d files, which
+# crashes xr.concat with "must supply at least one object to concatenate". Excluded here
+# since it has no daily sea ice for either the X predictors or the Y target.
+high_res_dirs = [d for d in high_res_dirs if 'sehires38' not in d]
+
 # ---------- Variables ----------
 
 low_vars = ['hi_d', 'aice_d', 'U10']
