@@ -42,10 +42,12 @@
 #   both X and Y, as if it were open water. `skipna=True` re-normalizes weights over only
 #   the valid (ocean) source cells instead, so only genuinely land-locked destination cells
 #   still come back `NaN` -> `0`.
-# - **A 5th `X` channel, `ocean_frac`** — a static (time-invariant) ocean-fraction field,
-#   regridded the same way as `hi`/`aice`/etc. from the native grid's own land/ocean split.
-#   Lets the UNet's encoder see coastal geometry from its very first conv layer, in addition
-#   to the separate high-res land mask already concatenated at the model's output.
+# - **No `ocean_frac` channel in X** — an earlier version added a static ocean-fraction
+#   channel here, but the conservative (`avg`) regridder left ~10% of destination cells
+#   NaN at the domain edge (no `.fillna(0)` after that regrid, unlike every other channel),
+#   which poisoned training with NaN loss for every `avg`-variant run. Land/ocean geometry
+#   is already available to the model via the separate high-res land mask concatenated at
+#   its output, so the channel was dropped rather than patched.
 #
 # Run this on Casper/Derecho with `/glade/campaign` and `/glade/p/cesmdata` mounted.
 
@@ -356,37 +358,11 @@ def process_wind(year, var, regridder):
     ds.close()
     return da_reg
 
-# ---------- Static ocean-fraction channel (for X) ----------
-# Land points are NaN in the native hi_d field (CICE's land fill value, decoded to NaN on
-# load); ocean points are real numbers even where there's no ice (hi_d/aice_d == 0).
-# Land/ocean geography doesn't change in time, so a NaN/not-NaN split on a single
-# timestep is already a clean, static land indicator -- no need to load all 64 files or
-# pull in a separate pop_tools/KMT mask. Regridding it (bilinear or conservative,
-# matching each X method, same regridders already built above) onto the 1-degree grid
-# gives a continuous ocean-fraction channel, so the UNet's encoder sees coastal geometry
-# from its very first conv layer instead of only via the separate high-res land mask
-# concatenated at the model's output.
-
-_ds0 = xr.open_dataset(run_files["hi_d"][0])
-_hi0 = _ds0["hi_d"].rename({"nj": "nlat", "ni": "nlon"}).isel(nlat=mask_ice_hr)
-if "time" in _hi0.dims:
-    _hi0 = _hi0.isel(time=0)
-ocean_native = (~np.isnan(_hi0)).astype(np.float32)
-_ds0.close()
-
-ocean_frac_by_method = {}
-for method, regridder in {"interp": regridder_hr_to_1deg_interp, "avg": regridder_hr_to_1deg_cons}.items():
-    ocean_frac = regridder(ocean_native)
-    ocean_frac = ocean_frac.sel(lat=slice(bbox["lat_min"], bbox["lat_max"]), lon=slice(lon_min, lon_max))
-    ocean_frac_by_method[method] = ocean_frac.astype(np.float32)
-
-print("Ocean-fraction channel built for:", list(ocean_frac_by_method.keys()))
-print("Range (interp):", float(ocean_frac_by_method["interp"].min()), "-", float(ocean_frac_by_method["interp"].max()))
-
 # ### 4. Build X (both regrid methods)
 #
-# `hi`/`aice`/`u_10`/`v_10`/`ocean_frac` channel stack, run once per method, saved as two
-# separate files: `X_FOSI_HR_JRA55_daily_interp.nc` / `X_FOSI_HR_JRA55_daily_avg.nc`.
+# `hi`/`aice`/`u_10`/`v_10` channel stack, run once per method, saved as two separate
+# files: `X_FOSI_HR_JRA55_daily_interp.nc` / `X_FOSI_HR_JRA55_daily_avg.nc`. No
+# `ocean_frac` channel -- see the note near the top of this file.
 
 regridders_ice = {
     "interp": regridder_hr_to_1deg_interp,
@@ -397,7 +373,7 @@ regridders_wind = {
     "avg": regridder_jra_to_1deg_cons,
 }
 processed_ice_vars = ["hi_d", "aice_d"]
-channel_order = processed_ice_vars + wind_vars + ["ocean_frac"]
+channel_order = processed_ice_vars + wind_vars
 
 for method in regridders_ice:
     print(f"=== Building X, method={method} ===")
@@ -422,10 +398,6 @@ for method in regridders_ice:
 
     min_t = min(channels[c].sizes["time"] for c in channel_order if c in channels)
     stacked = [channels[c].isel(time=slice(0, min_t)) for c in processed_ice_vars + wind_vars]
-
-    # Static ocean-fraction channel, broadcast across the same time axis as the others.
-    ocean_frac_t = ocean_frac_by_method[method].expand_dims(time=stacked[0]["time"])
-    stacked.append(ocean_frac_t)
 
     X_ds = xr.concat(stacked, dim="channel")
     X_ds.name = "X"
@@ -453,8 +425,7 @@ for method in regridders_ice:
         "hi_d: sea ice thickness (m); "
         "aice_d: sea ice concentration; "
         "u_10: JRA55 10m eastward wind (m s-1); "
-        "v_10: JRA55 10m northward wind (m s-1); "
-        "ocean_frac: static ocean fraction (1=ocean, 0=land), time-invariant"
+        "v_10: JRA55 10m northward wind (m s-1)"
     )
 
     X_ds = X_ds.transpose("ensemble", "time", "channel", "lat", "lon")

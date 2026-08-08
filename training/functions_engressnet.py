@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import torch.utils.checkpoint as torch_checkpoint
 import xarray as xr
 import xesmf as xe
 import pop_tools
@@ -307,6 +308,75 @@ def build_land_sea_mask(hlat, hlon, bbox, bbox_regrid, weighted_grids_dir, land_
     return land_mask
 
 
+def build_ocean_frac_channel(llat, llon, bbox_regrid, weighted_grids_dir):
+    """
+    Regrid the native POP ocean/land mask onto X's LOW-res grid (llat/llon),
+    mirroring build_land_sea_mask but targeting the encoder's input
+    resolution instead of the high-res target grid, and returning the
+    continuous ocean fraction (not thresholded to binary) -- so the encoder
+    sees graded coastal structure from the first conv layer, instead of the
+    model only learning land/ocean location via the land_mask concatenated
+    at the very last layer (see out_conv in UNet.forward).
+
+    Deliberately NOT a revival of the old X `ocean_frac` channel from
+    process_data/build_X_Y_from_FOSI-HR_daily.py, which had a real NaN bug
+    (missing skipna=True + fillna(0) on the conservative regridder left
+    ~10% of destination cells NaN) that led to it being dropped from X
+    entirely rather than fixed. This reuses the exact regridding machinery
+    already proven bug-free in build_land_sea_mask (same native
+    ocean_frac_native source, same xESMF call pattern), just retargeted to
+    llat/llon, and adds skipna=True + fillna(0) defensively anyway --
+    justified here since a 1deg low-res cell spans a much larger native-grid
+    footprint than a 0.1deg high-res cell, making a domain-edge cell with no
+    valid source overlap more likely, not less.
+
+    Returns a (H_lr, W_lr) float32 numpy array: 0 = land, 1 = open ocean,
+    matching llat/llon's grid exactly (same convention as build_land_sea_mask
+    but un-thresholded and 0/1 sense flipped -- 1 here means ocean, whereas
+    build_land_sea_mask's returned tensor uses 1 = land).
+    """
+    nat_ice_hr = pop_tools.get_grid("POP_tx0.1v2")
+    ice_lon = nat_ice_hr.TLONG % 360
+    ocean_frac_native = (nat_ice_hr.KMT > 0).astype(np.float32)  # 1 = ocean, 0 = land
+
+    lon_min_regrid = bbox_regrid["lon_min"] % 360
+    lon_max_regrid = bbox_regrid["lon_max"] % 360
+
+    mask_ice_hr = np.any(
+        (nat_ice_hr.TLAT >= bbox_regrid["lat_min"])
+        & (nat_ice_hr.TLAT <= bbox_regrid["lat_max"])
+        & (ice_lon >= lon_min_regrid)
+        & (ice_lon <= lon_max_regrid),
+        axis=1,
+    )
+
+    grid_ice_hr = xr.Dataset({
+        "lat": (["nlat", "nlon"], nat_ice_hr.TLAT.isel(nlat=mask_ice_hr).values),
+        "lon": (["nlat", "nlon"], ice_lon.isel(nlat=mask_ice_hr).values),
+    })
+    ocean_frac_src = ocean_frac_native.isel(nlat=mask_ice_hr)
+
+    dst_lr = xr.Dataset({"lat": ("lat", np.asarray(llat)), "lon": ("lon", np.asarray(llon) % 360)})
+
+    os.makedirs(weighted_grids_dir, exist_ok=True)
+    tag = f"{float(np.min(llat)):.2f}_{float(np.max(llat)):.2f}_{float(np.min(llon) % 360):.2f}_{float(np.max(llon) % 360):.2f}"
+    weights_path = os.path.join(weighted_grids_dir, f"ice_hr_to_lowres_oceanfrac_{tag}.nc")
+    reuse_weights = os.path.exists(weights_path)
+
+    regridder_ice_to_lowres = xe.Regridder(
+        grid_ice_hr,
+        dst_lr,
+        method="bilinear",
+        periodic=True,
+        filename=weights_path,
+        reuse_weights=reuse_weights,
+    )
+
+    ocean_frac_reg = regridder_ice_to_lowres(ocean_frac_src, skipna=True)
+    ocean_frac_reg = ocean_frac_reg.fillna(0).astype(np.float32)
+    return ocean_frac_reg.values
+
+
 # ==============================================================
 # Projection helper + domain diagnostic figure
 # ==============================================================
@@ -523,13 +593,18 @@ def crop_indices(coord_1d, lo, hi):
     return int(inside.min()), int(inside.max()) + 1
 
 
-def extract_full_domain(X, Y, land_mask, llon, llat, hlon, hlat, subdomain):
+def extract_full_domain(X, Y, land_mask, llon, llat, hlon, hlat, subdomain, divisor=8):
     """
     No-patch alternative to extract_patches(): crop X, Y and land_mask to
     `subdomain` and treat every sample's full cropped field as one
     training/eval example (instead of tiling). Returns the same signature
     as extract_patches so the rest of the pipeline (model, training loop,
     evaluation, figures) doesn't need to know whether patches were used.
+
+    divisor: the low-res crop must have both dims divisible by this (default
+        8, matching the UNet's 3 stride-2 pooling layers). Pass 16 when the
+        model's `extra_layer` sensitivity-test toggle is enabled, since that
+        adds a 4th stride-2 pool.
     """
     lat_min, lat_max = subdomain["lat_min"], subdomain["lat_max"]
     lon_min = subdomain["lon_min"] % 360
@@ -541,30 +616,30 @@ def extract_full_domain(X, Y, land_mask, llon, llat, hlon, hlat, subdomain):
     hj0, hj1 = crop_indices(np.asarray(hlon) % 360, lon_min, lon_max)
 
     lr_h, lr_w = li1 - li0, lj1 - lj0
-    # The UNet encoder has 3 stride-2 max-pools, so the low-res crop needs
-    # H and W each divisible by 8 (and at least 8) or the bottleneck
-    # collapses to a zero-sized tensor deep inside forward().
-    if lr_h < 8 or lr_w < 8 or lr_h % 8 != 0 or lr_w % 8 != 0:
+    # The UNet encoder has `divisor`-implied stride-2 max-pools (3 by default, 4
+    # with extra_layer), so the low-res crop needs H and W each divisible by
+    # `divisor` (and at least `divisor`) or the bottleneck collapses to a
+    # zero-sized tensor deep inside forward().
+    if lr_h < divisor or lr_w < divisor or lr_h % divisor != 0 or lr_w % divisor != 0:
         raise ValueError(
             f"Sub-domain {subdomain} crops to a low-res grid of shape "
-            f"({lr_h}, {lr_w}), but the UNet's 3 stride-2 pooling layers "
-            "require both dimensions to be multiples of 8 (and >= 8). "
+            f"({lr_h}, {lr_w}), but the UNet's pooling layers require both "
+            f"dimensions to be multiples of {divisor} (and >= {divisor}). "
             "Widen the sub-domain, or nudge lat/lon bounds so the low-res "
-            "crop lands on a multiple of 8 in both directions."
+            f"crop lands on a multiple of {divisor} in both directions."
         )
-    # Additionally, the bottleneck (H/8, W/8) must have MORE THAN ONE total
-    # spatial element, or InstanceNorm2d inside enc4/bottleneck raises
-    # "Expected more than 1 spatial element when training" -- this bites
-    # exactly the (8, 8) case (bottleneck collapses to a single 1x1 pixel),
-    # which the check above alone doesn't catch.
-    if (lr_h // 8) * (lr_w // 8) <= 1:
+    # Additionally, the bottleneck (H/divisor, W/divisor) must have MORE THAN
+    # ONE total spatial element, or InstanceNorm2d inside enc4/bottleneck
+    # raises "Expected more than 1 spatial element when training" -- this
+    # bites exactly the (divisor, divisor) case (bottleneck collapses to a
+    # single 1x1 pixel), which the check above alone doesn't catch.
+    if (lr_h // divisor) * (lr_w // divisor) <= 1:
         raise ValueError(
             f"Sub-domain {subdomain} crops to a low-res grid of shape "
-            f"({lr_h}, {lr_w}), whose bottleneck ({lr_h // 8}, {lr_w // 8}) has only "
-            "one spatial element -- InstanceNorm2d can't compute a variance over a "
-            "single point and will raise during training. Widen at least one "
-            "dimension to 16+ (e.g. keep H=8 but use W=16) so the bottleneck has "
-            "more than one pixel."
+            f"({lr_h}, {lr_w}), whose bottleneck ({lr_h // divisor}, {lr_w // divisor}) has "
+            "only one spatial element -- InstanceNorm2d can't compute a variance over a "
+            f"single point and will raise during training. Widen at least one "
+            f"dimension to {2 * divisor}+ so the bottleneck has more than one pixel."
         )
 
     X_crop = X[:, :, li0:li1, lj0:lj1]
@@ -593,12 +668,276 @@ def smooth_noise(z):
     return F.avg_pool2d(z, kernel_size=3, stride=1, padding=1)
 
 
+class LocallyConnected2d(nn.Module):
+    """
+    Per-location ("sparse local") linear layer over a k x k spatial
+    neighborhood, per Schillinger et al. 2025 (EnScale): unlike a Conv2d,
+    every grid location gets its own learnable weights rather than one
+    kernel shared across all locations -- "not fully convolutional", so the
+    noise-mixing behavior can vary with location (e.g. differently near the
+    coast than in the open ocean), at the cost of translation invariance.
+    H, W must be fixed at construction time (the target grid size is fixed
+    for the lifetime of a given training run).
+    """
+
+    def __init__(self, in_channels, out_channels, height, width, kernel_size=3):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.height = height
+        self.width = width
+        self.kernel_size = kernel_size
+        self.padding = kernel_size // 2
+
+        n_loc = height * width
+        fan_in = in_channels * kernel_size * kernel_size
+        self.weight = nn.Parameter(torch.randn(n_loc, out_channels, fan_in) / fan_in ** 0.5)
+        self.bias = nn.Parameter(torch.zeros(n_loc, out_channels))
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        if (H, W) != (self.height, self.width):
+            raise ValueError(
+                f"LocallyConnected2d built for grid ({self.height}, {self.width}) but got input ({H}, {W})."
+            )
+        # unfold: (B, C*k*k, H*W) -> (B, H*W, C*k*k), one neighbor-patch vector per location
+        patches = F.unfold(x, kernel_size=self.kernel_size, padding=self.padding).transpose(1, 2)
+        # einsum against per-location weights (H*W, out_channels, C*k*k) -- no sharing across n
+        out = torch.einsum("bnf,nof->bno", patches, self.weight) + self.bias
+        return out.transpose(1, 2).reshape(B, self.out_channels, H, W)
+
+
+class EnScaleStage(nn.Module):
+    """
+    One progressive 2x super-resolution step of the EnScale (Schillinger et
+    al., 2025) stochastic refinement design, layered onto this UNet's
+    existing encoder/skip-connection structure rather than the paper's
+    skip-connection-free pyramid ("baked into" the UNet, per project
+    convention, instead of a wholly separate architecture):
+
+      1. Deterministic bilinear upsample of the previous stage's field --
+         a stand-in for the paper's per-variable nearest-low-res-neighbor
+         linear interpolation.
+      2. Concatenate the matching-resolution encoder skip feature and the
+         (already resized+projected) global latent-noise feature, if either
+         is used at this stage -- these play the role of the paper's
+         "upsampled variables".
+      3. Concatenate fresh sigma-scaled Gaussian noise, then run it through
+         a LocallyConnected2d layer: per-location learnable weights mix
+         each pixel's noise with its spatial neighbors, generating spatially
+         correlated ("spatially coherent") noise rather than independent
+         per-pixel noise.
+      4. One shared MLP (weight-tied across space, i.e. 1x1 convs -- "one
+         MLP is used for all pixels") maps the full concatenation to this
+         stage's output field.
+    """
+
+    def __init__(self, in_channels, skip_channels, z_channels, out_channels, height, width,
+                 noise_channels=4, kernel_size=3, scale_factor=2, mlp_hidden=None):
+        super().__init__()
+        self.upsample = nn.Upsample(scale_factor=scale_factor, mode="bilinear", align_corners=False)
+        self.local_noise_mix = LocallyConnected2d(1, noise_channels, height, width, kernel_size=kernel_size)
+        mlp_hidden = mlp_hidden or out_channels
+        mlp_in = in_channels + skip_channels + z_channels + noise_channels
+        self.mlp = nn.Sequential(
+            nn.Conv2d(mlp_in, mlp_hidden, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mlp_hidden, out_channels, 1),
+        )
+
+    def forward(self, x, skip, z_feat, noise_sigma, deterministic=False):
+        x = self.upsample(x)
+        parts = [x]
+        if skip is not None:
+            parts.append(skip)
+        if z_feat is not None:
+            z_feat = F.interpolate(z_feat, size=x.shape[-2:], mode="bilinear", align_corners=False)
+            parts.append(z_feat)
+
+        if deterministic:
+            eps = torch.zeros(x.shape[0], 1, *x.shape[-2:], device=x.device)
+        else:
+            eps = noise_sigma * torch.randn(x.shape[0], 1, *x.shape[-2:], device=x.device)
+        parts.append(self.local_noise_mix(eps))
+
+        return self.mlp(torch.cat(parts, dim=1))
+
+
+class WindowedSelfAttention2d(nn.Module):
+    """
+    Non-overlapping windowed multi-head self-attention over a 2D feature
+    map (Swin-style W-MSA, not shifted), applied once at the very end of the
+    decoder -- a "sliding window" attention mechanism placed at the decoder
+    end rather than the encoder, per the user's explicit framing (2026-08-06
+    conversation): full quadratic self-attention over the whole up-sampled
+    field is too expensive at these domain sizes (e.g. ~150x310 for the
+    medium no-patch domain), and encoder-side attention operates several
+    layers upstream of where the model's coastal smoothing is actually
+    introduced (the bilinear decoder). Restricting attention to small local
+    windows keeps cost linear in H*W (O(H*W*window_size^2) instead of
+    O((H*W)^2)) while still letting each output pixel incorporate its local
+    neighborhood right before out_conv.
+
+    Pads H, W up to a multiple of window_size (reflect padding) before
+    windowing and crops back after, so this works for any domain crop size,
+    not just ones divisible by window_size -- no new constraint on top of
+    the existing divisor-8/16 sub-domain sizing rule.
+
+    max_window_batch chunks the flattened (B*nH*nW, ws*ws, C) call to
+    nn.MultiheadAttention instead of running it in one shot, AND each chunk
+    runs under torch.utils.checkpoint so its intermediate activations aren't
+    retained for backward (recomputed on demand instead). Both pieces turned
+    out necessary the hard way (2026-08-06): at the medium no-patch domain
+    (~150x310 up-sampled) with window_size=8 and a real training batch
+    (batch_size=16, K=20), B*nH*nW reaches ~237k. An un-chunked call tries
+    to materialize a (237k*num_heads, 64, 64) attention-score tensor and
+    OOMs outright (tried to allocate 14.47 GiB). Chunking alone (bounding
+    each individual attention call's peak to ~256 MiB) still OOM'd on the
+    resubmitted jobs -- turns out standard autograd retains *every* chunk's
+    saved activations simultaneously across the whole sequential loop, so
+    the *total* memory across ~58 chunks accumulated to more than the GPU
+    had left after the rest of the model's own activations (the medium-
+    domain baseline already runs close to the 32GB ceiling at K=20/batch=16
+    without any attention module at all). Per-chunk checkpointing discards
+    each chunk's activations immediately after producing its output and
+    recomputes them during backward, so only one chunk's activations exist
+    in memory at a time regardless of how many chunks there are -- the fix
+    that actually worked, confirmed against the same OOMing jobs.
+
+    The standalone smoke test that validated this module before use only
+    used a tiny synthetic batch (B=2) and never exercised a batch size close
+    to a real training step, which is why none of this was caught until the
+    actual comparison-batch jobs ran on the GPU.
+    """
+
+    def __init__(self, channels, window_size=8, num_heads=4, max_window_batch=4096):
+        super().__init__()
+        if channels % num_heads != 0:
+            raise ValueError(f"channels ({channels}) must be divisible by num_heads ({num_heads}).")
+        self.window_size = window_size
+        self.max_window_batch = max_window_batch
+        self.attn = nn.MultiheadAttention(embed_dim=channels, num_heads=num_heads, batch_first=True)
+        self.norm = nn.LayerNorm(channels)
+
+    def _run_chunk(self, x_chunk):
+        attn_chunk, _ = self.attn(x_chunk, x_chunk, x_chunk)
+        return self.norm(attn_chunk + x_chunk)  # residual, then normalize
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        ws = self.window_size
+        pad_h = (ws - H % ws) % ws
+        pad_w = (ws - W % ws) % ws
+        x_p = F.pad(x, (0, pad_w, 0, pad_h), mode="reflect") if (pad_h or pad_w) else x
+        Hp, Wp = H + pad_h, W + pad_w
+
+        # (B, C, Hp, Wp) -> non-overlapping ws x ws windows -> (B*nH*nW, ws*ws, C)
+        x_w = x_p.unfold(2, ws, ws).unfold(3, ws, ws)  # (B, C, nH, nW, ws, ws)
+        nH, nW = x_w.shape[2], x_w.shape[3]
+        x_w = x_w.permute(0, 2, 3, 4, 5, 1).reshape(B * nH * nW, ws * ws, C)
+
+        chunks = []
+        for i in range(0, x_w.shape[0], self.max_window_batch):
+            x_chunk = x_w[i:i + self.max_window_batch]
+            if self.training and x_chunk.requires_grad:
+                chunks.append(torch_checkpoint.checkpoint(self._run_chunk, x_chunk, use_reentrant=False))
+            else:
+                chunks.append(self._run_chunk(x_chunk))
+        attn_out = torch.cat(chunks, dim=0)
+
+        attn_out = attn_out.reshape(B, nH, nW, ws, ws, C).permute(0, 5, 1, 3, 2, 4).reshape(B, C, Hp, Wp)
+        return attn_out[:, :, :H, :W]
+
+
 class UNet(nn.Module):
 
-    def __init__(self, in_channels, latent_channels=8, mask_channels=1):
+    def __init__(self, in_channels, latent_channels=8, mask_channels=1, extra_layer=False, stochastic_refine=False,
+                 enscale_net=False, noise_sigma=1.0, input_size=None, up_size=None,
+                 classification_head=False, num_classes=3, attention_end=False,
+                 attn_window_size=8, attn_num_heads=4):
+        """
+        extra_layer, stochastic_refine, enscale_net: sensitivity-test toggles, all
+        default False (= identical behavior to the original architecture). See
+        CLAUDE.md-adjacent run notes for the sensitivity-test batches that exercise
+        these.
+
+        extra_layer: adds a 4th downsample (enc5/bottleneck at 1024 channels, with a
+        matching up4/dec4 decoder stage) below the original 512-channel bottleneck.
+        This adds a 4th stride-2 pool, so callers must crop the low-res domain to
+        multiples of 16 (not 8) in both dims when this is True -- see the `divisor`
+        param on extract_full_domain(). Mutually exclusive with enscale_net.
+
+        stochastic_refine: a single-shot EnScale-style (Schillinger et al., 2025)
+        stochastic refinement stage, layered on top of (not replacing) the existing
+        coarse global latent-noise pathway (z_proj_d3/d2/d1): sigma-scaled Gaussian
+        noise is mixed by a LocallyConnected2d layer (per-location learnable weights
+        over a spatial neighborhood -- the paper's "sparse local layer", not a
+        translation-invariant conv) to make it spatially correlated, then a shared
+        MLP (1x1 convs) combines that with the local decoder features (+ mask) to
+        produce the final residual. Mutually exclusive with enscale_net.
+
+        enscale_net: replaces the entire decoder (the original up3/dec3, up2/dec2,
+        up1/dec1, final_up chain) with a sequence of EnScaleStage modules -- the full
+        paper mechanism (deterministic upsample -> concat skip/global-noise features
+        -> LocallyConnected2d noise mixing -> shared MLP) applied progressively at
+        every 2x step, still built on this UNet's own encoder and skip connections
+        rather than the paper's separate skip-free pyramid. Requires input_size (the
+        low-res (H, W) the encoder operates on) to size each stage's LocallyConnected2d
+        layers up front. The paper's pyramid assumes clean power-of-2 grids (its
+        k=3..6 steps, 8x8 to 128x128); our domains generally aren't dyadic, so the
+        final stage does one larger jump (matching final_up's scale_factor=4) and the
+        usual explicit resize-to-up_size below still corrects any remaining mismatch.
+        Mutually exclusive with extra_layer and stochastic_refine.
+
+        noise_sigma: fixed (non-learnable) standard deviation of the raw Gaussian
+        noise fed into every LocallyConnected2d mixing layer above, for both
+        stochastic_refine and enscale_net. Deliberately not a learnable nn.Parameter
+        -- unlike the discarded design (see git history / CLAUDE.md), this is meant to
+        be swept as an explicit sensitivity-test hyperparameter (a real "dial"), while
+        everything about how the network *uses* that noise (the local layer's
+        per-location weights, the shared MLP) stays fully trainable, per the paper.
+
+        input_size, up_size: (H, W) of the low-res encoder input and the high-res
+        target, respectively -- required (only) when stochastic_refine or enscale_net
+        is True, since LocallyConnected2d needs its grid size fixed at construction.
+
+        classification_head: adds an auxiliary 3-class (land / open-ocean / ice)
+        segmentation head branching off the final decoder feature map (post
+        mask-concat, pre-out_conv), trained with an auxiliary cross-entropy loss
+        (see train_model's classif_weight) in addition to the main energy-score
+        loss -- intended to sharpen coastal/ice-edge boundaries by giving the
+        decoder features an explicit boundary-aware training signal, rather than
+        relying only on the land mask concatenated at the very last layer. Only
+        computed/returned when forward(..., return_classif=True); default False
+        (no head, no change to forward's return signature -- always the single
+        prediction tensor, same as before this option existed).
+
+        attention_end: applies WindowedSelfAttention2d (non-overlapping local
+        self-attention, "sliding window" but at the decoder's end rather than the
+        encoder) to the final 32-channel decoder feature map, right after it's
+        resized to up_size and before the land mask is concatenated. Default
+        False = unchanged architecture. attn_window_size/attn_num_heads size that
+        attention block; channels (32) must be divisible by attn_num_heads.
+        """
 
         super().__init__()
+        if enscale_net and extra_layer:
+            raise ValueError("enscale_net and extra_layer are mutually exclusive.")
+        if enscale_net and stochastic_refine:
+            raise ValueError("enscale_net and stochastic_refine are mutually exclusive "
+                              "(enscale_net already injects EnScale-style noise at every decoder stage).")
+        if stochastic_refine and up_size is None:
+            raise ValueError("stochastic_refine=True requires up_size (H, W) to size its LocallyConnected2d layer.")
+        if enscale_net and input_size is None:
+            raise ValueError("enscale_net=True requires input_size (H, W) to size its per-stage LocallyConnected2d layers.")
+
         self.latent_channels = latent_channels
+        self.extra_layer = extra_layer
+        self.stochastic_refine = stochastic_refine
+        self.enscale_net = enscale_net
+        self.noise_sigma = noise_sigma
+        self.classification_head = classification_head
+        self.attention_end = attention_end
 
         def conv_block(in_c, out_c):
             return nn.Sequential(
@@ -619,68 +958,140 @@ class UNet(nn.Module):
         self.pool3 = nn.MaxPool2d(2)
         self.enc4 = conv_block(256, 512)
 
-        # Bottleneck
-        self.bottleneck = conv_block(512, 512)
+        # Bottleneck (or, with extra_layer, a 4th downsample + 1024-channel bottleneck)
+        if self.extra_layer:
+            self.pool4 = nn.MaxPool2d(2)
+            self.enc5 = conv_block(512, 1024)
+            self.bottleneck = conv_block(1024, 1024)
+            self.up4 = nn.Sequential(nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False), nn.Conv2d(1024, 512, 3, padding=1))
+            self.z_proj_d4 = nn.Conv2d(latent_channels, 512, 1)
+            self.concat_d4 = nn.Conv2d(512 + 512, 512, 1)
+            self.dec4 = conv_block(512 + 512, 512)
+        else:
+            self.bottleneck = conv_block(512, 512)
 
-        # Decoder
-        self.up3 = nn.Sequential(nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False), nn.Conv2d(512, 256, 3, padding=1))
-        self.dec3 = conv_block(512, 256)
-        self.up2 = nn.Sequential(nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False), nn.Conv2d(256, 128, 3, padding=1))
-        self.dec2 = conv_block(256, 128)
-        self.up1 = nn.Sequential(nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False), nn.Conv2d(128, 64, 3, padding=1))
-        self.dec1 = conv_block(128, 64)
-
-        # Decoder noise projections
+        # Decoder noise projections for the global latent code z. Used directly by the
+        # up3/up2/up1 conv-block decoder below; when enscale_net is True instead, these
+        # same (already-projected) features are reused as the "z_feat" input to each
+        # EnScaleStage, so that pathway isn't lost when the rest of the decoder is
+        # replaced. (The old per-projection noise_scale_d3/d2/d1/d4 learnable scalars
+        # were removed here -- they were never actually multiplied into anything in
+        # forward(), just dead nn.Parameters frozen at their init value.)
         self.z_proj_d3 = nn.Conv2d(latent_channels, 256, 1)
         self.z_proj_d2 = nn.Conv2d(latent_channels, 128, 1)
         self.z_proj_d1 = nn.Conv2d(latent_channels, 64, 1)
 
-        # Scaling for additive noise
-        self.noise_scale_d3 = nn.Parameter(torch.tensor(0.05))
-        self.noise_scale_d2 = nn.Parameter(torch.tensor(0.05))
-        self.noise_scale_d1 = nn.Parameter(torch.tensor(0.05))
+        if self.enscale_net:
+            # Full EnScale (Schillinger et al., 2025) decoder: every 2x step is an
+            # EnScaleStage (deterministic upsample -> concat skip/z features -> sigma-
+            # scaled noise through a LocallyConnected2d mixing layer -> shared 1x1-conv
+            # MLP) instead of a conv_block with a separately-concatenated z. Channel
+            # widths at each resolution mirror the original decoder's (256/128/64/32)
+            # so out_conv and the residual base below don't need to change.
+            H_in, W_in = input_size
+            self.enscale_stage3 = EnScaleStage(512, 256, 256, 256, H_in // 4, W_in // 4)
+            self.enscale_stage2 = EnScaleStage(256, 128, 128, 128, H_in // 2, W_in // 2)
+            self.enscale_stage1 = EnScaleStage(128, 64, 64, 64, H_in, W_in)
+            # Mirrors final_up's bigger scale_factor=4 jump; no encoder skip or z
+            # injection at that resolution, same as final_up today.
+            self.enscale_stage_final = EnScaleStage(64, 0, 0, 32, H_in * 4, W_in * 4, scale_factor=4)
+        else:
+            # Decoder
+            self.up3 = nn.Sequential(nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False), nn.Conv2d(512, 256, 3, padding=1))
+            self.dec3 = conv_block(512, 256)
+            self.up2 = nn.Sequential(nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False), nn.Conv2d(256, 128, 3, padding=1))
+            self.dec2 = conv_block(256, 128)
+            self.up1 = nn.Sequential(nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False), nn.Conv2d(128, 64, 3, padding=1))
+            self.dec1 = conv_block(128, 64)
 
-        # Concatenation adapters
-        self.concat_d3 = nn.Conv2d(256 + 256, 256, 1)
-        self.concat_d2 = nn.Conv2d(128 + 128, 128, 1)
-        self.concat_d1 = nn.Conv2d(64 + 64, 64, 1)
+            # Concatenation adapters
+            self.concat_d3 = nn.Conv2d(256 + 256, 256, 1)
+            self.concat_d2 = nn.Conv2d(128 + 128, 128, 1)
+            self.concat_d1 = nn.Conv2d(64 + 64, 64, 1)
+
+            # Upsample-then-conv instead of a ConvTranspose2d(kernel_size=stride=4): with
+            # kernel_size == stride, every 4x4 output block is generated independently from a
+            # single input pixel through the same shared kernel, so any asymmetry the kernel
+            # learns repeats identically in every block -- a visible tiling/checkerboard
+            # artifact once the domain is wide enough to show several repeats. up3/up2/up1
+            # already use this upsample+conv pattern for exactly this reason; final_up was the
+            # one decoder stage that didn't.
+            # Two stacked convs (not one) after the upsample: every other decoder stage
+            # (up3/up2/up1) pairs its upsample+conv with a full conv_block (two conv+norm+relu
+            # layers, via dec3/dec2/dec1) for refinement capacity. final_up was left with a single
+            # bare conv, and also does a bigger 4x jump in one step (vs. 2x for the others) --
+            # that capacity mismatch is the likely cause of the accuracy regression seen after
+            # first replacing ConvTranspose2d with a single upsample+conv (see FOSI_tile_fix
+            # results vs. FOSI_land_fix4). This restores refinement capacity while keeping the
+            # smooth bilinear upsample that avoids the tiling artifact.
+            self.final_up = nn.Sequential(
+                nn.Upsample(scale_factor=4, mode='bilinear', align_corners=False),
+                nn.Conv2d(64, 32, 3, padding=1),
+                nn.InstanceNorm2d(32, affine=True),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(32, 32, 3, padding=1),
+            )
 
         # Output
         self.mask_channels = mask_channels
-        # Upsample-then-conv instead of a ConvTranspose2d(kernel_size=stride=4): with
-        # kernel_size == stride, every 4x4 output block is generated independently from a
-        # single input pixel through the same shared kernel, so any asymmetry the kernel
-        # learns repeats identically in every block -- a visible tiling/checkerboard
-        # artifact once the domain is wide enough to show several repeats. up3/up2/up1
-        # already use this upsample+conv pattern for exactly this reason; final_up was the
-        # one decoder stage that didn't.
-        # Two stacked convs (not one) after the upsample: every other decoder stage
-        # (up3/up2/up1) pairs its upsample+conv with a full conv_block (two conv+norm+relu
-        # layers, via dec3/dec2/dec1) for refinement capacity. final_up was left with a single
-        # bare conv, and also does a bigger 4x jump in one step (vs. 2x for the others) --
-        # that capacity mismatch is the likely cause of the accuracy regression seen after
-        # first replacing ConvTranspose2d with a single upsample+conv (see FOSI_tile_fix
-        # results vs. FOSI_land_fix4). This restores refinement capacity while keeping the
-        # smooth bilinear upsample that avoids the tiling artifact.
-        self.final_up = nn.Sequential(
-            nn.Upsample(scale_factor=4, mode='bilinear', align_corners=False),
-            nn.Conv2d(64, 32, 3, padding=1),
-            nn.InstanceNorm2d(32, affine=True),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 32, 3, padding=1),
-        )
         # High-res land mask is concatenated directly as extra input channels
         # to the final conv, instead of being processed by a separate fusion
         # head (no more mask_fuse conv/ReLU block in between).
         self.out_conv = nn.Conv2d(32 + mask_channels, 1, 3, padding=1)
 
-    def forward(self, x, up_size, mask=None, z=None):
+        if self.attention_end:
+            # Applied to the 32-channel decoder feature map, right after it's
+            # resized to up_size and before the land mask is concatenated (see
+            # forward()) -- see WindowedSelfAttention2d's docstring for why this
+            # placement (decoder end, local windows) instead of full-field
+            # attention or encoder-side attention.
+            self.attn_end = WindowedSelfAttention2d(32, window_size=attn_window_size, num_heads=attn_num_heads)
+
+        if self.classification_head:
+            # Auxiliary land / open-ocean / ice segmentation head, branching off
+            # the same (32 + mask_channels) feature map out_conv consumes -- see
+            # class docstring. Only used when forward(..., return_classif=True).
+            self.classif_head = nn.Sequential(
+                nn.Conv2d(32 + mask_channels, 16, 3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(16, num_classes, 1),
+            )
+
+        if self.stochastic_refine:
+            # Single-shot EnScale-style stochastic refinement (see class docstring):
+            # sigma-scaled noise -> LocallyConnected2d (per-location learnable neighbor
+            # mixing, the paper's "sparse local layer") -> shared MLP (1x1 convs). No
+            # separate learnable scale: the MLP's own weights (fully trainable) decide
+            # how much the mixed noise contributes, exactly as in the paper -- see
+            # noise_sigma in the class docstring for why the *input* noise magnitude is
+            # a fixed hyperparameter instead.
+            noise_mix_channels = 4
+            self.local_noise_mix = LocallyConnected2d(1, noise_mix_channels, *up_size, kernel_size=3)
+            self.refiner = nn.Sequential(
+                nn.Conv2d(32 + mask_channels + noise_mix_channels, 16, 1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(16, 16, 1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(16, 1, 1),
+            )
+
+    def forward(self, x, up_size, mask=None, z=None, eps=None, deterministic=False, return_classif=False):
 
         B, C, H, W = x.shape
 
-        # Latent noise
-        if z is None:
-            z = torch.randn(B, self.latent_channels, H // 8, W // 8, device=x.device)
+        # Latent noise -- generated at the deepest bottleneck's spatial resolution
+        # (H//16 with extra_layer, else H//8) so its granularity matches whichever
+        # bottleneck is actually in use; every decoder stage bilinearly resizes it
+        # to its own resolution regardless (see zd3/zd2/zd1[/zd4] below).
+        # `deterministic=True` forces every noise source in this forward pass (z,
+        # the stochastic_refine eps, and every EnScaleStage's internal per-stage
+        # noise) to exact zero, for a reproducible "mean" pass -- see evaluate_model.
+        if deterministic:
+            z_h, z_w = (H // 16, W // 16) if self.extra_layer else (H // 8, W // 8)
+            z = torch.zeros(B, self.latent_channels, z_h, z_w, device=x.device)
+        elif z is None:
+            z_h, z_w = (H // 16, W // 16) if self.extra_layer else (H // 8, W // 8)
+            z = torch.randn(B, self.latent_channels, z_h, z_w, device=x.device)
             z = smooth_noise(z)
 
         # Encoder
@@ -689,34 +1100,62 @@ class UNet(nn.Module):
         e3 = self.enc3(self.pool2(e2))
         e4 = self.enc4(self.pool3(e3))
 
-        # Bottleneck
-        b = self.bottleneck(e4)
+        # Bottleneck (or, with extra_layer, one more downsample + decoder stage first)
+        if self.extra_layer:
+            e5 = self.enc5(self.pool4(e4))
+            b = self.bottleneck(e5)
+
+            d4 = self.up4(b)
+            zd4 = F.interpolate(z, size=d4.shape[-2:], mode="bilinear", align_corners=False)
+            zd4 = self.z_proj_d4(zd4)
+            d4 = self.concat_d4(torch.cat([d4, zd4], dim=1))
+            d4 = torch.cat([d4, e4], dim=1)
+            b = self.dec4(d4)
+        else:
+            b = self.bottleneck(e4)
 
         # Decoder
-        d3 = self.up3(b)
-        zd3 = F.interpolate(z, size=d3.shape[-2:], mode="bilinear", align_corners=False)
-        zd3 = self.z_proj_d3(zd3)
-        d3 = self.concat_d3(torch.cat([d3, zd3], dim=1))
-        d3 = torch.cat([d3, e3], dim=1)
-        d3 = self.dec3(d3)
+        if self.enscale_net:
+            # z_proj_dN is a 1x1 conv, which commutes with the later bilinear resize
+            # inside EnScaleStage -- projecting z at its native (bottleneck) resolution
+            # here and letting each stage resize it to match is equivalent to (and
+            # simpler than) resizing first, as the non-enscale_net branch below does.
+            d3 = self.enscale_stage3(b, e3, self.z_proj_d3(z), self.noise_sigma, deterministic=deterministic)
+            d2 = self.enscale_stage2(d3, e2, self.z_proj_d2(z), self.noise_sigma, deterministic=deterministic)
+            d1 = self.enscale_stage1(d2, e1, self.z_proj_d1(z), self.noise_sigma, deterministic=deterministic)
+            out = self.enscale_stage_final(d1, None, None, self.noise_sigma, deterministic=deterministic)
+        else:
+            d3 = self.up3(b)
+            zd3 = F.interpolate(z, size=d3.shape[-2:], mode="bilinear", align_corners=False)
+            zd3 = self.z_proj_d3(zd3)
+            d3 = self.concat_d3(torch.cat([d3, zd3], dim=1))
+            d3 = torch.cat([d3, e3], dim=1)
+            d3 = self.dec3(d3)
 
-        d2 = self.up2(d3)
-        zd2 = F.interpolate(z, size=d2.shape[-2:], mode="bilinear", align_corners=False)
-        zd2 = self.z_proj_d2(zd2)
-        d2 = self.concat_d2(torch.cat([d2, zd2], dim=1))
-        d2 = torch.cat([d2, e2], dim=1)
-        d2 = self.dec2(d2)
+            d2 = self.up2(d3)
+            zd2 = F.interpolate(z, size=d2.shape[-2:], mode="bilinear", align_corners=False)
+            zd2 = self.z_proj_d2(zd2)
+            d2 = self.concat_d2(torch.cat([d2, zd2], dim=1))
+            d2 = torch.cat([d2, e2], dim=1)
+            d2 = self.dec2(d2)
 
-        d1 = self.up1(d2)
-        zd1 = F.interpolate(z, size=d1.shape[-2:], mode="bilinear", align_corners=False)
-        zd1 = self.z_proj_d1(zd1)
-        d1 = self.concat_d1(torch.cat([d1, zd1], dim=1))
-        d1 = torch.cat([d1, e1], dim=1)
-        d1 = self.dec1(d1)
+            d1 = self.up1(d2)
+            zd1 = F.interpolate(z, size=d1.shape[-2:], mode="bilinear", align_corners=False)
+            zd1 = self.z_proj_d1(zd1)
+            d1 = self.concat_d1(torch.cat([d1, zd1], dim=1))
+            d1 = torch.cat([d1, e1], dim=1)
+            d1 = self.dec1(d1)
 
-        # Output
-        out = self.final_up(d1)
+            # Output
+            out = self.final_up(d1)
+
         out = F.interpolate(out, size=up_size, mode="bilinear", align_corners=False)
+
+        if self.attention_end:
+            # Local windowed self-attention on the pure 32-channel decoder
+            # output, before the land mask is concatenated -- see
+            # WindowedSelfAttention2d's docstring.
+            out = self.attn_end(out)
 
         if self.mask_channels > 0:
             if mask is None:
@@ -729,7 +1168,35 @@ class UNet(nn.Module):
                 mask = mask.unsqueeze(1)
             out = torch.cat([out, mask.to(out.dtype)], dim=1)
 
-        out = self.out_conv(out)
+        pre_out_feat = out  # (B, 32 + mask_channels, *up_size) -- kept for the refiner below
+        out = self.out_conv(pre_out_feat)
+
+        classif_logits = None
+        if self.classification_head and return_classif:
+            # (B, num_classes, *up_size) land/open-ocean/ice logits -- see
+            # train_model for how the auxiliary cross-entropy loss and its
+            # ground-truth labels are built from Y_batch/mask_batch.
+            classif_logits = self.classif_head(pre_out_feat)
+
+        if self.stochastic_refine:
+            # eps mirrors z: `deterministic=True` forces exact zero for a reproducible
+            # pass (see evaluate_model); a caller-supplied eps is honored as-is (kept
+            # for backward compatibility); otherwise a fresh unit-Gaussian field is
+            # sampled here every call, so ensemble members each get independent
+            # stochastic detail. The raw noise is scaled by the fixed noise_sigma
+            # hyperparameter, then mixed by a LocallyConnected2d layer (per-location
+            # learnable weights over a spatial neighborhood) before being concatenated
+            # with the local decoder features and passed through the shared MLP
+            # (self.refiner) -- see class docstring.
+            if deterministic:
+                eps = torch.zeros(B, 1, *pre_out_feat.shape[-2:], device=x.device)
+            elif eps is None:
+                eps = torch.randn(B, 1, *pre_out_feat.shape[-2:], device=x.device)
+            mixed_noise = self.local_noise_mix(self.noise_sigma * eps)
+            refine_in = torch.cat([pre_out_feat, mixed_noise], dim=1)
+            refine_out = self.refiner(refine_in)
+            out = out + refine_out
+
         out = F.interpolate(out, size=up_size, mode="bilinear", align_corners=False)
 
         # Residual prediction. NOTE: this is in normalized (z-scored) space, like
@@ -738,7 +1205,10 @@ class UNet(nn.Module):
         # (`* Y_std + Y_mean`, done later in run_pipeline). Hard-zeroing land has to
         # happen after that de-normalization, on the physical-space tensors, not here.
         base = F.interpolate(x[:, 0:1], size=up_size, mode="bilinear", align_corners=False)
-        return base + out
+        pred = base + out
+        if return_classif:
+            return pred, classif_logits
+        return pred
 
 
 # ==============================================================
@@ -831,8 +1301,27 @@ def build_coastal_weight_map(land_mask, coastal_width=5, coastal_boost=2.0):
 # Train / evaluate
 # ==============================================================
 
+def build_classif_labels(Y_batch, mask_batch, y_mean, y_std, ice_thickness_thresh=0.01):
+    """
+    Per-pixel 3-class label (0=land, 1=open ocean, 2=ice-covered) for the
+    UNet's optional auxiliary classification_head, built from the same
+    truth/mask tensors train_model already has -- no separate label data
+    needed. Y_batch is in normalized (z-scored) space like everything else
+    train_model sees, so the physical ice_thickness_thresh (default 1cm) is
+    converted to normalized space via y_mean/y_std before comparing.
+    """
+    thresh_norm = (ice_thickness_thresh - y_mean) / (y_std + 1e-6)
+    land = mask_batch[:, 0] > 0.5
+    ice = (~land) & (Y_batch[:, 0] > thresh_norm)
+    labels = torch.ones_like(mask_batch[:, 0], dtype=torch.long)  # default 1 = open ocean
+    labels = torch.where(land, torch.zeros_like(labels), labels)
+    labels = torch.where(ice, torch.full_like(labels, 2), labels)
+    return labels
+
+
 def train_model(model, optimizer, X_train, Y_train, mask_train, device, K, num_epochs, batch_size,
-                 coastal_width=5, coastal_boost=2.0, beta=1.0, verbose=True):
+                 coastal_width=5, coastal_boost=2.0, beta=1.0, verbose=True,
+                 classification_head=False, classif_weight=0.1, y_mean=0.0, y_std=1.0):
     loss_array = []
 
     for epoch in range(num_epochs):
@@ -852,7 +1341,10 @@ def train_model(model, optimizer, X_train, Y_train, mask_train, device, K, num_e
             X_rep = X_batch.repeat_interleave(K, dim=0)
             mask_rep = mask_batch.repeat_interleave(K, dim=0)
 
-            preds = model(X_rep, up_size=Y_batch.shape[-2:], mask=mask_rep)
+            if classification_head:
+                preds, classif_logits = model(X_rep, up_size=Y_batch.shape[-2:], mask=mask_rep, return_classif=True)
+            else:
+                preds = model(X_rep, up_size=Y_batch.shape[-2:], mask=mask_rep)
             preds = preds.reshape(B, K, preds.shape[1], preds.shape[2], preds.shape[3])
 
             # Per-sample loss weight: land at baseline weight 1, coastal ocean band
@@ -863,6 +1355,18 @@ def train_model(model, optimizer, X_train, Y_train, mask_train, device, K, num_e
             # contribution from being silently dropped.
             coastal_weight = build_coastal_weight_map(mask_batch[:, 0], coastal_width, coastal_boost)
             loss = energy_loss(preds, Y_batch, weight=coastal_weight, beta=beta)
+
+            if classification_head:
+                # One label per original (non-repeated) sample -- land/ice-vs-
+                # open-ocean truth doesn't depend on which stochastic ensemble
+                # member produced classif_logits, so the label is repeated to
+                # match classif_logits' repeat_interleave(K) batch dim instead
+                # of being recomputed per member.
+                labels = build_classif_labels(Y_batch, mask_batch, y_mean, y_std)
+                labels_rep = labels.repeat_interleave(K, dim=0)
+                classif_loss = F.cross_entropy(classif_logits, labels_rep)
+                loss = loss + classif_weight * classif_loss
+
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -887,21 +1391,23 @@ def evaluate_model(model, X_test, Y_test, mask_test, device, K_eval, eval_batch_
             X_batch = X_test[i:i + eval_batch_size].to(device)
             Y_batch = Y_test[i:i + eval_batch_size].to(device)
             mask_batch = mask_test[i:i + eval_batch_size].to(device)
-            B, _, H, W = X_batch.shape
 
+            # z=None/eps=None (default) makes forward() sample its own fresh noise for
+            # every source (global z, stochastic_refine eps, and -- for enscale_net --
+            # each EnScaleStage's internal per-stage noise), so each ensemble member
+            # gets independent stochastic detail without duplicating that sampling
+            # logic here. deterministic=True (below) forces all of those to exact zero
+            # in one place instead of hand-building a matching zero tensor per source.
             ensemble_preds = []
             for k in range(K_eval):
-                z = torch.randn(B, model.module.latent_channels, H // 8, W // 8, device=device)
-                z = smooth_noise(z)
-                pred = model(X_batch, Y_batch.shape[-2:], mask=mask_batch, z=z)
+                pred = model(X_batch, Y_batch.shape[-2:], mask=mask_batch)
                 ensemble_preds.append(pred)
 
             preds = torch.stack(ensemble_preds, dim=0).permute(1, 0, 2, 3, 4)
             pred_mean = preds.mean(dim=1)
             pred_std = preds.std(dim=1)
 
-            z0 = torch.zeros(B, model.module.latent_channels, H // 8, W // 8, device=device)
-            pred_det = model(X_batch, Y_batch.shape[-2:], mask=mask_batch, z=z0)
+            pred_det = model(X_batch, Y_batch.shape[-2:], mask=mask_batch, deterministic=True)
 
             preds_all.append(preds.cpu())
             preds_mean.append(pred_mean.cpu())
@@ -1447,6 +1953,65 @@ def plot_error_figure(output_dir, Y_base_phys, Y_pred_det_phys, Y_pred_phys, Y_t
 
 
 # ==============================================================
+# Freeze + calibrate
+# ==============================================================
+
+# Parameter-name prefixes that make up the UNet's noise-injection pathway:
+# z_proj_d1-d4 (project the global latent z into each decoder stage),
+# concat_d1-d4 (mix the upsampled/skip features with that projected z),
+# local_noise_mix/refiner (stochastic_refine's LocallyConnected2d + shared
+# MLP). Matched via named_parameters() name prefixes, e.g. "z_proj_d3.weight".
+NOISE_PARAM_PREFIXES = ("z_proj_", "concat_d", "local_noise_mix", "refiner")
+
+
+def set_noise_only_trainable(unet):
+    """
+    Freezes every UNet parameter except the noise-injection pathway
+    (NOISE_PARAM_PREFIXES), for stage-2 "freeze backbone, calibrate noise"
+    fine-tuning -- directly targets ensemble-spread miscalibration
+    (Spread/Error away from 1.0) without touching the parameters that
+    determine mean accuracy/sharpness, on the idea that recalibrating an
+    already-good backbone's noise pathway is much cheaper than retraining
+    everything jointly.
+
+    Not supported for enscale_net=True: EnScaleStage fuses the deterministic
+    upsample/skip-mixing and the noise-mixing LocallyConnected2d+MLP into
+    the same module (enscale_stage1/2/3/final), so there's no clean
+    noise-only parameter subset to isolate there -- raises instead of
+    silently freezing/unfreezing the wrong thing.
+
+    `unet` must be the unwrapped module (model.module if wrapped in
+    DataParallel), since parameter names are matched against attribute
+    names defined in UNet.__init__.
+    """
+    if unet.enscale_net:
+        raise ValueError(
+            "set_noise_only_trainable is not supported with enscale_net=True: "
+            "EnScaleStage fuses noise-mixing and deterministic upsampling into "
+            "the same module, so there's no clean 'noise-only' parameter subset "
+            "to unfreeze. Use the baseline z-only pathway or stochastic_refine instead."
+        )
+
+    n_trainable, n_frozen = 0, 0
+    for name, param in unet.named_parameters():
+        is_noise = name.startswith(NOISE_PARAM_PREFIXES)
+        param.requires_grad = is_noise
+        if is_noise:
+            n_trainable += param.numel()
+        else:
+            n_frozen += param.numel()
+
+    if n_trainable == 0:
+        raise ValueError(
+            "set_noise_only_trainable found zero noise-pathway parameters -- "
+            "check NOISE_PARAM_PREFIXES against this model's actual parameter names "
+            "(e.g. stochastic_refine=False and extra_layer=False means only "
+            "z_proj_d1/d2/d3 + concat_d1/d2/d3 exist)."
+        )
+    print(f"Calibration: {n_trainable:,} noise-pathway params trainable, {n_frozen:,} backbone params frozen.")
+
+
+# ==============================================================
 # Full pipeline
 # ==============================================================
 
@@ -1510,6 +2075,31 @@ def run_pipeline(config):
     land_mask = build_land_sea_mask(hlat, hlon, config.bbox, config.bbox_regrid, config.weighted_grids_dir, land_threshold=config.land_threshold)
     print(X.shape, Y.shape, land_mask.shape)
 
+    # ------------------------------------------------------------
+    # Optional coastal input channel: append a low-res ocean-fraction field
+    # to X so the encoder sees coastal structure from the first conv layer,
+    # instead of land/ocean location only being known at the very last layer
+    # (via land_mask, concatenated just before out_conv). Opt-in and default
+    # off so it doesn't change in_channels for any run that doesn't ask for
+    # it -- see build_ocean_frac_channel's docstring for why this is a fresh
+    # regrid (with skipna+fillna) rather than a revival of the old buggy X
+    # `ocean_frac` channel.
+    # ------------------------------------------------------------
+    if getattr(config, "coastal_channel", False):
+        print("Building low-res coastal (ocean-fraction) input channel...")
+        ocean_frac_lr = build_ocean_frac_channel(llat, llon, config.bbox_regrid, config.weighted_grids_dir)
+        if ocean_frac_lr.shape != X.shape[-2:]:
+            raise ValueError(
+                f"coastal_channel ocean_frac_lr shape {ocean_frac_lr.shape} doesn't match "
+                f"X's spatial shape {X.shape[-2:]} -- llat/llon must be X's own grid."
+            )
+        N, T = X.shape[0], X.shape[1]
+        coastal_channel = np.broadcast_to(
+            ocean_frac_lr[None, None, None, :, :], (N, T, 1, *ocean_frac_lr.shape)
+        ).astype(np.float32)
+        X = np.concatenate([X, coastal_channel], axis=2)
+        print("X shape after adding coastal channel:", X.shape)
+
     proj, boundary_path, central_lon = make_polar_proj(config.bbox)
 
     if config.make_figures:
@@ -1560,11 +2150,12 @@ def run_pipeline(config):
         )
     else:
         print("Cropping to sub-domain (no patches)...")
+        divisor = 16 if getattr(config, "extra_layer", False) else 8
         X_train, Y_train, mask_train, _, _ = extract_full_domain(
-            X_train, Y_train, land_mask, llon, llat, hlon, hlat, config.subdomain,
+            X_train, Y_train, land_mask, llon, llat, hlon, hlat, config.subdomain, divisor=divisor,
         )
         X_test, Y_test, mask_test, test_tile_ids, tile_geometry = extract_full_domain(
-            X_test, Y_test, land_mask, llon, llat, hlon, hlat, config.subdomain,
+            X_test, Y_test, land_mask, llon, llat, hlon, hlat, config.subdomain, divisor=divisor,
         )
 
     print("X_train:   ", X_train.shape)
@@ -1577,9 +2168,36 @@ def run_pipeline(config):
     # ------------------------------------------------------------
     # Model
     # ------------------------------------------------------------
-    model = UNet(in_channels=X_train.shape[1], latent_channels=config.latent_channels, mask_channels=mask_train.shape[1])
+    model = UNet(
+        in_channels=X_train.shape[1], latent_channels=config.latent_channels, mask_channels=mask_train.shape[1],
+        extra_layer=getattr(config, "extra_layer", False), stochastic_refine=getattr(config, "stochastic_refine", False),
+        enscale_net=getattr(config, "enscale_net", False), noise_sigma=getattr(config, "noise_sigma", 1.0),
+        input_size=tuple(X_train.shape[-2:]), up_size=tuple(Y_train.shape[-2:]),
+        classification_head=getattr(config, "classification_head", False),
+        attention_end=getattr(config, "attention_end", False),
+        attn_window_size=getattr(config, "attn_window_size", 8),
+        attn_num_heads=getattr(config, "attn_num_heads", 4),
+    )
     model = nn.DataParallel(model).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=config.lr)
+
+    # ------------------------------------------------------------
+    # Optional calibration: load an already-trained checkpoint and (if
+    # freeze_backbone) freeze everything except the noise-injection pathway,
+    # so training below only recalibrates ensemble spread instead of
+    # retraining mean-accuracy/sharpness from scratch. See
+    # set_noise_only_trainable's docstring; num_epochs/lr for this stage are
+    # just the normal --num-epochs/--lr flags (typically overridden smaller
+    # at the CLI for a short calibration run, no separate flags needed).
+    # ------------------------------------------------------------
+    calibrate_from = getattr(config, "calibrate_from", None)
+    if calibrate_from:
+        print(f"Loading checkpoint for calibration: {calibrate_from}")
+        state_dict = torch.load(calibrate_from, map_location=device)
+        model.module.load_state_dict(state_dict)
+        if getattr(config, "freeze_backbone", False):
+            set_noise_only_trainable(model.module)
+
+    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=config.lr)
     print("Model setup complete.")
 
     # ------------------------------------------------------------
@@ -1589,6 +2207,9 @@ def run_pipeline(config):
     loss_array = train_model(
         model, optimizer, X_train, Y_train, mask_train, device, config.k, config.num_epochs, config.batch_size,
         coastal_width=config.coastal_width, coastal_boost=config.coastal_boost, beta=config.beta,
+        classification_head=getattr(config, "classification_head", False),
+        classif_weight=getattr(config, "classif_weight", 0.1),
+        y_mean=float(Y_mean.flatten()[0]), y_std=float(Y_std.flatten()[0]),
     )
 
     torch.save(model.module.state_dict(), os.path.join(config.output_dir, "model_state_dict.pt"))

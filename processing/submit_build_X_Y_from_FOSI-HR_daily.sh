@@ -18,8 +18,8 @@
 #PBS -N build_FOSI_HR_daily
 #PBS -A P93300065
 #PBS -q casper
-#PBS -l select=1:ncpus=64:mem=256GB
-#PBS -l walltime=24:00:00
+#PBS -l select=1:ncpus=8:mem=128GB
+#PBS -l walltime=06:00:00
 #PBS -j oe
 #PBS -o logs/
 #PBS -m abe
