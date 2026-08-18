@@ -36,6 +36,12 @@ def parse_args():
     p.add_argument("--data-dir", default=fe.DEFAULT_DATA_DIR)
     p.add_argument("--x-path", default=None, help="Defaults to <data-dir>/X_FOSI_HR_JRA55_interp.nc")
     p.add_argument("--y-path", default=None, help="Defaults to <data-dir>/Y_FOSI_HR_JRA55.nc")
+    p.add_argument("--test-x-path", default=None,
+                   help="Cross-dataset evaluation: evaluate on a different dataset than the model "
+                        "trained on (e.g. train on FOSI, test on MESA-HR). Must be given together "
+                        "with --test-y-path, and with --train-years/--test-years both set (no "
+                        "random-split fallback). The test dataset must share a grid with --x-path.")
+    p.add_argument("--test-y-path", default=None, help="See --test-x-path. Must be given together with it.")
     p.add_argument("--weighted-grids-dir", default=fe.DEFAULT_WEIGHTED_GRIDS_DIR, help="Where regridding weight files are cached/reused across runs.")
     p.add_argument("--output-dir", default=None, help="Defaults to <data-dir>/results/<PBS_JOBID or timestamp>")
 
@@ -43,6 +49,10 @@ def parse_args():
     p.add_argument("--train-years", default=None, help='e.g. "1980-2005" or "1980,1985,1990-1995"')
     p.add_argument("--test-years", default=None, help='e.g. "2006-2014"')
     p.add_argument("--train-frac", type=float, default=0.8, help="Used only if --train-years/--test-years are not given (random split fallback).")
+    p.add_argument("--months", default=None,
+                   help='Restrict both train and test samples to these calendar months before '
+                        'the year split, e.g. "3-7" for March-July. Comma/range syntax like '
+                        '--train-years. No wraparound (e.g. "11-2") support. Default: all months.')
 
     # Patches vs. single sub-domain
     patch_group = p.add_mutually_exclusive_group()
@@ -183,6 +193,12 @@ def parse_args():
             flags = ", ".join("--" + m.replace("_", "-") for m in missing)
             p.error(f"--no-patches requires {flags}")
 
+    if bool(args.test_x_path) != bool(args.test_y_path):
+        p.error("--test-x-path and --test-y-path must be given together.")
+    if args.test_x_path and not (args.train_years and args.test_years):
+        p.error("--test-x-path/--test-y-path (cross-dataset evaluation) requires both "
+                "--train-years and --test-years.")
+
     if args.enscale_net and args.extra_layer:
         p.error("--enscale-net and --extra-layer are mutually exclusive.")
     if args.enscale_net and args.stochastic_refine:
@@ -208,7 +224,10 @@ def main():
     job_name = os.environ.get("PBS_JOBNAME", "engressnet")
     job_tag = os.environ.get("PBS_JOBID", time.strftime("%Y%m%d_%H%M%S"))
     if args.train_years and args.test_years:
-        run_tag = f"{job_name}_{args.train_years}_{args.test_years}_{job_tag}".replace(",", "-")
+        run_tag = f"{job_name}_{args.train_years}_{args.test_years}"
+        if args.months:
+            run_tag += f"_m{args.months}"
+        run_tag = f"{run_tag}_{job_tag}".replace(",", "-")
     else:
         run_tag = f"{job_name}_{job_tag}"
     output_dir = args.output_dir or os.path.join(fe.DEFAULT_RESULTS_DIR, run_tag)
@@ -223,6 +242,8 @@ def main():
     config = argparse.Namespace(
         x_path=x_path,
         y_path=y_path,
+        test_x_path=args.test_x_path,
+        test_y_path=args.test_y_path,
         output_dir=output_dir,
         weighted_grids_dir=args.weighted_grids_dir,
         bbox=fe.DEFAULT_BBOX,
@@ -235,6 +256,7 @@ def main():
         train_years=fe.parse_years(args.train_years),
         test_years=fe.parse_years(args.test_years),
         train_frac=args.train_frac,
+        months=fe.parse_months(args.months),
         k=args.k,
         num_epochs=args.num_epochs,
         batch_size=args.batch_size,

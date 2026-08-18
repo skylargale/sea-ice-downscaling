@@ -33,6 +33,8 @@ import cartopy.feature as cfeature
 import matplotlib.path as mpath
 import matplotlib.pyplot as plt
 
+from member_metrics import compute_member_avg_metrics, is_mesaclip_run
+
 matplotlib.use("Agg")
 warnings.filterwarnings("ignore", message=r"Latitude is outside of \[-90, 90\]")
 
@@ -44,7 +46,7 @@ DEFAULT_DATA_DIR = "/glade/derecho/scratch/skygale/Downscaling_Data"
 DEFAULT_X_PATH = os.path.join(DEFAULT_DATA_DIR, "X_FOSI_HR_JRA55_interp.nc")
 DEFAULT_Y_PATH = os.path.join(DEFAULT_DATA_DIR, "Y_FOSI_HR_JRA55.nc")
 DEFAULT_WEIGHTED_GRIDS_DIR = "/glade/work/skygale/_projects/SeaIceDownscaling/weighted_grids"
-DEFAULT_RESULTS_DIR = "/glade/work/skygale/_projects/SeaIceDownscaling/Version4/results"
+DEFAULT_RESULTS_DIR = "/glade/work/skygale/_projects/SeaIceDownscaling/Version5/results"
 
 DEFAULT_BBOX = {"lon_min": -190, "lon_max": -140, "lat_min": 60, "lat_max": 80}
 DEFAULT_BBOX_REGRID = {"lon_min": -200, "lon_max": -130, "lat_min": 55, "lat_max": 85}
@@ -93,12 +95,14 @@ def save_run_config(config):
 
     train_desc = ",".join(str(y) for y in config.train_years) if config.train_years else f"random {config.train_frac:.0%} split"
     test_desc = ",".join(str(y) for y in config.test_years) if config.test_years else f"random {1 - config.train_frac:.0%} split"
+    months_desc = ",".join(str(m) for m in config.months) if getattr(config, "months", None) else "all months"
 
     lines = [
         f"X data: {config.x_path}",
         f"Y data: {config.y_path}",
         f"Train years: {train_desc}",
         f"Test years: {test_desc}",
+        f"Months: {months_desc}",
         f"Domain: {domain_desc}",
         f"k (train) / k_eval: {config.k} / {config.k_eval}",
         f"num_epochs: {config.num_epochs}   batch_size: {config.batch_size}   lr: {config.lr}",
@@ -166,7 +170,61 @@ def years_mask(time_coord, years):
     return np.array([int(y) in years_set for y in time_years])
 
 
-def split_train_test(X, Y, time_coord, train_years, test_years, train_frac, seed=0):
+def parse_months(spec):
+    """
+    Parse a month specification string into a sorted list of ints (1-12).
+
+    Accepts comma-separated months and/or ranges, e.g.:
+        "3-7"     -> 3, 4, 5, 6, 7   (March-July)
+        "3,4,5"   -> 3, 4, 5
+        "1,6-8"   -> mix of both
+
+    Unlike parse_years, does NOT support wraparound ranges (e.g. "11-2" for
+    Nov-Feb) -- a low > high chunk is swapped, same as parse_years, which
+    would silently produce the wrong months for a wraparound season. Not
+    needed for any season used in this project so far; revisit if one comes
+    up.
+
+    Returns None if spec is None (caller should fall back to no month filter).
+    """
+    if spec is None:
+        return None
+
+    months = set()
+    for chunk in spec.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        m = re.fullmatch(r"(\d{1,2})\s*-\s*(\d{1,2})", chunk)
+        if m:
+            lo, hi = int(m.group(1)), int(m.group(2))
+            if lo > hi:
+                lo, hi = hi, lo
+            months.update(range(lo, hi + 1))
+        elif re.fullmatch(r"\d{1,2}", chunk):
+            months.add(int(chunk))
+        else:
+            raise ValueError(
+                f"Could not parse month chunk {chunk!r} in spec {spec!r}. "
+                "Use a 1-2 digit month (e.g. 3) or a range (e.g. 3-7)."
+            )
+    if not all(1 <= m <= 12 for m in months):
+        raise ValueError(f"Month spec {spec!r} contains a value outside 1-12.")
+    return sorted(months)
+
+
+def months_mask(time_coord, months):
+    """
+    Boolean mask, aligned with time_coord, True where the calendar month of
+    time_coord is in `months`. time_coord should be an xarray DataArray
+    (e.g. X.time) so .dt.month works for both datetime64 and cftime.
+    """
+    time_months = time_coord.dt.month.values
+    months_set = set(months)
+    return np.array([int(m) in months_set for m in time_months])
+
+
+def split_train_test(X, Y, time_coord, train_years, test_years, train_frac, seed=0, months=None):
     """
     Split X, Y (numpy arrays, shape (N, T, C, H, W) / (N, T, Cy, Hh, Wh))
     into train/test sets, either by explicit year lists (train_years /
@@ -174,11 +232,25 @@ def split_train_test(X, Y, time_coord, train_years, test_years, train_frac, seed
     given -- a random train_frac / (1 - train_frac) split like the
     original pipeline.
 
+    If `months` is given (a list of ints 1-12, e.g. from parse_months), the
+    data is first restricted to timestamps in those calendar months, before
+    either the year-based or random split -- so a seasonal focus (e.g.
+    March-July only) applies uniformly to both train and test samples,
+    whichever split mode is used.
+
     Returns X_train, Y_train, X_test, Y_test as flattened (Nsamples, C, H, W)
     float tensors, plus time_train, time_test (one timestamp per sample)
     and member_train, member_test (the N/ensemble-member index per sample)
     for downstream bookkeeping (e.g. the SIT time series).
     """
+    if months is not None:
+        month_mask_t = months_mask(time_coord, months)
+        if not month_mask_t.any():
+            raise ValueError(f"No timestamps in the data match the requested months {months}.")
+        X = X[:, month_mask_t]
+        Y = Y[:, month_mask_t]
+        time_coord = time_coord[month_mask_t]
+
     N, T, C, H, W = X.shape
     _, _, Cy, Hy, Wy = Y.shape
     time_vals = time_coord.values
@@ -232,6 +304,92 @@ def split_train_test(X, Y, time_coord, train_years, test_years, train_frac, seed
         member_test = member_flat[test_idx.numpy()]
 
     return X_train, Y_train, X_test, Y_test, time_train, time_test, member_train, member_test
+
+
+def select_by_years(X, Y, time_coord, years, months=None):
+    """
+    One-sided counterpart to split_train_test: restrict X, Y (numpy arrays,
+    shape (N, T, C, H, W) / (N, T, Cy, Hy, Wy)) to timestamps matching
+    `years` (required, unlike split_train_test's random-split fallback --
+    there's no sensible "random half of a different dataset" mode), after
+    an optional calendar-month restriction. Used for cross-dataset
+    evaluation (run_pipeline's `test_x_path`/`test_y_path`), where the
+    train and test fields come from two different opened datasets rather
+    than two slices of the same one, so split_train_test's single-array,
+    disjoint-mask design doesn't apply.
+
+    Returns X_fields, Y_fields (flattened (Nsamples, C, H, W) float
+    tensors), plus time_flat and member_flat (one timestamp / N-index per
+    sample), matching split_train_test's per-side return shape.
+    """
+    if months is not None:
+        month_mask_t = months_mask(time_coord, months)
+        if not month_mask_t.any():
+            raise ValueError(f"No timestamps in the data match the requested months {months}.")
+        X = X[:, month_mask_t]
+        Y = Y[:, month_mask_t]
+        time_coord = time_coord[month_mask_t]
+
+    N, T, C, H, W = X.shape
+    _, _, Cy, Hy, Wy = Y.shape
+    time_vals = time_coord.values
+
+    mask_t = years_mask(time_coord, years)
+    if not mask_t.any():
+        raise ValueError(f"No timestamps in the data match the requested years {years}.")
+
+    X_raw = X[:, mask_t]
+    Y_raw = Y[:, mask_t]
+    time_flat = np.tile(time_vals[mask_t], N)
+    member_flat = np.repeat(np.arange(N), int(mask_t.sum()))
+
+    X_fields = torch.tensor(X_raw.reshape(-1, C, H, W)).float()
+    Y_fields = torch.tensor(Y_raw.reshape(-1, Cy, Hy, Wy)).float()
+
+    return X_fields, Y_fields, time_flat, member_flat
+
+
+def collapse_wind_vector_channel(X, channel_names):
+    """
+    Cross-dataset channel harmonization: FOSI's X carries full vector wind
+    ('u_10', 'v_10', true east/north m/s) while MESA-HR's X carries only
+    wind *speed* ('U10') -- a real predictor-schema difference between the
+    two datasets' construction pipelines (see process_data/), not a bug.
+    A checkpoint's first conv layer is sized for whatever channel count it
+    trained on, so cross-dataset eval needs both sides to present the same
+    channels. If `channel_names` (X's *original* loaded channel order, i.e.
+    `X_da["channel"].values` -- before any channel appended later, like
+    --coastal-channel) contains both 'u_10' and 'v_10', collapse them into
+    a single derived wind-speed channel (sqrt(u^2+v^2)) in their place,
+    dropping wind direction, so the result matches MESA's (hi_d, aice_d,
+    wind_speed) layout. No-op (returns X, channel_names unchanged) if
+    'u_10'/'v_10' aren't both present -- i.e. this only ever fires on the
+    FOSI side, never on MESA's.
+
+    X: (N, T, C, H, W) numpy array, C >= len(channel_names) (any channels
+    appended past len(channel_names), e.g. a coastal-fraction channel, are
+    passed through untouched at the end). Returns (X_new, new_channel_names).
+    """
+    channel_names = list(channel_names)
+    if "u_10" not in channel_names or "v_10" not in channel_names:
+        return X, channel_names
+
+    u_idx = channel_names.index("u_10")
+    v_idx = channel_names.index("v_10")
+    n_orig = len(channel_names)
+    speed = np.sqrt(X[:, :, u_idx] ** 2 + X[:, :, v_idx] ** 2)[:, :, None]
+
+    keep = [i for i in range(n_orig) if i not in (u_idx, v_idx)]
+    insert_pos = sum(1 for i in keep if i < u_idx)
+    X_kept = X[:, :, keep]
+    X_extra = X[:, :, n_orig:]  # anything appended past the original schema (e.g. coastal channel)
+
+    X_new = np.concatenate(
+        [X_kept[:, :, :insert_pos], speed, X_kept[:, :, insert_pos:], X_extra], axis=2,
+    )
+    new_channel_names = [channel_names[i] for i in keep]
+    new_channel_names.insert(insert_pos, "wind_speed")
+    return X_new, new_channel_names
 
 
 # ==============================================================
@@ -758,7 +916,14 @@ class EnScaleStage(nn.Module):
             eps = torch.zeros(x.shape[0], 1, *x.shape[-2:], device=x.device)
         else:
             eps = noise_sigma * torch.randn(x.shape[0], 1, *x.shape[-2:], device=x.device)
-        parts.append(self.local_noise_mix(eps))
+        # LocallyConnected2d gives every grid location its own independent weight
+        # vector, so neighboring locations can map even correlated (unfold-overlapping)
+        # noise patches to very different outputs -- visible as pixel-scale speckle in
+        # any single ensemble member (washes out in the ensemble mean, so CRPS/energy-
+        # loss training doesn't penalize it). Smoothing the *mixed* noise (not the raw
+        # eps going in, which would blunt the paper's neighbor-conditioning mechanism
+        # itself) removes that speckle while leaving the per-location mixing intact.
+        parts.append(smooth_noise(self.local_noise_mix(eps)))
 
         return self.mlp(torch.cat(parts, dim=1))
 
@@ -1192,7 +1357,9 @@ class UNet(nn.Module):
                 eps = torch.zeros(B, 1, *pre_out_feat.shape[-2:], device=x.device)
             elif eps is None:
                 eps = torch.randn(B, 1, *pre_out_feat.shape[-2:], device=x.device)
-            mixed_noise = self.local_noise_mix(self.noise_sigma * eps)
+            # See EnScaleStage.forward's comment on why the smoothing lands here
+            # (post-mixing) rather than on the raw eps input.
+            mixed_noise = smooth_noise(self.local_noise_mix(self.noise_sigma * eps))
             refine_in = torch.cat([pre_out_feat, mixed_noise], dim=1)
             refine_out = self.refiner(refine_in)
             out = out + refine_out
@@ -1562,7 +1729,7 @@ def masked_rmse(pred, truth, mask_bool):
 
 
 def compute_metrics_table(Y_base_phys, Y_pred_det_phys, Y_pred_phys, Y_spread_phys, Y_test_phys,
-                           mask_test=None, coastal_width=5):
+                           mask_test=None, coastal_width=5, preds_all_phys=None, per_member=False):
     """
     Per-method metrics table (Bilinear / Deterministic UNet / Stochastic UNet Mean).
 
@@ -1570,28 +1737,51 @@ def compute_metrics_table(Y_base_phys, Y_pred_det_phys, Y_pred_phys, Y_spread_ph
     the same MAE/RMSE but restricted to ocean cells within `coastal_width` pixels of land
     (per-sample, via `coastal_band_mask`, so this works whether every test sample shares
     one land mask [--no-patches] or each has its own [--patches, sliding-window tiles]).
+
+    `per_member=True` (requires `preds_all_phys`, (N, K, C, H, W)): the "Stochastic UNet
+    Mean" row's MAE/RMSE/Bias/Grad MAE/Pattern Corr/SSIM/IIEE/Coastal MAE/RMSE are computed
+    as the mean, over the K individual saved ensemble members, of metric(member_k, truth) --
+    instead of metric(ensemble_mean, truth) -- via `member_metrics.compute_member_avg_metrics`.
+    Intended for MESACLIP runs, whose saved "truth" is itself a single ensemble-member
+    realization rather than a deterministic physical target, so comparing it against the
+    smoother ensemble mean understates real error (see member_metrics.py's module
+    docstring). `run_pipeline` sets this automatically via `is_mesaclip_run(config.output_dir)`.
+    Spread/Error is unaffected either way -- it's already single-truth-aware by design.
     """
     coastal_band = coastal_band_mask(mask_test[:, 0], coastal_width=coastal_width) if mask_test is not None else None
     ocean_bool = (mask_test[:, 0] <= 0.5) if mask_test is not None else None
+
+    member_avg = None
+    if per_member:
+        if preds_all_phys is None:
+            raise ValueError("per_member=True requires preds_all_phys")
+        member_avg = compute_member_avg_metrics(preds_all_phys, Y_test_phys, mask_test, coastal_width)
 
     rows = []
     for label, pred in [
         ("Bilinear", Y_base_phys), ("Deterministic UNet", Y_pred_det_phys), ("Stochastic UNet Mean", Y_pred_phys),
     ]:
-        rows.append({
-            "Method": label,
-            "MAE": mae(pred, Y_test_phys),
-            "RMSE": rmse(pred, Y_test_phys),
-            "Bias": bias(pred, Y_test_phys),
-            "Grad MAE": grad_mae(pred, Y_test_phys),
-            "Pattern Corr": pattern_corr(pred, Y_test_phys),
-            "SSIM": ssim(pred, Y_test_phys),
-            "IIEE": ice_edge_error(pred, Y_test_phys, mask_bool=ocean_bool),
-            "Coastal MAE": masked_mae(pred, Y_test_phys, coastal_band) if coastal_band is not None else np.nan,
-            "Coastal RMSE": masked_rmse(pred, Y_test_phys, coastal_band) if coastal_band is not None else np.nan,
-            "Spread/Error": spread_skill_ratio(Y_pred_phys, Y_spread_phys, Y_test_phys) if label == "Stochastic UNet Mean" else np.nan,
-        })
-    return pd.DataFrame(rows).round(4)
+        if member_avg is not None and label == "Stochastic UNet Mean":
+            row = dict(member_avg)
+        else:
+            row = {
+                "MAE": mae(pred, Y_test_phys),
+                "RMSE": rmse(pred, Y_test_phys),
+                "Bias": bias(pred, Y_test_phys),
+                "Grad MAE": grad_mae(pred, Y_test_phys),
+                "Pattern Corr": pattern_corr(pred, Y_test_phys),
+                "SSIM": ssim(pred, Y_test_phys),
+                "IIEE": ice_edge_error(pred, Y_test_phys, mask_bool=ocean_bool),
+                "Coastal MAE": masked_mae(pred, Y_test_phys, coastal_band) if coastal_band is not None else np.nan,
+                "Coastal RMSE": masked_rmse(pred, Y_test_phys, coastal_band) if coastal_band is not None else np.nan,
+            }
+        row["Method"] = label
+        row["Spread/Error"] = spread_skill_ratio(Y_pred_phys, Y_spread_phys, Y_test_phys) if label == "Stochastic UNet Mean" else np.nan
+        rows.append(row)
+
+    cols = ["Method", "MAE", "RMSE", "Bias", "Grad MAE", "Pattern Corr", "SSIM", "IIEE",
+            "Coastal MAE", "Coastal RMSE", "Spread/Error"]
+    return pd.DataFrame(rows)[cols].round(4)
 
 
 # ==============================================================
@@ -1867,18 +2057,32 @@ def save_evaluation_data(output_dir, X_test_sit_phys, Y_base_phys, Y_pred_det_ph
 
 def plot_ensemble_figure(output_dir, X_test_sit_phys, Y_base_phys, Y_pred_det_phys, preds_all_phys,
                           Y_pred_phys, Y_test_phys, test_tile_ids, tile_geometry, proj, boundary_path,
-                          bbox, idxs, mem_idx=4):
+                          bbox, idxs, mem_idx=4, member_avg_error=False):
+    """
+    member_avg_error=True adds a 7th "Mean Member Error" panel -- the
+    average, over the K saved ensemble members, of |member_k - truth| --
+    on its own colorbar (different units/scale than the six SIT-field
+    panels). Intended for MESACLIP runs, where the "One Member"/"Ensemble
+    Mean" panels alone don't show how far a typical individual member
+    actually sits from the single-realization truth -- see
+    member_metrics.py's module docstring for why that comparison matters.
+    """
     num_samples = len(idxs)
     mem_idx = min(mem_idx, preds_all_phys.shape[1] - 1)
     panel_titles = ["Low-Res Input", "Bilinear", "Deterministic", "One Member", "Ensemble Mean", "High-Res Truth"]
+    n_field_cols = len(panel_titles)
+    n_cols = n_field_cols + (1 if member_avg_error else 0)
+    if member_avg_error:
+        panel_titles = panel_titles + ["Mean Member Error"]
 
     fig, axs = plt.subplots(
-        num_samples, 6, figsize=(18, 3.3 * num_samples), constrained_layout=True, dpi=300,
+        num_samples, n_cols, figsize=(3 * n_cols, 3.3 * num_samples), constrained_layout=True, dpi=300,
         subplot_kw={"projection": proj},
     )
     if num_samples == 1:
         axs = axs[None, :]
 
+    im_err = None
     for row, idx in enumerate(idxs):
         geo = tile_geometry[test_tile_ids[idx].item()]
         ctx_lon, ctx_lat = geo["context_lon"], geo["context_lat"]
@@ -1902,22 +2106,49 @@ def plot_ensemble_figure(output_dir, X_test_sit_phys, Y_base_phys, Y_pred_det_ph
             if row == 0:
                 ax.set_title(panel_titles[col], fontsize=14)
 
+        if member_avg_error:
+            member_err = (preds_all_phys[idx, :, 0] - truth).abs().mean(dim=0)
+            ax_err = axs[row, n_field_cols]
+            im_err = ax_err.pcolormesh(
+                tgt_lon, tgt_lat, member_err, transform=ccrs.PlateCarree(), cmap="viridis", vmin=0, vmax=2, shading="auto",
+            )
+            style_polar_ax(ax_err, proj, boundary_path, bbox, tgt_lon, tgt_lat)
+            if row == 0:
+                ax_err.set_title(panel_titles[n_field_cols], fontsize=14)
+
         axs[row, 0].set_ylabel(f"Sample {row + 1}", fontsize=14)
 
-    cbar = fig.colorbar(im, ax=axs, aspect=30, shrink=0.8, pad=0.02)
+    cbar = fig.colorbar(im, ax=axs[:, :n_field_cols], aspect=30, shrink=0.8, pad=0.02)
     cbar.ax.tick_params(labelsize=14)
     cbar.set_label("Sea ice thickness (m)", fontsize=16)
+    if member_avg_error and im_err is not None:
+        cbar2 = fig.colorbar(im_err, ax=axs[:, n_field_cols], aspect=30, shrink=0.8, pad=0.02)
+        cbar2.ax.tick_params(labelsize=12)
+        cbar2.set_label("Mean |member - truth| (m)", fontsize=14)
 
     save_fig(fig, output_dir, "ensemble_figure.png", dpi=300)
 
 
 def plot_error_figure(output_dir, Y_base_phys, Y_pred_det_phys, Y_pred_phys, Y_test_phys,
-                       test_tile_ids, tile_geometry, proj, boundary_path, bbox, idxs):
+                       test_tile_ids, tile_geometry, proj, boundary_path, bbox, idxs,
+                       preds_all_phys=None, member_avg_error=False):
+    """
+    member_avg_error=True (requires preds_all_phys, (N, K, C, H, W)) adds a
+    4th "Mean Member Error" panel -- the average, over the K saved ensemble
+    members, of |member_k - truth| -- on the same color scale as the other
+    three error panels (no extra colorbar needed). Intended for MESACLIP
+    runs, where the "Ensemble Mean" error panel alone understates real
+    error the same way the metrics table's "Stochastic UNet Mean" row did
+    before member_metrics.py -- see that module's docstring.
+    """
     num_samples = len(idxs)
     panel_titles_err = ["Bilinear", "Deterministic", "Ensemble Mean"]
+    if member_avg_error:
+        panel_titles_err = panel_titles_err + ["Mean Member Error"]
+    n_cols = len(panel_titles_err)
 
     fig, axs = plt.subplots(
-        num_samples, 3, figsize=(9, 2.7 * num_samples), constrained_layout=True, dpi=300,
+        num_samples, n_cols, figsize=(3 * n_cols, 2.7 * num_samples), constrained_layout=True, dpi=300,
         subplot_kw={"projection": proj},
     )
     if num_samples == 1:
@@ -1935,8 +2166,12 @@ def plot_error_figure(output_dir, Y_base_phys, Y_pred_det_phys, Y_pred_phys, Y_t
         bilinear_ae = abs(bilinear - truth)
         det_ae = abs(det - truth)
         ens_ae = abs(ens - truth)
+        fields = [bilinear_ae, det_ae, ens_ae]
+        if member_avg_error:
+            member_ae = np.abs(preds_all_phys[idx, :, 0].numpy() - truth).mean(axis=0)
+            fields.append(member_ae)
 
-        for col, field in enumerate([bilinear_ae, det_ae, ens_ae]):
+        for col, field in enumerate(fields):
             ax = axs[row, col]
             im = ax.pcolormesh(tgt_lon, tgt_lat, field, transform=ccrs.PlateCarree(), cmap="viridis", vmin=0, vmax=2, shading="auto")
             style_polar_ax(ax, proj, boundary_path, bbox, tgt_lon, tgt_lat)
@@ -2025,8 +2260,13 @@ def run_pipeline(config):
     `config` is any object with attribute access (argparse.Namespace is
     fine) providing: x_path, y_path, output_dir, weighted_grids_dir, bbox,
     bbox_regrid, use_patches, subdomain, context_size, target_size, stride,
-    train_years, test_years, train_frac, k, num_epochs, batch_size, lr,
-    latent_channels, k_eval, eval_batch_size, make_figures, seed.
+    train_years, test_years, train_frac, months, k, num_epochs, batch_size, lr,
+    latent_channels, k_eval, eval_batch_size, make_figures, seed. Optionally
+    test_x_path/test_y_path: when both are set, the model trains on x_path/
+    y_path (restricted to train_years) but evaluates on a *different*
+    dataset (test_x_path/test_y_path, restricted to test_years) -- e.g.
+    train on FOSI, test on MESA-HR. Requires train_years and test_years both
+    set, and the two datasets to share a grid.
 
     Returns a dict with the key results (metrics_df, loss_array, etc.) so
     callers like hpo_engressnet.py can pull out a metric without re-reading
@@ -2115,13 +2355,111 @@ def run_pipeline(config):
         validate_subdomain(config.subdomain, config.bbox)
 
     # ------------------------------------------------------------
-    # Train/test split (by year, or random fallback)
+    # Train/test split (by year, or random fallback) -- or, if
+    # test_x_path/test_y_path are set, a cross-dataset split: train fields
+    # come from X/Y (above) restricted to train_years, test fields come from
+    # a *separately opened* dataset restricted to test_years (e.g. train on
+    # FOSI, evaluate the resulting checkpoint on MESA-HR). This requires an
+    # explicit train_years/test_years pair (no random-split fallback -- a
+    # random split of two different datasets isn't a meaningful "test set")
+    # and a matching target (Y) grid, since land_mask/subdomain cropping
+    # below are computed once from the primary (train) dataset's grid and
+    # reused for both sides.
     # ------------------------------------------------------------
     print("Splitting...")
-    (X_train_fields, Y_train_fields, X_test_fields, Y_test_fields,
-     time_train, time_test, member_train, member_test) = split_train_test(
-        X, Y, X_time, config.train_years, config.test_years, config.train_frac, seed=config.seed,
-    )
+    test_x_path = getattr(config, "test_x_path", None)
+    test_y_path = getattr(config, "test_y_path", None)
+    if test_x_path or test_y_path:
+        if not (test_x_path and test_y_path):
+            raise ValueError("test_x_path and test_y_path must be given together (or neither).")
+        if config.train_years is None or config.test_years is None:
+            raise ValueError(
+                "Cross-dataset evaluation (test_x_path/test_y_path) requires both "
+                "config.train_years and config.test_years -- there's no random-split "
+                "fallback across two different datasets."
+            )
+        print(f"Cross-dataset eval: training on {config.x_path}, testing on {test_x_path}")
+
+        X_test_ds = xr.open_dataset(test_x_path)
+        Y_test_ds = xr.open_dataset(test_y_path)
+        X_test_da, Y_test_da = X_test_ds.X, Y_test_ds.Y
+
+        if "time" not in X_test_da.dims or X_test_da.dims.index("time") != 1:
+            raise ValueError(
+                f"test_x_path dataset must have dims (N, time, C, H, W); found {X_test_da.dims}."
+            )
+
+        llat2, llon2 = X_test_da.lat.values, X_test_da.lon.values
+        hlat2, hlon2 = Y_test_da.lat.values, Y_test_da.lon.values
+        if llat2.shape != llat.shape or llon2.shape != llon.shape or not (
+            np.allclose(llat2, llat) and np.allclose(llon2, llon)
+        ):
+            raise ValueError(
+                "test_x_path's low-res grid doesn't match x_path's -- cross-dataset eval "
+                "requires both datasets to share a grid (land_mask/subdomain cropping are "
+                f"computed once from the training dataset). Shapes: train {llat.shape}, test {llat2.shape}."
+            )
+        if hlat2.shape != hlat.shape or hlon2.shape != hlon.shape or not (
+            np.allclose(hlat2, hlat) and np.allclose(hlon2, hlon)
+        ):
+            raise ValueError(
+                "test_y_path's high-res grid doesn't match y_path's -- cross-dataset eval "
+                "requires both datasets to share a grid. Shapes: "
+                f"train {hlat.shape}, test {hlat2.shape}."
+            )
+
+        X2 = X_test_da.values
+        Y2 = Y_test_da.values
+        X2[:, :, 0, :, :] = np.clip(X2[:, :, 0, :, :], None, 6.0)
+        Y2 = np.clip(Y2, None, 6.0)
+
+        # Predictor-schema harmonization: FOSI's X carries full vector wind
+        # (u_10, v_10) while MESA-HR's carries only wind speed (U10) -- a real
+        # difference between the two datasets' predictor-construction pipelines,
+        # discovered via a mismatched-tensor-shape crash the first time this
+        # cross-dataset path was smoke-tested. Collapse whichever side has the
+        # vector-wind pair down to a single derived speed channel so both sides
+        # present the same channel count/order (see collapse_wind_vector_channel's
+        # docstring) -- confirmed by the user as the preferred fix over dropping
+        # wind entirely. Uses the *original* dataset channel coordinate, not
+        # X.shape, since X may already carry an appended --coastal-channel.
+        if "channel" in X_da.coords and "channel" in X_test_da.coords:
+            train_channel_names = list(X_da["channel"].values)
+            test_channel_names = list(X_test_da["channel"].values)
+            if len(train_channel_names) != len(test_channel_names):
+                print(f"Predictor channel mismatch: train={train_channel_names}, test={test_channel_names} "
+                      "-- attempting to reconcile by collapsing vector wind (u_10, v_10) to wind speed.")
+                X, train_channel_names = collapse_wind_vector_channel(X, train_channel_names)
+                X2, test_channel_names = collapse_wind_vector_channel(X2, test_channel_names)
+                print(f"After harmonization: train channels={train_channel_names}, test channels={test_channel_names}.")
+        if X.shape[2] != X2.shape[2]:
+            raise ValueError(
+                f"Train X has {X.shape[2]} channels, test X has {X2.shape[2]} -- cross-dataset eval "
+                "requires matching predictor channels, and the vector-wind-to-speed harmonization "
+                "(collapse_wind_vector_channel) wasn't enough to reconcile them. Extend it or align "
+                "the two datasets' predictor schemas manually."
+            )
+
+        if getattr(config, "coastal_channel", False):
+            ocean_frac_lr2 = build_ocean_frac_channel(llat2, llon2, config.bbox_regrid, config.weighted_grids_dir)
+            N2, T2 = X2.shape[0], X2.shape[1]
+            coastal_channel2 = np.broadcast_to(
+                ocean_frac_lr2[None, None, None, :, :], (N2, T2, 1, *ocean_frac_lr2.shape)
+            ).astype(np.float32)
+            X2 = np.concatenate([X2, coastal_channel2], axis=2)
+
+        X_train_fields, Y_train_fields, time_train, member_train = select_by_years(
+            X, Y, X_time, config.train_years, months=getattr(config, "months", None),
+        )
+        X_test_fields, Y_test_fields, time_test, member_test = select_by_years(
+            X2, Y2, X_test_da["time"], config.test_years, months=getattr(config, "months", None),
+        )
+    else:
+        (X_train_fields, Y_train_fields, X_test_fields, Y_test_fields,
+         time_train, time_test, member_train, member_test) = split_train_test(
+            X, Y, X_time, config.train_years, config.test_years, config.train_frac, seed=config.seed,
+            months=getattr(config, "months", None),
+        )
 
     # ------------------------------------------------------------
     # Normalize
@@ -2254,10 +2592,28 @@ def run_pipeline(config):
     # ------------------------------------------------------------
     # Metrics
     # ------------------------------------------------------------
+    # Cross-dataset eval (test_y_path set): the per-member-averaged-metrics
+    # correction should key off which dataset supplies the *test* truth
+    # (Y_test_phys), not the training data or the output-dir naming
+    # convention -- a "<train>_train_<test>_test"-style cross-run's folder
+    # name doesn't map cleanly onto is_mesaclip_run's MESA_-prefix heuristic
+    # either way, and using it would get the direction backwards half the
+    # time. Same-dataset runs are unaffected -- unchanged output-dir check.
+    test_y_path = getattr(config, "test_y_path", None)
+    if test_y_path:
+        mesaclip_run = "MESA" in os.path.basename(test_y_path).upper()
+    else:
+        mesaclip_run = is_mesaclip_run(config.output_dir)
     metrics_df = compute_metrics_table(
         Y_base_phys, Y_pred_det_phys, Y_pred_phys, Y_spread_phys, Y_test_phys,
         mask_test=mask_test, coastal_width=config.coastal_width,
+        preds_all_phys=preds_all_phys if mesaclip_run else None, per_member=mesaclip_run,
     )
+    if mesaclip_run:
+        detected_via = "test_y_path" if test_y_path else "output dir starts with 'MESA_'"
+        print(f"MESACLIP run detected (via {detected_via}): 'Stochastic UNet Mean' "
+              "metrics are per-member-then-averaged against the single-realization truth, not "
+              "ensemble-mean-vs-truth -- see member_metrics.py.")
     metrics_df.to_csv(os.path.join(config.output_dir, "metrics.csv"), index=False)
     print(metrics_df)
 
@@ -2306,12 +2662,14 @@ def run_pipeline(config):
         plot_ensemble_figure(
             config.output_dir, X_test_sit_phys, Y_base_phys, Y_pred_det_phys, preds_all_phys,
             Y_pred_phys, Y_test_phys, test_tile_ids, tile_geometry, proj, boundary_path, config.bbox, fig_idxs,
+            member_avg_error=mesaclip_run,
         )
 
         print("Rendering error figure...")
         plot_error_figure(
             config.output_dir, Y_base_phys, Y_pred_det_phys, Y_pred_phys, Y_test_phys,
             test_tile_ids, tile_geometry, proj, boundary_path, config.bbox, fig_idxs,
+            preds_all_phys=preds_all_phys, member_avg_error=mesaclip_run,
         )
 
     print("All done. Outputs written to:", config.output_dir)
