@@ -6,4 +6,6 @@ saved_figs/
 logs/
 hpo_echo/
 optimization/log.txt
+.member_metrics_cache.json
+.member_rmse_cache.json
 
