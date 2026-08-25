@@ -4,7 +4,7 @@ Deep learning stochastic downscaling of Arctic sea ice thickness (SIT) for regio
 coastal sea ice. A coarse CESM/reanalysis-forced "low-res" field is downscaled onto a
 high-res target grid with a stochastic UNet trained via an energy-score ("EngressNet")
 loss, targeting the Kivalina/Shishmaref/Kotzebue/Nome/Point Hope coastal region of
-Alaska. This is research code developed and run on NCAR HPC (Casper).
+Alaska.
 
 ## Repository Contents
 
@@ -85,7 +85,7 @@ The pipeline is organized into five stages, one per top-level directory:
   per_member=False`: when `per_member=True` (auto-set by `run_pipeline` whenever the
   output directory is a MESACLIP run), the "Stochastic UNet Mean" row is computed as
   each ensemble member scored against truth, then averaged, rather than the smoother
-  ensemble-mean prediction scored against truth -- MESACLIP's saved truth is a single
+  ensemble-mean prediction scored against truth, MESACLIP's saved truth is a single
   CESM1 realization, not a deterministic target, so the naive ensemble-mean comparison
   understates real error (Jensen's inequality). `Spread/Error` is deliberately unchanged
   by this, since it's already single-truth-aware by design. Also gained
