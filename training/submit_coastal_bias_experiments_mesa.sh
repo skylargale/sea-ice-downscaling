@@ -11,7 +11,7 @@
 # See submit_coastal_bias_experiments.sh for the full per-cause rationale (regridding
 # noise / land-mask threshold / decoder over-smoothing). Differences here are purely
 # MESA-specific plumbing:
-#   - Data-prep job runs process_data/build_Y_MESA-HR_daily_conservative.py (6-member
+#   - Data-prep job runs processing/build_Y_MESA-HR_daily_conservative.py (6-member
 #     ensemble, RCP8.5 files, needs pop_tools) instead of the FOSI version.
 #   - Training jobs go through submit_engressnet_daily_mesa.sh instead of
 #     submit_engressnet_daily.sh (256GB mem, since MESA's 6 ensemble members multiply the
@@ -30,7 +30,7 @@ if [ "${1:-}" = "--submit" ]; then
     SUBMIT=true
 fi
 
-mkdir -p logs process_data/logs
+mkdir -p logs processing/logs
 
 BATCH_NAME="MESA_coastal_bias_experiments"
 COMMON="BATCH_NAME=${BATCH_NAME},DATA_VARIANT=interp,TRAIN_YEARS=2015-2020,TEST_YEARS=2021"
@@ -38,10 +38,10 @@ COMMON="BATCH_NAME=${BATCH_NAME},DATA_VARIANT=interp,TRAIN_YEARS=2015-2020,TEST_
 n_jobs=0
 
 echo "--- Data prep: conservative-regridded Y (2015-2021, 6-member ensemble) ---"
-echo "(cd process_data && qsub submit_build_Y_MESA-HR_daily_conservative.sh)"
+echo "(cd processing && qsub submit_build_Y_MESA-HR_daily_conservative.sh)"
 DATA_JOB_ID=""
 if [ "$SUBMIT" = true ]; then
-    DATA_JOB_ID=$(cd process_data && qsub submit_build_Y_MESA-HR_daily_conservative.sh)
+    DATA_JOB_ID=$(cd processing && qsub submit_build_Y_MESA-HR_daily_conservative.sh)
     echo "  -> ${DATA_JOB_ID}"
 fi
 n_jobs=$((n_jobs + 1))

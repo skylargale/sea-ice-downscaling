@@ -14,8 +14,8 @@
 # This file is the STITCHED HIST (1920-2006, subset to >=1999) + RCP8.5
 # (2006-2021ish) record, restricted to the 6-member ensemble intersection
 # that has complete daily data in both periods (.004/.005/.006/.007/.008/
-# .010 -- see process_data/build_X_Y_from_MESA-HR_daily_rcp85.py and
-# process_data/stitch_MESA_HR_daily_hist_rcp85.py for why 3 of the original
+# .010 -- see processing/build_X_Y_from_MESA-HR_daily_rcp85.py and
+# processing/stitch_MESA_HR_daily_hist_rcp85.py for why 3 of the original
 # 9 HIST members were dropped). Unlike FOSI's single-realization daily data,
 # every MESA sample has a real ensemble-member axis, so at a given time span
 # there are ~6x more (member, time) training/eval samples than FOSI would

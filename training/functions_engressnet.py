@@ -354,7 +354,7 @@ def collapse_wind_vector_channel(X, channel_names):
     Cross-dataset channel harmonization: FOSI's X carries full vector wind
     ('u_10', 'v_10', true east/north m/s) while MESA-HR's X carries only
     wind *speed* ('U10') -- a real predictor-schema difference between the
-    two datasets' construction pipelines (see process_data/), not a bug.
+    two datasets' construction pipelines (see processing/), not a bug.
     A checkpoint's first conv layer is sized for whatever channel count it
     trained on, so cross-dataset eval needs both sides to present the same
     channels. If `channel_names` (X's *original* loaded channel order, i.e.
@@ -477,7 +477,7 @@ def build_ocean_frac_channel(llat, llon, bbox_regrid, weighted_grids_dir):
     at the very last layer (see out_conv in UNet.forward).
 
     Deliberately NOT a revival of the old X `ocean_frac` channel from
-    process_data/build_X_Y_from_FOSI-HR_daily.py, which had a real NaN bug
+    processing/build_X_Y_from_FOSI-HR_daily.py, which had a real NaN bug
     (missing skipna=True + fillna(0) on the conservative regridder left
     ~10% of destination cells NaN) that led to it being dropped from X
     entirely rather than fixed. This reuses the exact regridding machinery

@@ -7,8 +7,8 @@
 # = 64 jobs), but against the stitched HIST+RCP8.5 daily MESA data instead
 # of FOSI. Requires X_MESA_HR_daily_{interp,avg}.nc / Y_MESA_HR_daily.nc to
 # exist first -- run, in order:
-#   1. process_data/submit_build_X_Y_from_MESA-HR_daily_rcp85.sh
-#   2. process_data/submit_stitch_MESA_HR_daily.sh
+#   1. processing/submit_build_X_Y_from_MESA-HR_daily_rcp85.sh
+#   2. processing/submit_stitch_MESA_HR_daily.sh
 # before this script.
 #
 # Axes (identical definitions to the FOSI combo sweep -- see that script for

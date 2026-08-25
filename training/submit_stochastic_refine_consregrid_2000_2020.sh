@@ -4,7 +4,7 @@
 #
 # Trains the recommended config (STOCHASTIC_REFINE=true, NOISE_SIGMA=1.0) against the new
 # conservative-regridded truth (Y_FOSI_HR_JRA55_daily_conservative_2000_2020.nc, built by
-# ../../process_data/build_Y_FOSI-HR_daily_conservative_2000_2020.py) across the full
+# ../../processing/build_Y_FOSI-HR_daily_conservative_2000_2020.py) across the full
 # standard grid, retraining (not just re-evaluating -- the earlier single-split
 # re-evaluation-only test was inconclusive because it measured an already-bilinear-trained
 # model against a moved target). Matched bilinear-truth baseline arm is

@@ -4,7 +4,7 @@
 #
 # MESA-HR twin of submit_stochastic_refine_consregrid_2000_2020.sh: trains the recommended
 # config against Y_MESA_HR_daily_conservative_2000_2020.nc (built by
-# ../../process_data/build_Y_MESA-HR_daily_conservative_2000_2020.py, the full HIST+RCP8.5
+# ../../processing/build_Y_MESA-HR_daily_conservative_2000_2020.py, the full HIST+RCP8.5
 # conservative pipeline), chained after that data-prep job.
 #
 #   ./submit_stochastic_refine_consregrid_2000_2020_mesa.sh 5622475              # dry run

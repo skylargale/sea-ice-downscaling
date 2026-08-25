@@ -71,7 +71,7 @@ def parse_args():
     p.add_argument("--stride", type=int, default=fe.DEFAULT_STRIDE)
 
     # Model / training hyperparameters
-    # lr/k/batch_size defaults come from hpo_echo/trial_results.csv trial 11 (best rmse,
+    # lr/k/batch_size defaults come from optimization/trial_results.csv trial 11 (best rmse,
     # 0.1321, tied with trial 13) -- see the caveats in submit_engressnet.sh before trusting
     # these blindly on top of the coastal-loss/ocean_frac changes made after that HPO run.
     p.add_argument("--k", type=int, default=9, help="Ensemble size during training.")

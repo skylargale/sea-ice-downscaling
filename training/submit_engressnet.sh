@@ -57,7 +57,7 @@ LON_MAX="${LON_MAX:--151}"
 NUM_EPOCHS="${NUM_EPOCHS:-20}"
 
 # Ensemble size during training (energy_loss's pairwise diversity term). K=9 matches
-# hpo_echo/trial_results.csv trial 11 (best rmse, 0.1321, tied with trial 13) -- lr and
+# optimization/trial_results.csv trial 11 (best rmse, 0.1321, tied with trial 13) -- lr and
 # batch_size were updated the same way, as train_engressnet.py's own --lr/--batch-size
 # defaults, since they aren't overridden here. Caveat: that HPO run (2026-07-15) predates
 # the coastal-weighted loss and the ocean_frac 5th X channel added since, and used

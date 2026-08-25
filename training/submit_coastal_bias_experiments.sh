@@ -15,7 +15,7 @@
 #   ocean, and bilinear regridding onto a mostly-land destination cell is noisy): tested
 #   for real this time by actually training against a conservative-regridded Y (previous
 #   test only re-evaluated an already-trained model against cleaner truth, which just
-#   measures against a moved target). Needs process_data/build_Y_FOSI-HR_daily_conservative.py
+#   measures against a moved target). Needs processing/build_Y_FOSI-HR_daily_conservative.py
 #   to run first (submitted here too, with the training job chained after it via
 #   `qsub -W depend=afterok`) -- see that script for why it's scoped to 2015-2021 only.
 #   Job: FOSI_consregrid (Y_PATH_OVERRIDE points at the new conservative Y file).
@@ -43,7 +43,7 @@ if [ "${1:-}" = "--submit" ]; then
     SUBMIT=true
 fi
 
-mkdir -p logs process_data/logs
+mkdir -p logs processing/logs
 
 BATCH_NAME="FOSI_coastal_bias_experiments"
 COMMON="BATCH_NAME=${BATCH_NAME},DATA_VARIANT=interp,TRAIN_YEARS=2015-2020,TEST_YEARS=2021"
@@ -51,13 +51,13 @@ COMMON="BATCH_NAME=${BATCH_NAME},DATA_VARIANT=interp,TRAIN_YEARS=2015-2020,TEST_
 n_jobs=0
 
 echo "--- Data prep: conservative-regridded Y (2015-2021) ---"
-echo "(cd process_data && qsub submit_build_Y_FOSI-HR_daily_conservative.sh)"
+echo "(cd processing && qsub submit_build_Y_FOSI-HR_daily_conservative.sh)"
 DATA_JOB_ID=""
 if [ "$SUBMIT" = true ]; then
-    # cd into process_data/ first so PBS_O_WORKDIR (and this script's own "cd
-    # $PBS_O_WORKDIR") resolves there, not Version4/ root -- the python script and its
-    # logs/ dir both live in process_data/, not here.
-    DATA_JOB_ID=$(cd process_data && qsub submit_build_Y_FOSI-HR_daily_conservative.sh)
+    # cd into processing/ first so PBS_O_WORKDIR (and this script's own "cd
+    # $PBS_O_WORKDIR") resolves there, not Version5/ root -- the python script and its
+    # logs/ dir both live in processing/, not here.
+    DATA_JOB_ID=$(cd processing && qsub submit_build_Y_FOSI-HR_daily_conservative.sh)
     echo "  -> ${DATA_JOB_ID}"
 fi
 n_jobs=$((n_jobs + 1))
