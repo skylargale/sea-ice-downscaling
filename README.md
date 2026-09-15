@@ -1,6 +1,6 @@
 # SeaIceDownscaling (Version 6)
 
-## Purpose
+## Version Update
 
 Version6 is a deliberately narrow fork of `Version5/`'s code: same recommended-config toggles
 (`STOCHASTIC_REFINE=true`, `NOISE_SIGMA=1.0`, `NOISE_SHARED_BIAS=true`, `DATA_VARIANT=avg`), but
@@ -17,9 +17,6 @@ Version5's full script history (data-prep variants, a finished HPO study, CryoSa
 observing-system-design research, validation notebooks), and everything not load-bearing for
 this specific retrain-and-evaluate task was deleted (2026-09-15) to keep the fork legible. If you
 need any of that other material, it still exists unchanged in `Version5/`.
-
-**No PBS training job has been submitted from here yet** — this is pending explicit review/
-approval before any `qsub` runs.
 
 ## Layout
 
