@@ -20,6 +20,8 @@ each) — FOSI is done, MESA is still running. Everything else in this document 
 ```
 STOCHASTIC_REFINE=true
 NOISE_SIGMA=1.0
+NOISE_SHARED_BIAS=true    # added 2026-09-12 -- root-cause fix for a patchy per-pixel artifact,
+                          # also a net accuracy/calibration win, not just cosmetic -- see below
 DATA_VARIANT=avg          # confirmed better than interp on both datasets, see below
 LAND_THRESHOLD=0.1        # default -- combining with 0.5 tested, does NOT help, see below
 EXTRA_LAYER=false
@@ -28,7 +30,22 @@ COASTAL_CHANNEL=false
 CLASSIFICATION_HEAD=false
 ATTENTION_END=false
 ```
-i.e. `qsub -v BATCH_NAME=...,TRAIN_YEARS=...,TEST_YEARS=...,DATA_VARIANT=avg,STOCHASTIC_REFINE=true,NOISE_SIGMA=1.0 submit_engressnet_daily.sh`
+i.e. `qsub -v BATCH_NAME=...,TRAIN_YEARS=...,TEST_YEARS=...,DATA_VARIANT=avg,STOCHASTIC_REFINE=true,NOISE_SIGMA=1.0,NOISE_SHARED_BIAS=true submit_engressnet_daily.sh`
+
+**Checkpoints to actually use for the paper**: `results/MESA_stochastic_refine_sweep_avg_sharedbias/`
+(MESA). For FOSI, `results/FOSI_stochastic_refine_sweep_avg_sharedbias/` is a **symlink** (added
+2026-09-15) to `results/FOSI_daily_combo_avg_recheck_currentcode_sharedbias/` (the item-10
+confirmation rerun, jobs 5910301-304) rather than a dedicated retrain — a dedicated
+`submit_stochastic_refine_sweep_mesa_sharedbias.sh`-style FOSI retrain turned out unnecessary:
+the recheck already has FOSI run with identical toggles/domain/hyperparameters to the recommended
+config, `NOISE_SHARED_BIAS=true` included, and the shared-bias effect on FOSI is essentially flat
+(RMSE 0.1802 pre-fix -> 0.1805 with both fixes, vs. MESA's real ~3% win, plausibly because FOSI's
+truth is a smooth deterministic single trajectory rather than MESA's per-member-averaged
+comparison against a noisy single-realization truth, so the per-member texture artifact barely
+shows up in FOSI's metrics either way). The symlink exists purely so any script/notebook that
+expects a checkpoint at the "official" path finds one, without spending GPU-hours re-deriving a
+result already in hand. Don't use the pre-fix `results/MESA_stochastic_refine_sweep_avg/` or
+`results/FOSI_stochastic_refine_sweep_avg/` going forward except for before/after comparison.
 
 This is **not** the config the original sweep was aimed at confirming. Going in, the
 natural best-guess candidate was `ENSCALE_NET=true,LAND_THRESHOLD=0.5` (the two
@@ -132,6 +149,26 @@ architectural or data-side. The original coastal-bias problem remains genuinely 
 this project has now ruled out the three most obvious candidate fixes rather than found
 one.
 
+**Limitation to state explicitly in the paper** (documented 2026-09-15, no new fix attempted):
+coastal error is a real, quantified, and currently unsolved weakness of this method, not an
+oversight — say so directly rather than letting a reviewer find it. Concretely: the recommended
+config's Coastal RMSE (0.189 MESA, 0.296 FOSI, after the shared-bias fix) runs roughly 1.7-2x the
+domain-wide RMSE (0.108 MESA, 0.180 FOSI) — errors concentrate specifically at the coast. Three
+structurally different fixes (loss-side land-threshold tightening, architecture-side
+refiner+land-threshold combo, data-side conservative-vs-bilinear truth regridding) were tried and
+all three failed the identical way: a small coastal gain bought at a disproportionate cost to
+overall accuracy, with no calibration benefit either. That consistency across three unrelated
+intervention types is itself informative — it suggests the coastal error isn't a simple
+regridding or loss-weighting artifact fixable by tuning existing knobs, but something more
+structural (e.g. the fundamental information loss of downscaling a coarse coastal cell that mixes
+land and ocean, or a genuine limit of this receptive-field size at the coastline). Worth framing
+as a specific direction for future work rather than an incidental caveat: e.g. an explicit
+coastal loss term with a different functional form (not just re-weighting existing MSE/energy
+loss), or a boundary-aware architectural change (e.g. the `deep_mask_head` toggle from the
+2026-09-12 round already shows a real IIEE win from more mask-aware decoder capacity, at a
+calibration cost -- see below -- suggesting the mask-processing-depth axis is more promising than
+the three loss/data-side levers already exhausted).
+
 ## Data variant: conservative regridding for the 2000-2020 target — resolved, negative
 
 This closes out the "production data is still bilinear" question **for the actual
@@ -162,7 +199,11 @@ gained a `SEED` passthrough (`--seed`, `torch.manual_seed` + train/test-split RN
 round specifically to make this test possible. 5 seeds each (seed 0 = the original
 single-split evidence run), same split (2000-2005→2021), interp:
 
-- **FOSI**: RMSE 0.2145–0.2184 (±1.8% around the mean), Spread/Error 0.843–0.936 (±10%).
+- **FOSI**: RMSE 0.2145–0.2184 (±1.8% around the mean), Spread/Error 0.811–0.936 (±11%,
+  **corrected 2026-09-15** from a previously-stated 0.843 lower bound that didn't match any of
+  the 5 actual seed runs when directly recomputed — the true minimum is seed 0's own
+  `results/FOSI_stochastic_refine_sweep_interp/FOSI_refine_interp_2000-2005_2021_5622249.casper-pbs`
+  at 0.8114; mean across all 5 seeds is 0.8807).
 - **MESA**: RMSE 0.1323–0.1354 (±2.3% around the mean), Spread/Error 0.872–0.993 (±12%).
 
 Same shape both times: **RMSE is tightly reproducible run-to-run; Spread/Error is
@@ -189,7 +230,7 @@ than genuinely better generalization to the melt season specifically. Checked di
 each `FOSI_fullyear_avg`/`MESA_fullyear_avg` checkpoint was re-evaluated (inference only,
 no retraining) against a Mar-Jul-only slice of its own test set, using
 `functions_engressnet.py`'s own load/split/normalize/evaluate functions directly (script:
-`process_data`-adjacent one-off, `submit/evaluation/submit_eval_fullyear_on_season.sh`).
+`processing`-adjacent one-off, `submit/evaluation/submit_eval_fullyear_on_season.sh`).
 4-window averages, same test period for both arms this time:
 
 | Metric | FOSI, trained Mar-Jul | FOSI, trained full-year (tested Mar-Jul only) | MESA, trained Mar-Jul | MESA, trained full-year (tested Mar-Jul only) |
@@ -230,7 +271,7 @@ Spread/Error 1.65, indistinguishable from baseline — not worth pursuing furthe
 
    | Config | Dataset | RMSE | Coastal RMSE | Spread/Error |
    |---|---|---|---|---|
-   | Refiner alone | FOSI | 0.2174 | 0.4005 | 0.843 (near-ideal) |
+   | Refiner alone | FOSI | 0.2161 | 0.3978 | 0.881 (near-ideal) |
    | Attention-end alone | FOSI | 0.2178 | 0.4050 | 1.358 (over-dispersive) |
    | Refiner+attention combo | FOSI | 0.2168 | 0.4027 | 1.076 (over-dispersive) |
    | Refiner alone | MESA | 0.1339 | 0.2534 | 0.986 (near-ideal) |
@@ -241,10 +282,17 @@ Spread/Error 1.65, indistinguishable from baseline — not worth pursuing furthe
    two ingredients with no improvement, and MESA's Coastal RMSE is actually the worst
    of any of the three configs. Calibration moves in the same direction both times —
    from the refiner's already-near-ideal Spread/Error into mild over-dispersion (FOSI
-   0.843→1.076, MESA 0.986→1.035) — the opposite of a calibration win; on MESA it's
+   0.881→1.076, MESA 0.986→1.035) — the opposite of a calibration win; on MESA it's
    still much better than attention-end alone's poor 1.229, but worse than the refiner
    by itself. **The two toggles don't compose usefully — adding attention-end to the
    refiner is a net negative or neutral change, never a win, on either dataset.**
+   (**Corrected 2026-09-15**: FOSI's "Refiner alone" row originally read 0.2174/0.4005/0.843 --
+   verified directly against `results/`, this didn't match any actual run, including the 5-seed
+   variance set for this exact window/config. Replaced with the mean of that 5-seed set
+   (0.2161/0.3978/0.881), the closest verified single-split-equivalent reference actually on
+   record; individual seeds range 0.2145-0.2184 / 0.3923-0.4070 / 0.811-0.936, so the qualitative
+   conclusion above — refiner+attention moves further from ideal calibration than the refiner
+   alone, in every seed — is unaffected by which exact reference point is used.)
 2. ~~Refiner+land-threshold combo and the conservative-regrid comparison, checked on
    `avg`~~ — **RESOLVED 2026-08-18, both datasets, both combos, same conclusion as
    `interp` in every case:**
@@ -312,3 +360,387 @@ loss, not a collapse. Calibration also degrades cross-dataset: FOSI→MESA's Spr
 (0.77-0.86) drifts further under-dispersive than in-domain FOSI's 0.833 — consistent
 with a model whose learned noise-injection scale was calibrated for one dataset's error
 statistics not transferring cleanly to the other's.
+
+## Distributional evaluation and baseline (2026-09 review round)
+
+Added in response to a coauthor review asking for a distributional baseline and richer
+distributional evaluation, beyond the existing Spread/Error and rank histogram:
+
+- **New permanent evaluation sections** in `evaluation/run_daily_eval_batch.py`: section 16
+  (CRPS, the standard proper-scoring-rule metric, broken out by the same SIT-regime bins as
+  the Spread/Error section) and section 13b (per-ensemble-member isotropic PSD, checking
+  whether individual stochastic draws — not just the ensemble mean, which is all section 13's
+  domain-wide PSD comparison covers — reproduce realistic small-scale spatial texture, and
+  whether the *spread* of member spectra is itself calibrated). Both apply automatically to
+  every future run through this script, not just the ones evaluated below.
+- **Distributional baseline**: `evaluation/build_analog_baseline.py`, a nearest-neighbor
+  ("analog") method — for each test-time low-res X, finds the K=20 nearest analogs in the
+  *training* period by KD-tree and uses their corresponding truth Y fields as the predictive
+  ensemble. No training loop; reuses `functions_engressnet.py`'s own load/split/normalize/crop
+  path and `compute_metrics_table`/`save_evaluation_data`, so its output is a real run
+  (`results/MESA_analog_baseline/`) that every existing evaluation tool works against
+  unmodified.
+
+4-window average (MESA, `avg` variant, same methodology as the rest of this document):
+
+| Metric | Stochastic UNet (recommended) | Analog baseline (K=20) | Ratio |
+|---|---|---|---|
+| RMSE | 0.1111 | 0.2700 | 2.43x worse |
+| Coastal RMSE | 0.1938 | 0.4404 | 2.27x worse |
+| Pattern Corr | 0.8783 | 0.6654 | 0.76x |
+| SSIM | 0.9344 | 0.8380 | 0.90x |
+| Spread/Error (1.0 = ideal) | 1.034 | 1.341 | more over-dispersive |
+| CRPS, domain-wide (m) | 0.0350 | 0.0844 | 2.41x worse |
+| CRPS, open water / thin / moderate / thick ice (m) | 0.0058 / 0.0506 / 0.0731 / 0.0955 | 0.0148 / 0.1319 / 0.1788 / 0.2212 | ~2.3-2.6x worse in every regime |
+
+For reference, bilinear (identical baseline in both batches, since it doesn't depend on the
+model) scores RMSE 0.2581 / Coastal RMSE 0.2651 — **the analog baseline is worse than plain
+bilinear interpolation** on both, despite being a genuinely distributional method: matching on
+the coarse low-res field doesn't guarantee the historical analog's fine-scale structure
+resembles the current one. The stochastic UNet beats the analog baseline by a consistent
+2.2-2.6x on every proper-scoring/calibration metric, in every SIT regime.
+
+## Deterministic-vs-stochastic accuracy/calibration trade-off — write-up for the paper (2026-09-15)
+
+**A real, quantified accuracy-vs-calibration trade-off, not a free lunch.** The plain
+Deterministic UNet (same backbone, no `stochastic_refine`) beats the Stochastic UNet's own
+ensemble mean on raw accuracy, on both the pre-fix and shared-bias-fixed checkpoints:
+
+| Checkpoint | Deterministic RMSE | Stochastic-mean RMSE | Relative gap |
+|---|---|---|---|
+| Pre-fix (original recommended, MESA) | 0.1022 | 0.1111 | ~9% |
+| **Shared-bias fix (current recommended, MESA)** | **0.1042** | **0.1080** | **~3.6%** |
+
+The shared-bias fix narrowed this gap by more than half (9%→3.6%) as a side effect of fixing the
+patchy-bias artifact — worth mentioning as an incidental benefit, though calibration (not
+accuracy) was the fix's actual target. The gap is still larger than the ±2% seed-run-to-run noise
+band quantified above, so it's a real, structural cost, not sampling noise.
+
+**CRPS does not rescue this, and a reviewer could make the same point independently.** CRPS
+reduces exactly to MAE for a point forecast — there's no separate "CRPS" to compute for a
+deterministic model, its MAE already is the number that would go in that column. On the pre-fix
+checkpoint, the Deterministic UNet's MAE (0.031) was *lower* than the stochastic ensemble's real
+CRPS (0.035 domain-wide) — meaning a naive side-by-side of "CRPS" would have nominally favored
+the point forecast. (The equivalent comparison on the shared-bias-fixed checkpoint needs the
+CRPS rerun in progress, item 1 above, to state precisely — update this table once that lands.)
+
+**The actual, defensible case for the stochastic method has to rest on calibration evidence
+specifically, not on CRPS or RMSE.** The Deterministic UNet has no Spread/Error at all — not a
+tie on calibration, a structural inability to represent uncertainty in the first place. The
+paper's argument for the method should lean on the reliability diagram (per-threshold Brier
+scores), rank histogram (domain-wide flatness), and Spread/Error (near-ideal calibration, ~0.97
+post-fix) — i.e., "the ensemble tells you when to trust it, which a point forecast structurally
+cannot" — rather than implying the stochastic method is simply more accurate, which the raw
+numbers don't support and a careful reader would notice.
+
+**This isn't a one-off quirk of `stochastic_refine`** — the same shape (calibration gain, real
+accuracy cost) was independently seen with `attention_end` in the toggle sweep above, and again
+with `deep_mask_head` in the 2026-09-12 round (IIEE improves, Spread/Error worsens). Three
+unrelated architectural changes producing the same trade-off shape is reasonable evidence this is
+a genuine property of pushing calibration in this architecture family, not a fixable artifact of
+any one toggle — worth stating as a general finding, not just a caveat specific to the
+recommended config.
+
+## Known issue found 2026-09-11: recommended checkpoints predate the noise-shared-bias fix
+
+`functions_engressnet.py`'s `LocallyConnected2d`/`noise_bias_smoothness_penalty` docstrings
+document a root-cause fix (2026-08-26) for a persistent, non-random, spatially-rough texture
+that survives even `stochastic_refine`'s fully deterministic (eps=0) pass, caused by its
+noise-mixing layer's per-location bias having no smoothness constraint — fixed by
+`--noise-shared-bias` (ties that bias to one shared vector instead of one independent value per
+grid cell). **Confirmed directly against `model_state_dict.pt`**: both
+`results/MESA_stochastic_refine_sweep_avg/` (written 2026-08-17) and
+`results/FOSI_stochastic_refine_sweep_avg/` (same era) have `local_noise_mix.bias` shaped
+`(46500, 4)` — one independent value per grid cell, i.e. **pre-fix**, nine days before the fix
+landed. This plausibly explains this round's per-member PSD finding above (members' spectra
+were suspiciously similar to each other, with an unexplained excess of high-wavenumber energy
+in the member mean vs. truth) as a symptom of this specific bug rather than generic
+under-dispersion.
+
+**Retrain complete (2026-09-15) — a real win, adopted as the new MESA ★ recommendation.** Full
+numbers (RMSE, Coastal RMSE, IIEE, Spread/Error) are in "Shared-bias / deep-mask-head /
+noise-mix results" below, rather than duplicated here. Headline: RMSE 0.1111→0.1080 (−2.8%),
+calibration 1.034→0.972 (closer to ideal from the other side). **FOSI's equivalent checkpoints
+still have not been submitted** — `results/FOSI_stochastic_refine_sweep_avg_sharedbias/` does not
+exist yet; the MESA-only result should not be assumed to carry over to FOSI. **CRPS-by-regime and
+per-member PSD spread (sections 16/13b) also have not yet been re-run against this batch** — do
+that before claiming the texture-calibration bug is fully resolved, not just RMSE/Pattern
+Corr/Spread-Error.
+
+Two more architecture experiments launched alongside it, same 4-window MESA/avg methodology,
+each testing one toggle in isolation on top of the shared-bias fix:
+- `submit/training/submit_deep_mask_head_sweep_mesa.sh` (`--deep-mask-head`, into
+  `results/MESA_deep_mask_head_sweep_avg/`) -- adds a 2-layer conv block processing the
+  high-res land mask right after it's concatenated in, giving the network real depth to learn
+  coastal-aware behavior instead of one bare 3x3 conv. Not the same idea as `coastal_channel`
+  (a low-res proxy fed to the *encoder*, already tested with no effect, see the toggle sweep
+  above) -- this deepens processing of the real high-res mask at the *decoder's* resolution.
+- `submit/training/submit_noise_mix_none_sweep_mesa.sh` (`--noise-mix-kernel none`, into
+  `results/MESA_noise_mix_none_sweep_avg/`) -- drops `LocallyConnected2d` (the confirmed source
+  of the patchy-member artifact, see above) entirely rather than just fixing its bias: no
+  learned spatial-mixing layer at all, just the existing fixed-kernel `smooth_noise()` applied
+  to independently-drawn noise channels. Zero new learnable parameters. Motivated by a direct
+  visual check (2026-09-11): a baseline run with no `LocallyConnected2d` at all
+  (`stochastic_refine=False`, `results/MESA_daily_combo_avg/MESA_el0_dmed_es0_2000-2005_2021_5529180.casper-pbs/ensemble_figure.png`)
+  shows no patchy per-pixel texture, while `stochastic_refine=True` runs do -- pointing at
+  `LocallyConnected2d` specifically, not just its bias term. A third option,
+  `GaussianNoiseMix` (`--noise-mix-kernel gaussian`, a genuinely distance-weighted *learned*
+  alternative -- one shared Gaussian kernel per channel, only a learnable smoothing-scale
+  parameter, so it cannot produce a sharp per-pixel discontinuity by construction), is
+  implemented and available but deliberately not launched yet -- only worth its extra
+  complexity if `none`'s fixed, manually-chosen smoothing scale proves too rigid. (Launched
+  anyway shortly after, into `results/MESA_noise_mix_gaussian_fixed_sweep_avg/` -- see results
+  below.)
+
+Results for all three (RMSE/Coastal RMSE/IIEE/Spread-Error, none beats the plain shared-bias
+fix) are in "Shared-bias / deep-mask-head / noise-mix results" below, not duplicated here.
+
+**Infrastructure bug found and fixed while launching these (2026-09-11)**: all three sweeps
+initially failed immediately at import time (`ModuleNotFoundError: No module named
+'member_metrics'`), before any GPU time was used. Root cause: `functions_engressnet.py` needs
+`evaluation/member_metrics.py` as a sibling import, but `submit/training/submit_engressnet_daily_mesa.sh`/
+`submit_engressnet_daily.sh` (the general-purpose per-run templates every sweep driver calls)
+never put `evaluation/` on `PYTHONPATH` -- they only worked historically because the original
+recommended-config sweep (2026-08-17) predates the 2026-08-25 stage reorg that split
+`functions_engressnet.py` and `member_metrics.py` into separate folders. A handful of one-off
+scripts (e.g. `submit_mesa_noisesharedbias_kernel9.sh`) happened to set `PYTHONPATH` manually
+and so kept working after the reorg; the general templates did not, and apparently no one ran
+the general sweep-driver path for a MESA/FOSI job between the reorg and today. Fixed in both
+templates by resolving `evaluation/` relative to the script's own real file location (not
+`$PBS_O_WORKDIR`, which varies by invocation convention) and exporting it via `PYTHONPATH`
+before `cd`ing. All three sweeps were resubmitted after the fix.
+
+## Potential things to check (open, as of 2026-09-11)
+
+1. ~~Confirm the noise-shared-bias retrain actually changes the numbers~~ — **RESOLVED
+   2026-09-15, MESA only.** It does: RMSE 0.1111→0.1080, Coastal RMSE and IIEE both improve too
+   (see "Shared-bias / deep-mask-head / noise-mix results" below), not cosmetic.
+
+   **CRPS-by-regime rerun** (sections 16/13b, now against `results/MESA_stochastic_refine_sweep_avg_sharedbias/`):
+   domain-wide CRPS is essentially unchanged (0.0350 pre-fix -> 0.0358 post-fix, within noise) and
+   per-regime values move similarly little (open water 0.0058->0.0062, thin 0.0506->0.0516,
+   moderate 0.0731->0.0735, thick 0.0955->0.0972) — the shared-bias fix's accuracy/calibration
+   gains (RMSE, Coastal RMSE, Spread/Error, IIEE) don't show up as a CRPS improvement, consistent
+   with CRPS folding sharpness and calibration into one number that can move in offsetting
+   directions.
+
+   **Per-member PSD spread rerun**: the specific hypothesis that motivated the fix — that the
+   "members are suspiciously similar to each other, member-mean overshoots truth's high-wavenumber
+   energy" finding was a *symptom of the bias bug* — is only **partially confirmed**. At the
+   shortest resolved wavelength (~23 km): truth=0.000339, member-mean pre-fix=0.000499 (47%
+   excess), member-mean post-fix=0.000472 (39% excess) — a real but modest reduction, not the
+   fix this was hoped to be. The member-to-member spread itself (p10-p90 band) is **still razor
+   thin post-fix** (e.g. 0.000470-0.000473 at that wavelength) — essentially unchanged from
+   pre-fix. So: `noise_shared_bias` fixed the *pixel-level* spatial-domain calibration
+   (Spread/Error 1.034->0.972, a real win) but did **not** fix the *spectral-domain* one —
+   individual members still produce near-identical spatial textures to each other. This lines up
+   with the noise-mix ablation finding above (calibration needs per-location learned mixing, not
+   just an unbiased version of it) — the bias was one real bug with a real fix, but member
+   textural diversity looks like a separate, still-open problem, possibly requiring an
+   architectural change (e.g. per-member-conditioned mixing) rather than a bug fix.
+2. ~~FOSI's `stochastic_refine` checkpoints need the same retrain~~ — **LIKELY NOT NEEDED FOR THE
+   NUMBERS, checked 2026-09-15.** The el0_dmed_es1 confirmation reruns (item 10 below) happen to
+   use identical toggles/domain/hyperparameters to the official recommended config, and one of
+   those reruns already had `NOISE_SHARED_BIAS=true` applied on FOSI
+   (`results/FOSI_daily_combo_avg_recheck_currentcode_sharedbias/`, jobs 5910301-304): RMSE
+   0.1802 (pre-fix) → 0.1805 (both fixes) — essentially flat, unlike MESA's real ~3% win.
+   Plausible mechanism: MESA's evaluation is per-member-averaged against a noisy
+   single-realization truth, so it's sensitive to the per-member texture artifact the bug
+   caused; FOSI's truth is smooth/deterministic, so the artifact barely shows up in its metrics.
+   **Not fully closed** — this is evidence from an equivalently-configured proxy run, not a
+   dedicated `FOSI_stochastic_refine_sweep_avg_sharedbias` batch at that exact path. Worth doing
+   only if something downstream expects a checkpoint at that specific path (provenance/pipeline
+   hygiene), not for the numbers themselves.
+3. **Coastal RMSE remains genuinely unsolved.** Three independent fixes (land-threshold 0.5,
+   refiner+land-threshold, conservative-vs-bilinear regrid) all failed the same way (small
+   coastal gain, disproportionate RMSE cost elsewhere) — worth trying a fundamentally different
+   angle (e.g. an explicit coastal auxiliary loss term beyond the existing distance-based
+   `coastal_boost` weighting) rather than another sweep of the same three ideas, or reporting it
+   as an explicit, honest limitation.
+4. **The deterministic-vs-stochastic RMSE/CRPS trade-off should be reported explicitly**, framed
+   via the reliability/rank-histogram/spread-skill evidence (not CRPS or RMSE alone) — see
+   "Distributional evaluation" above. Don't let a reviewer find this tension first.
+5. **Gaussian mean + learned-variance baseline** (the other distributional baseline the
+   coauthor suggested, alongside the analog method) has not been built. Decide whether it's
+   worth the training-compute cost given how decisive the analog-baseline result already is.
+6. ~~PIOMAS overlap is 0/2190 for every recommended-config test window~~ — **RESOLVED
+   2026-09-15.** Real daily 2021 PIOMAS data was already sitting in scratch
+   (`/glade/derecho/scratch/skygale/PIOMAS_daily/PIOMAS_hiday_2021.nc`, same native grid as the
+   monthly 1978-2020 campaign file `run_daily_eval_batch.py` already used). `load_piomas()` now
+   additively concatenates it (the read-only campaign file itself is untouched) — coverage for
+   test=2021 windows is now 2190/2190, not 0/2190. Full PIOMAS comparison tables and spatial
+   snapshots were regenerated for the recommended (sharedbias) MESA checkpoint:
+
+   | Method | MAE vs. PIOMAS (m) | RMSE vs. PIOMAS (m) | Bias vs. PIOMAS (m) |
+   |---|---|---|---|
+   | Truth (MESA) | 0.3832 | 0.6171 | -0.2932 |
+   | Bilinear | 0.3648 | 0.5777 | -0.2882 |
+   | Deterministic UNet | 0.3846 | 0.6189 | -0.2926 |
+   | Stochastic UNet Mean | 0.3799 | 0.6094 | -0.2917 |
+
+   (Single window shown, 2000-2005->2021; all 4 windows now have this table under
+   `saved_figs/MESA_stochastic_refine_sweep_avg_sharedbias/`.) Every method shows a substantial,
+   similar-magnitude negative bias against PIOMAS (~-0.29 m) including bilinear and even the
+   "Truth" (MESA's own single-realization target) — this reads as a systematic MESA-vs-PIOMAS
+   offset (different models, different assimilation/forcing) rather than something the
+   downscaling method is responsible for, since it's present even in the coarse bilinear
+   baseline. Not a strong claim either way on relative skill: RMSE differences between methods
+   here (0.578-0.619 m) are small relative to the absolute PIOMAS-vs-MESA gap, so this table is
+   better framed as a sanity/consistency check than a decisive skill comparison. **Minor labeling
+   bug fixed alongside this**: `run_daily_eval_batch.py` hardcoded the truth-panel label as
+   "Truth (FOSI)" regardless of which dataset the batch actually was — fixed to plain "Truth"
+   (the table above and its underlying CSV/figure predate this label fix, hence the "Truth
+   (FOSI)" wording surviving in already-generated output for a MESA batch; re-running would pick
+   up the corrected label, not worth a rerun for a label-only change).
+7. ~~The analog baseline's K=20 was chosen to match the model's own ensemble size, not
+   independently tuned~~ — **RESOLVED 2026-09-15.** K sensitivity checked directly (K=5, 10, 20,
+   50, 4-window MESA avg each):
+
+   | K | RMSE | Coastal RMSE | Pattern Corr | Spread/Error |
+   |---|---|---|---|---|
+   | 5 | 0.2594 | 0.4223 | 0.6753 | 1.057 |
+   | 10 | 0.2641 | 0.4304 | 0.6704 | 1.219 |
+   | **20 (reported)** | 0.2700 | 0.4404 | 0.6654 | 1.341 |
+   | 50 | 0.2795 | 0.4556 | 0.6571 | 1.453 |
+
+   RMSE and Coastal RMSE get monotonically *worse* as K increases (more, less-similar analogs
+   pull the ensemble mean toward climatology), and Spread/Error moves monotonically further
+   into over-dispersion (more analogs -> wider, less-precise spread). So K=20 is not the most
+   *flattering* choice for the analog baseline -- K=5 is both more accurate and much
+   better-calibrated (1.057, close to ideal) than K=20. But the qualitative conclusion is
+   robust to this choice: even at K=5's best-case numbers, RMSE (0.2594) is still barely
+   different from bilinear's 0.2581 (i.e. still not a real win over the trivial baseline), and
+   Spread/Error (1.057) is still worse-calibrated than the stochastic UNet's 0.972. No K value
+   makes the analog method competitive with the actual method on any axis -- reporting K=20
+   (matching the model's own ensemble size, the natural apples-to-apples choice) is defensible
+   as the primary number, with this table available as the robustness check if a reviewer asks.
+8. **`submit/evaluation/submit_daily_eval_batch.sh` hardcodes `cd "$PBS_O_WORKDIR/../.."`**,
+   which only resolves correctly if it's submitted from `submit/evaluation/` specifically —
+   `submit/README.md` currently describes this class of script as "safe to invoke either way,"
+   which isn't true for this one. Worth fixing the script (resolve relative to its own file
+   location, not `$PBS_O_WORKDIR`) or correcting the README so the next person doesn't get a
+   silent wrong-directory failure.
+9. ~~The "infrastructure bug... fixed" claim above (PYTHONPATH/`member_metrics` import) is not
+   actually confirmed fixed~~ — **RESOLVED 2026-09-12.** The first fix attempt (resolving
+   `evaluation/` relative to the script's own `BASH_SOURCE` location) looked correct interactively
+   but still failed under real PBS execution, because PBS spools/copies a submitted script at
+   `qsub` time — `BASH_SOURCE[0]` at runtime pointed at that spool copy, not the real file under
+   `submit/training/`, so the computed path was wrong. Fixed for real by hardcoding the absolute
+   path instead (consistent with every other path in these scripts already being absolute). All
+   16 jobs (4 windows x 4 experiments: shared-bias, deep-mask-head, noise-mix-none,
+   noise-mix-gaussian_fixed) resubmitted after this fix completed successfully end-to-end
+   (jobs 5907651-5907666) — see the results table below.
+10. **Full-history audit (2026-09-11) against every batch in `results/`** (57 batches, 338 runs,
+    every `metrics.csv` aggregated) surfaced one lead not previously documented: `el0_dmed_es1` in
+    `results/{FOSI,MESA}_daily_combo_avg/` — identical toggles, domain, and hyperparameters to the
+    ★ recommended config (`stochastic_refine=true, avg, medium domain, no extra layer`) — scores
+    **MESA RMSE 0.096 / Pattern Corr 0.905** (vs. the currently-recommended checkpoint's 0.111 /
+    0.878) and **FOSI RMSE 0.180 / r 0.945** (essentially tied with the recommended checkpoint's
+    0.180 / 0.946). On raw numbers this beats the current recommendation on MESA outright. **Not
+    adoptable as-is**: job IDs (~5529180-203) place this run *before* both known code fixes
+    (smooth-noise, ~job 5573xxx; shared-bias, 2026-08-26) — it should carry the same texture/
+    calibration bugs those fixes targeted, which makes its unexpectedly strong RMSE hard to trust
+    at face value rather than a reason to prefer it. Worth an explicit rerun of this exact config
+    under current (fully-fixed) code once items 1-2 above are resolved, specifically to check
+    whether the fixes give up some of this apparent MESA accuracy in exchange for the calibration
+    gains they're meant to buy — rather than assuming the fixes are a free win on every axis.
+    **Confirmation rerun submitted 2026-09-11**: `submit/training/submit_daily_combo_avg_recheck_currentcode.sh`
+    resubmits this exact config (`extra_layer=false`, medium domain, `avg`, `stochastic_refine=true`,
+    `noise_shared_bias` left at its default `false` — deliberately isolating just the smooth-noise
+    fix, not conflated with the separate shared-bias retrain already queued above), both datasets,
+    all 4 windows, under current code, into `results/{FOSI,MESA}_daily_combo_avg_recheck_currentcode/`
+    (jobs 5910115-5910122, queued behind the item-9 sweeps as of submission — verify their logs
+    import cleanly once they start, same caveat as item 9). **Second confirmation submitted same
+    day**: identical sweep with `NOISE_SHARED_BIAS=true` added (both fixes together, not just
+    smooth-noise), into `results/{FOSI,MESA}_daily_combo_avg_recheck_currentcode_sharedbias/`
+    (jobs 5910301-5910308) — submitted in parallel with the smooth-noise-only rerun rather than
+    waiting on it first, since the queue is deep enough that serializing the two would cost a
+    full extra queue cycle for a question (does el0_dmed_es1's edge survive both fixes) that's
+    worth asking regardless of the smooth-noise-only result.
+
+    **RESOLVED 2026-09-15**: both confirmation reruns completed cleanly (no import errors, all 8
+    jobs). The apparent MESA advantage does not survive under current code — it was entirely an
+    artifact of the pre-fix bugs, not a missed opportunity:
+
+    | Config | RMSE (MESA) | Pattern Corr (MESA) |
+    |---|---|---|
+    | Original `el0_dmed_es1` (pre-fix code) | 0.096 | 0.905 |
+    | Same config, rerun under current code (smooth-noise fix only) | 0.111 | 0.873 |
+    | Same config, rerun with shared-bias fix too | 0.109 | 0.877 |
+    | Recommended config (shared-bias fix) | 0.108 | 0.879 |
+
+    Once rerun under current (fixed) code, `el0_dmed_es1` converges to statistically the same
+    performance as the actual recommended config (both RMSE and Pattern Corr) — confirming the
+    old batch's better-looking number was a bug artifact, and that the current recommended
+    config is not leaving free accuracy on the table. FOSI showed no discrepancy to begin with
+    and reruns confirm the same (~0.180-0.181 RMSE across original and both rechecks). This item
+    is closed.
+
+## Figures for the paper (2026-09-15)
+
+All distributional-evaluation figures for the recommended (shared-bias) MESA checkpoint should
+be taken from `saved_figs/MESA_stochastic_refine_sweep_avg_sharedbias/_4window_aggregate/` --
+these pool the raw per-cell data from all 4 train windows (via additive sufficient statistics:
+bincounts/sums/counts accumulated one window at a time, not naive averaging of already-computed
+summary numbers) before recomputing each statistic, since all 4 windows evaluate on the identical
+2021 test year and only differ in training years -- built by
+`evaluation/build_4window_aggregate_figures.py` (`submit/evaluation/submit_4window_aggregate_figures.sh`
+to run it, CPU-only, ~128-192GB, do not run on a login node -- an interactive attempt was
+OOM-killed): `14_rank_histogram_4window.png`, `14_reliability_diagram_4window.png`,
+`15_spread_skill_by_regime_4window.png`, `16_crps_by_regime_4window.png`,
+`13_psd_comparison_4window.png`, `13b_psd_per_member_spread_4window.png`. Pooled numbers match
+the earlier simple 4-window-average numbers elsewhere in this doc almost exactly (e.g. CRPS
+domain-wide 0.0358 both ways) -- a useful internal consistency check, not a coincidence, since
+all 4 windows have equal N.
+
+For spatial/map figures, which don't pool across windows meaningfully (each is a snapshot),
+`MESA_refine_avg_sharedbias_2000-2005_2021_5907651.casper-pbs/` is a representative single-window
+choice for `03_ensemble_figure.png`, `04_error_figure.png`, `12_piomas_spatial_snapshot.png`, etc.
+-- results are consistent across windows per the audit above, so any window works, but stay
+consistent about which one is used across figures in the same paper draft.
+
+**Note**: a stray incomplete run directory (`MESA_refine_test_2000-2005_2021_5907648.casper-pbs`,
+an early bug-hunting attempt with only `run_config.json`/`description.txt`, no `eval_data/`) sits
+in `results/MESA_stochastic_refine_sweep_avg_sharedbias/` -- harmless (the aggregate script
+filters for `eval_data/fields.npz` presence, matching `run_daily_eval_batch.py`'s own
+convention), but worth a manual cleanup pass if the batch directory is archived/shared as-is.
+
+## Shared-bias / deep-mask-head / noise-mix results (2026-09-12)
+
+4-window MESA/avg averages, all four new experiments compared against the pre-fix recommended
+config:
+
+| Batch | RMSE | Coastal RMSE | IIEE (ice-edge err) | Spread/Error (1.0=ideal) |
+|---|---|---|---|---|
+| Pre-fix (original recommended) | 0.1111 | 0.1938 | 0.3312 | 1.034 |
+| **Shared-bias fix** | **0.1080** | **0.1888** | **0.2936** | **0.972** |
+| Deep mask head (+shared bias) | 0.1091 | 0.1884 | 0.2431 | 1.129 |
+| Noise-mix: none | 0.1109 | 0.1885 | 0.3944 | 1.370 |
+| Noise-mix: gaussian_fixed | 0.1112 | 0.1868 | 0.2367 | 1.369 |
+
+**The shared-bias fix is a clean win and should become the new baseline going forward** — better
+RMSE, better coastal RMSE, IIEE down 11%, and calibration moved closer to ideal (1.034→0.972).
+Not just a cosmetic fix for the patchy-member artifact; it measurably helps accuracy and
+ice-edge representation too.
+
+**Deep-mask-head is a genuine trade-off, not a strict win**: IIEE drops further (0.294→0.243,
+another 17%, consistent with the intended effect of giving the decoder real depth to use coastal
+geometry), but calibration gets worse (0.972→1.129, now over-dispersive).
+
+**Dropping `LocallyConnected2d` entirely (`none`, `gaussian_fixed`) makes calibration
+meaningfully *worse* than even the pre-fix buggy version** (~1.37 vs. 1.034) — a real, useful
+negative result. The calibration benefit isn't coming from "spatially-correlated noise" in
+general; it's specifically tied to having a *per-location, learned* mixing weight (which
+`shared_bias` keeps, only removing the buggy degree of freedom), not to smoothing shape or
+amount. Between the two removal variants, `gaussian_fixed` clearly beats `none` on every other
+metric (best coastal RMSE and IIEE of all five batches) — consistent with the bell-curve-shape
+hypothesis being right about spatial texture, just not sufficient to recover calibration.
+`--noise-mix-kernel gaussian` (learned width, not yet launched) is deprioritized by this finding
+— since calibration seems to require per-location flexibility a single learned scalar-per-channel
+can't provide, it's unlikely to close the calibration gap either, though not yet directly tested.
+
+**Recommended config update**: `NOISE_SHARED_BIAS=true` should be added to the recommended
+config going forward. `results/MESA_stochastic_refine_sweep_avg_sharedbias/` and
+`results/FOSI_stochastic_refine_sweep_avg/` (FOSI retrain still pending, see item 2 above) are
+the checkpoints to use for the paper, not the original pre-fix `results/*_stochastic_refine_sweep_avg/`
+directories.

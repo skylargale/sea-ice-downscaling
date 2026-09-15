@@ -2,7 +2,7 @@
 """Standalone driver for evaluation_plots_daily.ipynb's "Batch mode" section (section 16),
 so it can run headlessly under PBS instead of interactively in a live kernel.
 
-Regenerates every figure/table (sections 00-15) for every run under a results/<BATCH_NAME>/
+Regenerates every figure/table (sections 00-16) for every run under a results/<BATCH_NAME>/
 directory, saving into saved_figs/<BATCH_NAME>/<run_name>/ -- exactly matching what the
 notebook's own batch-mode cell (the BATCH_RUN_DIRS loop) produces. Kept as a plain .py file
 rather than `jupyter nbconvert --execute` since downscaling_env has no nbconvert/nbclient,
@@ -144,15 +144,48 @@ def nearest_valid_index(lat_grid, lon_grid, exclude_hw, point_lat, point_lon_360
 
 
 PIOMAS_PATH = Path("/glade/campaign/cgd/ccr/yeager/OBS/seaice/PIOMAS/PIOMAS.hi.1978-2020.nc")
+# Real daily 2021 PIOMAS on the same native grid (confirmed 2026-09-15: identical (nlat, nlon)
+# = (120, 360), same grid_source as the monthly campaign file), extending coverage past the
+# monthly file's 2020 cutoff without touching that read-only /glade/campaign file. Additive
+# only -- if this path is ever missing, load_piomas() silently falls back to monthly-only
+# 1978-2020 coverage (unchanged prior behavior) rather than raising.
+PIOMAS_DAILY_2021_PATH = Path("/glade/derecho/scratch/skygale/PIOMAS_daily/PIOMAS_hiday_2021.nc")
 PIOMAS_MAX_GAP_DAYS = 20  # see the "Observational comparison" section markdown above
 
 
-def load_piomas(path=PIOMAS_PATH):
+def load_piomas(path=PIOMAS_PATH, daily_extra_paths=(PIOMAS_DAILY_2021_PATH,)):
     ds = xr.open_dataset(path)
     year = np.floor(ds["time"].values).astype(int)
     month = np.clip(np.round((ds["time"].values - year) * 12 + 0.5).astype(int), 1, 12)
     times = pd.to_datetime({"year": year, "month": month, "day": 1})
-    return ds["hi"].values, ds["lat"].values, (ds["lon"].values % 360), times
+    hi = ds["hi"].values
+    lat = ds["lat"].values
+    lon = ds["lon"].values % 360
+
+    # Splice in any available real daily data past the monthly file's coverage (e.g. 2021),
+    # on the same native grid, so batch-mode PIOMAS comparisons aren't silently limited to
+    # whatever the monthly campaign archive happens to end at. Matches by nearest calendar day
+    # instead of nearest month for whatever period this covers, tightening the max_gap_days
+    # match for those samples specifically -- everything before this file's coverage is
+    # unaffected.
+    times = pd.DatetimeIndex(times)
+    for extra_path in daily_extra_paths:
+        if not extra_path.exists():
+            continue
+        ds_extra = xr.open_dataset(extra_path)
+        if ds_extra["hi"].shape[1:] != hi.shape[1:]:
+            raise ValueError(
+                f"{extra_path} grid shape {ds_extra['hi'].shape[1:]} doesn't match "
+                f"{path}'s {hi.shape[1:]} -- can't concatenate onto the same (nlat, nlon) grid."
+            )
+        hi = np.concatenate([hi, ds_extra["hi"].values], axis=0)
+        # This file's time coord is a 365-day "noleap" cftime calendar (no Feb 29), not
+        # plain datetime64 -- convert via isoformat rather than pd.DatetimeIndex(...) directly,
+        # which can't parse cftime objects. Safe here since noleap -> standard-calendar dates
+        # are unambiguous (standard calendar is a strict superset).
+        extra_times = pd.DatetimeIndex([pd.Timestamp(t.isoformat()) for t in ds_extra["time"].values])
+        times = times.append(extra_times)
+    return hi, lat, lon, times
 
 
 def nearest_grid_indices(src_lat, src_lon, query_lat, query_lon):
@@ -180,9 +213,9 @@ def build_piomas_regridded(target_lat, target_lon, sample_times, max_gap_days=PI
     out_of_coverage = gap_days > max_gap_days
     regridded[out_of_coverage] = np.nan
     n_out = int(out_of_coverage.sum())
-    if n_out:
-        print(f"  PIOMAS coverage: {len(sample_times) - n_out}/{len(sample_times)} test samples overlap "
-              f"PIOMAS's 1978-2020 record.")
+    coverage_end = pd.Timestamp(piomas_times.values.max()).strftime("%Y-%m-%d")
+    print(f"  PIOMAS coverage: {len(sample_times) - n_out}/{len(sample_times)} test samples overlap "
+          f"PIOMAS's record (through {coverage_end}).")
     return regridded
 
 
@@ -213,7 +246,7 @@ ROLLING_DAYS_TIMESERIES = 10  # centered running mean (days) for the domain-mean
 
 
 def run_all_sections(eval_dir, save_dir, show=False):
-    """Regenerate every figure/table in this notebook (sections 00-15) for one run,
+    """Regenerate every figure/table in this notebook (sections 00-16) for one run,
     using each section's notebook default parameters, and save into save_dir."""
     eval_dir = Path(eval_dir)
     save_dir = Path(save_dir)
@@ -430,6 +463,49 @@ def run_all_sections(eval_dir, save_dir, show=False):
     ax2.legend(fontsize=9, frameon=False)
     plt.tight_layout()
     save_fig(fig, "15_spread_skill_by_regime")
+
+    # ---- 16. CRPS (proper scoring rule) by SIT regime ----
+    # NRG/energy-form CRPS for an ensemble forecast against a single truth (Hersbach 2000):
+    #   CRPS = mean_k|x_k - y| - (1/(2K^2)) * sum_i sum_j |x_i - x_j|
+    # The double sum is computed via the standard order-statistic identity (sort ensemble
+    # ascending, weight member i (1-indexed) by (2i - K - 1)) instead of an O(K^2) double loop --
+    # this is the same trick used to make Kendall-tau-style pairwise sums tractable, and matters
+    # here since ens_ocean can be tens of millions of (sample, cell) rows.
+    K_crps = ens_ocean.shape[1]
+    crps_term1 = np.abs(ens_ocean - truth_ocean[:, None]).mean(axis=1)
+    sorted_ens = np.sort(ens_ocean, axis=1)
+    crps_weights = (2 * np.arange(1, K_crps + 1) - K_crps - 1)
+    crps_term2 = (sorted_ens * crps_weights[None, :]).sum(axis=1) / (K_crps ** 2)
+    crps_per_sample = crps_term1 - crps_term2
+
+    crps_rows = [{
+        "SIT regime": "All (domain-wide)", "N": int(crps_per_sample.size),
+        "Mean true SIT (m)": round(float(truth_ocean.mean()), 4),
+        "CRPS (m)": round(float(crps_per_sample.mean()), 4),
+    }]
+    for b, label in enumerate(SIT_BIN_LABELS):
+        sel = bin_idx_sit == b
+        n = int(sel.sum())
+        crps_rows.append({
+            "SIT regime": label, "N": n,
+            "Mean true SIT (m)": round(float(truth_ocean[sel].mean()), 4) if n > 0 else np.nan,
+            "CRPS (m)": round(float(crps_per_sample[sel].mean()), 4) if n > 0 else np.nan,
+        })
+    crps_df = pd.DataFrame(crps_rows)
+    save_table(crps_df, "16_crps_by_regime_data")
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    plot_rows = crps_df.iloc[1:]  # regime bars only, "All" reported separately as a reference line
+    ax.bar(np.arange(len(plot_rows)), plot_rows["CRPS (m)"], color="tab:purple", alpha=0.85)
+    ax.axhline(crps_df.iloc[0]["CRPS (m)"], color="black", linestyle="--", linewidth=1.2,
+               label=f"Domain-wide CRPS ({crps_df.iloc[0]['CRPS (m)']:.4f} m)")
+    ax.set_xticks(np.arange(len(plot_rows)))
+    ax.set_xticklabels(plot_rows["SIT regime"], fontsize=8)
+    ax.set_ylabel("CRPS (m, lower = better)")
+    ax.set_title("CRPS by true-SIT regime")
+    ax.legend(fontsize=9, frameon=False)
+    plt.tight_layout()
+    save_fig(fig, "16_crps_by_regime")
 
     # ---- 00. Domain overview ----
     geo0 = tile_geometry[0] if not use_patches else None
@@ -893,7 +969,7 @@ def run_all_sections(eval_dir, save_dir, show=False):
         print("  No test samples overlap PIOMAS's record -- skipping PIOMAS metrics/snapshot.")
     else:
         methods_vs_piomas = {
-            "Truth (FOSI)": Y_test_phys, "Bilinear": Y_base_phys,
+            "Truth": Y_test_phys, "Bilinear": Y_base_phys,
             "Deterministic UNet": Y_pred_det_phys, "Stochastic UNet Mean": Y_pred_phys,
         }
         piomas_metrics = []
@@ -912,7 +988,7 @@ def run_all_sections(eval_dir, save_dir, show=False):
             ice_valid = valid_idxs[(Y_test_phys[valid_idxs, 0] > 0.5).mean(axis=(1, 2)) > 0.25]
             piomas_sample_idx = int(ice_valid[0]) if len(ice_valid) else int(valid_idxs[0])
         panel_fields = [Y_test_phys[piomas_sample_idx, 0], Y_pred_phys[piomas_sample_idx, 0], piomas_regridded_phys[piomas_sample_idx, 0]]
-        panel_titles_piomas = ["Truth (FOSI)", "Ensemble Mean", "PIOMAS (obs, regridded)"]
+        panel_titles_piomas = ["Truth", "Ensemble Mean", "PIOMAS (obs, regridded)"]
         fig, axs = plt.subplots(1, 3, figsize=(13.5, 4.5), constrained_layout=True, dpi=150, subplot_kw={"projection": proj})
         for ax, field, title in zip(axs, panel_fields, panel_titles_piomas):
             im = ax.pcolormesh(tgt_lon, tgt_lat, field, transform=ccrs.PlateCarree(), cmap="Blues", vmin=0, vmax=3, shading="auto")
@@ -994,6 +1070,73 @@ def run_all_sections(eval_dir, save_dir, show=False):
     ax.grid(True, which="both", alpha=0.3)
     plt.tight_layout()
     save_fig(fig, "13_psd_comparison")
+
+    # ---- 13b. Per-member PSD spread -- is the ensemble's spatial texture calibrated? ----
+    # The comparison above uses the ensemble MEAN field, so it only tests whether the central
+    # estimate is realistically sharp -- it says nothing about the ensemble's distributional
+    # properties. This computes the same isotropic PSD separately for every stochastic draw and
+    # asks whether the *spread* of member spectra brackets truth's spectrum at each wavenumber --
+    # a spectral-domain analog of the physical-domain spread-skill check above. Uses bincount
+    # instead of isotropic_psd's per-bin boolean-mask loop (N x K calls here vs. N there) purely
+    # for speed.
+    def isotropic_psd_per_member(preds_all_hwk, ocean_hw, dlat_deg, dlon_deg, mean_lat_deg, n_bins=N_PSD_BINS):
+        N, K, H, W = preds_all_hwk.shape
+        km_per_deg = 111.0
+        dy = km_per_deg * dlat_deg
+        dx = km_per_deg * dlon_deg * np.cos(np.deg2rad(mean_lat_deg))
+        window = np.outer(np.hanning(H), np.hanning(W))
+        ky = np.fft.fftfreq(H, d=dy)
+        kx = np.fft.fftfreq(W, d=dx)
+        kr = np.sqrt(ky[:, None] ** 2 + kx[None, :] ** 2)
+        k_nyq = min(ky.max(), kx.max())
+        bin_edges = np.linspace(0, k_nyq, n_bins + 1)
+        bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+        bin_idx_flat = np.clip(np.digitize(kr.ravel(), bin_edges) - 1, 0, n_bins - 1)
+        bin_counts = np.bincount(bin_idx_flat, minlength=n_bins).astype(np.float64)
+        bin_counts[bin_counts == 0] = np.nan
+
+        psd_samples = np.full((N, K, n_bins), np.nan)
+        for i in range(N):
+            for k in range(K):
+                f = preds_all_hwk[i, k].astype(np.float64).copy()
+                f[ocean_hw] -= f[ocean_hw].mean()
+                f[~ocean_hw] = 0.0
+                spec = np.abs(np.fft.fft2(f * window)) ** 2 / (H * W)
+                sums = np.bincount(bin_idx_flat, weights=spec.ravel(), minlength=n_bins)
+                psd_samples[i, k] = sums / bin_counts
+        return bin_centers, psd_samples  # (n_bins,), (N, K, n_bins)
+
+    _, member_psd_samples = isotropic_psd_per_member(
+        preds_all_phys[:, :, 0], ocean_hw, dlat_deg, dlon_deg, mean_lat_deg
+    )
+    member_psd_time_mean = np.nanmean(member_psd_samples, axis=0)  # (K, n_bins)
+
+    psd_spread_df = pd.DataFrame({
+        "wavenumber_cycles_per_km": wavenumber,
+        "wavelength_km": 1.0 / np.where(wavenumber > 0, wavenumber, np.nan),
+        "Truth": psd_results["Truth"],
+        "Member mean": member_psd_time_mean.mean(axis=0),
+        "Member p10": np.percentile(member_psd_time_mean, 10, axis=0),
+        "Member p90": np.percentile(member_psd_time_mean, 90, axis=0),
+    })
+    save_table(psd_spread_df, "13b_psd_per_member_spread_data")
+
+    fig, ax = plt.subplots(figsize=(7, 5.5))
+    valid = (wavenumber > 0) & (psd_spread_df["Truth"] > 0)
+    ax.plot(wavenumber[valid], psd_spread_df["Truth"][valid], label="Truth", color="black", linewidth=1.8)
+    ax.fill_between(wavenumber[valid], psd_spread_df["Member p10"][valid], psd_spread_df["Member p90"][valid],
+                     color="tab:blue", alpha=0.3, label="Stochastic UNet members (10th-90th pct)")
+    ax.plot(wavenumber[valid], psd_spread_df["Member mean"][valid], color="tab:blue", linewidth=1.2, linestyle="--",
+            label="Stochastic UNet member mean")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("Wavenumber (cycles/km)")
+    ax.set_ylabel("Isotropic PSD (m$^2$, arb. spectral units)")
+    ax.set_title("Per-member PSD spread vs. truth -- calibration of spatial texture")
+    ax.legend(fontsize=9)
+    ax.grid(True, which="both", alpha=0.3)
+    plt.tight_layout()
+    save_fig(fig, "13b_psd_per_member_spread")
 
 
 def main():

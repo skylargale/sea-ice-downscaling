@@ -26,7 +26,7 @@
 #PBS -M skycgale@uw.edu
 
 # -o logs/ (trailing slash) keeps PBS's own default filename, routed into logs/
-# instead of the process_data/ root. Resolved relative to the submission
+# instead of the processing/ root. Resolved relative to the submission
 # directory, so logs/ must exist there before qsub runs (created below too, in
 # case this is submitted before the directory has been created interactively).
 

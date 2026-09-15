@@ -90,12 +90,6 @@ def parse_args():
                    help="Power parameter of the energy-score loss (functions_engressnet.energy_loss). "
                         "Lowering below 1 shifts relative weight toward the ensemble-spread term vs. "
                         "the mean-accuracy term; default 1.0 matches prior behavior unchanged.")
-    p.add_argument("--extra-layer", dest="extra_layer", action="store_true",
-                   help="Sensitivity-test toggle: add a 4th UNet downsample/upsample stage "
-                        "(1024-channel bottleneck) below the default 512-channel one. Requires "
-                        "the low-res domain crop to be divisible by 16 (not just 8) in both dims "
-                        "when --no-patches is used. Default off = unchanged architecture.")
-    p.set_defaults(extra_layer=False)
     p.add_argument("--stochastic-refine", dest="stochastic_refine", action="store_true",
                    help="Sensitivity-test toggle: add a single-shot EnScale-style (Schillinger et "
                         "al., 2025) stochastic refinement stage -- sigma-scaled noise mixed by a "
@@ -109,7 +103,7 @@ def parse_args():
                         "(Schillinger et al., 2025) mechanism applied progressively at every 2x "
                         "upsampling step (still built on this UNet's own encoder/skip connections, "
                         "not the paper's separate skip-free pyramid) -- see functions_engressnet.UNet "
-                        "docstring. Mutually exclusive with --stochastic-refine and --extra-layer. "
+                        "docstring. Mutually exclusive with --stochastic-refine. "
                         "Default off = unchanged architecture.")
     p.set_defaults(enscale_net=False)
     p.add_argument("--noise-sigma", type=float, default=1.0,
@@ -120,6 +114,68 @@ def parse_args():
                         "layer's weights, the shared MLP) stays fully trainable regardless of this "
                         "value. No effect if neither --stochastic-refine nor --enscale-net is set. "
                         "Default 1.0 = raw unit-Gaussian noise, as in the paper.")
+    p.add_argument("--noise-smooth-kernel-size", type=int, default=3,
+                   help="Kernel size of the avg_pool2d applied to the mixed noise after "
+                        "LocallyConnected2d, for both --stochastic-refine and --enscale-net "
+                        "(functions_engressnet.smooth_noise). Widening this (e.g. 7 or 9) smooths "
+                        "more aggressively -- targets pixel-scale speckle in a single ensemble "
+                        "member's output. Default 3 = original behavior.")
+    p.add_argument("--noise-bias-smooth-weight", type=float, default=0.0,
+                   help="Weight on a total-variation-style penalty applied during training to "
+                        "LocallyConnected2d.bias in the --stochastic-refine noise-mixing layer "
+                        "(functions_engressnet.noise_bias_smoothness_penalty). That bias is a "
+                        "freely-learned per-location parameter added even in the fully "
+                        "deterministic (eps=0) pass, so unlike --noise-sigma or "
+                        "--noise-smooth-kernel-size, it can leave a persistent non-random rough "
+                        "pattern that no runtime noise setting can remove -- confirmed empirically "
+                        "2026-08-26 (visible in ensemble_figure.png's 'Deterministic' column, "
+                        "concentrated in high-thickness/high-variability regions). Default 0.0 = "
+                        "off, no effect on training. No effect if --stochastic-refine isn't set or "
+                        "--enscale-net is.")
+    p.add_argument("--noise-shared-bias", dest="noise_shared_bias", action="store_true",
+                   help="Root-cause fix (2026-08-26) for the same persistent deterministic-pass "
+                        "streaky texture --noise-bias-smooth-weight targets, but stronger: ties "
+                        "LocallyConnected2d.bias in the --stochastic-refine noise-mixing layer to a "
+                        "single shared vector instead of one independent value per grid location, "
+                        "removing the degree of freedom that caused it by construction rather than "
+                        "penalizing it statistically. The per-location *weight* (which only matters "
+                        "when noise is actually nonzero) is unaffected. Default off = original "
+                        "independent-per-location bias. No effect if --stochastic-refine isn't set "
+                        "or --enscale-net is; incompatible with a nonzero --noise-bias-smooth-weight "
+                        "(nothing left to penalize once the bias is shared -- silently a no-op).")
+    p.set_defaults(noise_shared_bias=False)
+    p.add_argument("--deep-mask-head", dest="deep_mask_head", action="store_true",
+                   help="The high-res land mask is already concatenated into the feature map both "
+                        "out_conv and the --stochastic-refine refiner consume, but only a single bare "
+                        "3x3 conv (or a shallow 3-layer 1x1-conv MLP) processes that concatenation -- "
+                        "no real depth to learn coastal-aware behavior. Inserts a small 2-layer conv "
+                        "block (3x3 conv + InstanceNorm + ReLU, twice) right after the mask "
+                        "concatenation, at full target resolution, before out_conv/refiner see it. "
+                        "Not the same as --coastal-channel (which feeds a "
+                        "low-res ocean-fraction proxy into the encoder's input, already tested with "
+                        "no effect) -- this deepens processing of the real high-res mask at the "
+                        "decoder's own resolution. Default off = unchanged architecture.")
+    p.set_defaults(deep_mask_head=False)
+    p.add_argument("--noise-mix-kernel", choices=["learned", "gaussian", "gaussian_fixed", "none"],
+                   default="learned",
+                   help="Which layer mixes --stochastic-refine's raw per-pixel noise into "
+                        "spatially-correlated texture. 'learned' (default) = LocallyConnected2d, "
+                        "the EnScale paper's independently-learned-per-location weight matrix -- "
+                        "appropriate for sharp-fronted atmospheric fields, but nothing constrains "
+                        "neighboring locations to mix noise similarly, and it's the confirmed source "
+                        "of a persistent per-pixel artifact (see --noise-shared-bias). 'none' = no "
+                        "mixing layer at all, learned or otherwise: draw noise_mix_channels "
+                        "independent noise channels directly and smooth each with the existing "
+                        "fixed-kernel --noise-smooth-kernel-size -- zero new learnable parameters, "
+                        "the cheapest thing to try before concluding a learned mixing layer is needed. "
+                        "'gaussian_fixed'/'gaussian' = GaussianNoiseMix, a genuinely distance-weighted "
+                        "alternative (one shared, translation-invariant Gaussian kernel per channel) -- "
+                        "'gaussian_fixed' freezes the per-channel smoothing scale at its initial value "
+                        "(isolates whether the bell-curve *shape* helps over 'none''s box shape, holding "
+                        "width fixed); 'gaussian' lets that scale be learned by backprop instead (isolates "
+                        "whether *learning* the width helps, holding shape fixed vs. 'gaussian_fixed'). "
+                        "No effect unless --stochastic-refine is set. --noise-shared-bias is a no-op with "
+                        "any kernel other than 'learned' (none of the others has a bias term at all).")
     p.add_argument("--land-threshold", type=float, default=0.1,
                    help="A high-res grid cell is classified as land only if its regridded ocean "
                         "fraction is below this value (default 0.1, i.e. >90%% land). Tightened "
@@ -134,16 +190,6 @@ def parse_args():
                         "of land/ocean location only being known at the last layer (the land mask "
                         "concatenated before out_conv). Default off = unchanged in_channels.")
     p.set_defaults(coastal_channel=False)
-    p.add_argument("--classification-head", dest="classification_head", action="store_true",
-                   help="Sensitivity-test toggle: add an auxiliary land/open-ocean/ice "
-                        "segmentation head branching off the final decoder feature map, trained "
-                        "with an auxiliary cross-entropy loss (weight --classif-weight) alongside "
-                        "the main energy-score loss, to give the decoder an explicit "
-                        "boundary-aware signal. Default off = no head, no change to model output.")
-    p.set_defaults(classification_head=False)
-    p.add_argument("--classif-weight", type=float, default=0.1,
-                   help="Weight of the auxiliary classification cross-entropy loss relative to "
-                        "the main energy-score loss. No effect unless --classification-head is set.")
     p.add_argument("--attention-end", dest="attention_end", action="store_true",
                    help="Sensitivity-test toggle: apply local windowed self-attention "
                         "(WindowedSelfAttention2d) to the final 32-channel decoder feature map, "
@@ -164,7 +210,7 @@ def parse_args():
                         "calibrate noise pathway only' fine-tuning (see "
                         "functions_engressnet.set_noise_only_trainable) -- typically with a "
                         "smaller --num-epochs/--lr than the original training run. Architecture "
-                        "flags (--extra-layer/--stochastic-refine/--enscale-net/etc.) must match "
+                        "flags (--stochastic-refine/--enscale-net/etc.) must match "
                         "the checkpoint's original run exactly, or load_state_dict will fail on a "
                         "shape mismatch.")
     p.add_argument("--freeze-backbone", dest="freeze_backbone", action="store_true",
@@ -199,8 +245,6 @@ def parse_args():
         p.error("--test-x-path/--test-y-path (cross-dataset evaluation) requires both "
                 "--train-years and --test-years.")
 
-    if args.enscale_net and args.extra_layer:
-        p.error("--enscale-net and --extra-layer are mutually exclusive.")
     if args.enscale_net and args.stochastic_refine:
         p.error("--enscale-net and --stochastic-refine are mutually exclusive "
                 "(--enscale-net already injects EnScale-style noise at every decoder stage).")
@@ -262,17 +306,19 @@ def main():
         batch_size=args.batch_size,
         lr=args.lr,
         latent_channels=args.latent_channels,
-        extra_layer=args.extra_layer,
         stochastic_refine=args.stochastic_refine,
         enscale_net=args.enscale_net,
         noise_sigma=args.noise_sigma,
+        noise_smooth_kernel_size=args.noise_smooth_kernel_size,
+        noise_bias_smooth_weight=args.noise_bias_smooth_weight,
+        noise_shared_bias=args.noise_shared_bias,
+        deep_mask_head=args.deep_mask_head,
+        noise_mix_kernel=args.noise_mix_kernel,
         coastal_width=args.coastal_width,
         coastal_boost=args.coastal_boost,
         beta=args.beta,
         land_threshold=args.land_threshold,
         coastal_channel=args.coastal_channel,
-        classification_head=args.classification_head,
-        classif_weight=args.classif_weight,
         attention_end=args.attention_end,
         attn_window_size=args.attn_window_size,
         attn_num_heads=args.attn_num_heads,
