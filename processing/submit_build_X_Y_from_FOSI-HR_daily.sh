@@ -21,13 +21,13 @@
 #PBS -l select=1:ncpus=8:mem=128GB
 #PBS -l walltime=06:00:00
 #PBS -j oe
-#PBS -o logs/
+#PBS -o .logs/
 #PBS -m abe
 #PBS -M skycgale@uw.edu
 
-# -o logs/ (trailing slash) keeps PBS's own default filename, routed into logs/
+# -o .logs/ (trailing slash) keeps PBS's own default filename, routed into .logs/
 # instead of the processing/ root. Resolved relative to the submission
-# directory, so logs/ must exist there before qsub runs (created below too, in
+# directory, so .logs/ must exist there before qsub runs (created below too, in
 # case this is submitted before the directory has been created interactively).
 
 set -euo pipefail
@@ -39,7 +39,7 @@ module load conda
 conda activate downscaling_env
 
 cd "$PBS_O_WORKDIR"
-mkdir -p logs
+mkdir -p .logs
 
 python build_X_Y_from_FOSI-HR_daily.py
 

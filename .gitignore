@@ -4,6 +4,7 @@ __pycache__/
 results/
 saved_figs/
 logs/
+.logs/
 hpo_echo/
 optimization/log.txt
 .member_metrics_cache.json
