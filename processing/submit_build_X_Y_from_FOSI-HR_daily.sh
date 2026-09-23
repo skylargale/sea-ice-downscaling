@@ -4,7 +4,7 @@
 #
 # Builds the daily FOSI_BGC HR (JRA55-forced t13) X/Y perfect-model pair:
 # X_FOSI_HR_JRA55_daily_{interp,avg}.nc / Y_FOSI_HR_JRA55_daily.nc in
-# /glade/derecho/scratch/skygale/Downscaling_Data. Deliberately a distinct
+# /glade/derecho/scratch/skygale/downscaling. Deliberately a distinct
 # run_name/filename from the existing monthly X_FOSI_HR_JRA55_*.nc /
 # Y_FOSI_HR_JRA55.nc, which functions_engressnet.py's DEFAULT_X_PATH/
 # DEFAULT_Y_PATH currently point at -- this job does NOT overwrite that live

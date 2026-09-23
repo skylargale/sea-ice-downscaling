@@ -42,10 +42,10 @@ warnings.filterwarnings("ignore", message=r"Latitude is outside of \[-90, 90\]")
 # Defaults (all overridable via the config object passed to run_pipeline)
 # ==============================================================
 
-DEFAULT_DATA_DIR = "/glade/derecho/scratch/skygale/Downscaling_Data"
+DEFAULT_DATA_DIR = "/glade/derecho/scratch/skygale/downscaling"
 DEFAULT_X_PATH = os.path.join(DEFAULT_DATA_DIR, "X_FOSI_HR_JRA55_interp.nc")
 DEFAULT_Y_PATH = os.path.join(DEFAULT_DATA_DIR, "Y_FOSI_HR_JRA55.nc")
-DEFAULT_WEIGHTED_GRIDS_DIR = "/glade/work/skygale/_projects/SeaIceDownscaling/weighted_grids"
+DEFAULT_WEIGHTED_GRIDS_DIR = "/glade/work/skygale/projects/SeaIceDownscaling/weighted_grids"
 DEFAULT_RESULTS_DIR = "/glade/work/skygale/projects/SeaIceDownscaling/Version6/results"
 
 DEFAULT_BBOX = {"lon_min": -190, "lon_max": -140, "lat_min": 60, "lat_max": 80}

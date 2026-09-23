@@ -4,7 +4,7 @@
 #
 # Builds the daily MESA-HR (CESM-LE d651007/d651030) X/Y perfect-model pair:
 # X_MESA_HR_HIST_daily_{interp,avg}.nc / Y_MESA_HR_HIST_daily.nc in
-# /glade/derecho/scratch/skygale/Downscaling_Data. Pure CPU/memory regridding
+# /glade/derecho/scratch/skygale/downscaling. Pure CPU/memory regridding
 # work (xESMF + pop_tools), no GPU needed.
 #
 # Submit with:  qsub submit_build_X_Y_from_MESA-HR_daily.sh

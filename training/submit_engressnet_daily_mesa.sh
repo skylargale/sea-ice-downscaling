@@ -43,14 +43,14 @@ set -euo pipefail
 # Which daily X variant to train against -- "interp" or "avg".
 DATA_VARIANT="${DATA_VARIANT:-interp}"
 case "$DATA_VARIANT" in
-    interp) X_PATH="/glade/derecho/scratch/skygale/Downscaling_Data/X_MESA_HR_daily_interp.nc" ;;
-    avg)    X_PATH="/glade/derecho/scratch/skygale/Downscaling_Data/X_MESA_HR_daily_avg.nc" ;;
+    interp) X_PATH="/glade/derecho/scratch/skygale/downscaling/X_MESA_HR_daily_interp.nc" ;;
+    avg)    X_PATH="/glade/derecho/scratch/skygale/downscaling/X_MESA_HR_daily_avg.nc" ;;
     *) echo "Unknown DATA_VARIANT: $DATA_VARIANT (expected 'interp' or 'avg')" >&2; exit 1 ;;
 esac
 # Opt-in override so a one-off experiment (e.g. a conservative-regridded Y, testing
 # whether coastal-bias truth-regridding noise is the real driver) can point at an
 # alternate Y file without needing a separate submission script.
-Y_PATH="${Y_PATH_OVERRIDE:-/glade/derecho/scratch/skygale/Downscaling_Data/Y_MESA_HR_daily.nc}"
+Y_PATH="${Y_PATH_OVERRIDE:-/glade/derecho/scratch/skygale/downscaling/Y_MESA_HR_daily.nc}"
 
 # Cross-dataset evaluation: set both to evaluate the checkpoint trained on
 # MESA against a *different* dataset's X/Y files (e.g. FOSI) instead of
