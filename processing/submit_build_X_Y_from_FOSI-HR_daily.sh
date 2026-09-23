@@ -36,7 +36,7 @@ echo "Job started on $(hostname) at $(date)"
 echo "PBS_JOBID: ${PBS_JOBID:-not set}"
 
 module load conda
-conda activate downscaling_env
+conda activate seaice-downscaling
 
 cd "$PBS_O_WORKDIR"
 mkdir -p .logs

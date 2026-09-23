@@ -149,7 +149,7 @@ echo "Batch name: ${BATCH_NAME:-<none, flat results/>}"
 echo "Init checkpoint: ${INIT_CHECKPOINT:-<none, random init>}   Collapse wind vector: ${COLLAPSE_WIND_VECTOR}"
 
 module load conda
-conda activate downscaling_env
+conda activate seaice-downscaling
 
 # functions_engressnet.py needs evaluation/member_metrics.py as a sibling import
 # (MESACLIP per-member-averaged metrics), but this script's own directory (wherever

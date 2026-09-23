@@ -5,7 +5,7 @@ so it can run headlessly under PBS instead of interactively in a live kernel.
 Regenerates every figure/table (sections 00-16) for every run under a results/<BATCH_NAME>/
 directory, saving into evaluation/saved_figs/<BATCH_NAME>/<run_name>/ -- exactly matching what the
 notebook's own batch-mode cell (the BATCH_RUN_DIRS loop) produces. Kept as a plain .py file
-rather than `jupyter nbconvert --execute` since downscaling_env has no nbconvert/nbclient,
+rather than `jupyter nbconvert --execute` since seaice-downscaling has no nbconvert/nbclient,
 the same constraint noted throughout this project's other batch-processing notebooks.
 
 `run_all_sections` below is a direct copy of evaluation_plots_daily.ipynb's batch-mode cell

@@ -30,7 +30,7 @@ set -euo pipefail
 BATCH_DIR="${BATCH_DIR:?Must set BATCH_DIR, e.g. -v BATCH_DIR=results/FOSI_daily_combo_avg}"
 
 module load conda
-conda activate downscaling_env
+conda activate seaice-downscaling
 
 # cd to the Version6 root (not $PBS_O_WORKDIR, which varies by invocation convention --
 # see Version6/README.md): --save-root defaults to the relative path "evaluation/saved_figs",

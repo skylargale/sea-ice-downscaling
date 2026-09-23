@@ -34,7 +34,7 @@ K="${K:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-}"
 
 module load conda
-conda activate downscaling_env
+conda activate seaice-downscaling
 
 # Hardcoded absolute path, not $PBS_O_WORKDIR-relative or BASH_SOURCE-based -- see
 # submit_daily_eval_batch.sh's matching comment for why (PBS spools a submitted script at

@@ -12,6 +12,6 @@
 set -euo pipefail
 BATCH_DIRS="${BATCH_DIRS:?Must set BATCH_DIRS}"
 module load conda
-conda activate downscaling_env
+conda activate seaice-downscaling
 cd "/glade/work/skygale/projects/SeaIceDownscaling/Version6"
 python -u evaluation/recompute_spread_skill.py --out-dir evaluation/corrected_calibration $BATCH_DIRS

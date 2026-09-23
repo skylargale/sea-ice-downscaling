@@ -27,7 +27,7 @@ set -euo pipefail
 BATCH_DIR="${BATCH_DIR:?Must set BATCH_DIR, e.g. -v BATCH_DIR=results/MESA_stochastic_refine_sweep_avg_sharedbias}"
 
 module load conda
-conda activate downscaling_env
+conda activate seaice-downscaling
 
 # Hardcoded absolute path -- see submit_daily_eval_batch.sh's matching comment for why
 # (PBS spools a submitted script at qsub time; BASH_SOURCE/$PBS_O_WORKDIR-based resolution

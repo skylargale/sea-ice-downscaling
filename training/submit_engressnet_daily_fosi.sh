@@ -147,7 +147,7 @@ echo "Batch name: ${BATCH_NAME:-<none, flat results/>}"
 echo "Init checkpoint: ${INIT_CHECKPOINT:-<none, random init>}   Collapse wind vector: ${COLLAPSE_WIND_VECTOR}"
 
 module load conda
-conda activate downscaling_env
+conda activate seaice-downscaling
 
 # See submit_engressnet_daily_mesa.sh's matching comment: functions_engressnet.py needs
 # evaluation/member_metrics.py as a sibling import. Hardcoded absolute path, not resolved

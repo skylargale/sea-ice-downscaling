@@ -31,7 +31,7 @@ MAE/RMSE/Bias/etc. measure, so it doesn't have the same problem.
 Mirrors functions_engressnet.py's mae/rmse/bias/grad_mae/pattern_corr/ssim/
 ice_edge_error/masked_mae/masked_rmse/coastal_band_mask formula-for-formula
 (reusing torch, already a hard dependency of this project's training
-pipeline and the `downscaling_env` these notebooks run in) rather than a
+pipeline and the `seaice-downscaling` these notebooks run in) rather than a
 from-scratch numpy port, specifically so the two implementations of the
 same metric can't quietly drift apart. Deliberately does NOT import
 functions_engressnet.py itself -- that would pull in xesmf/pop_tools/

@@ -10,7 +10,7 @@
 
 set -euo pipefail
 module load conda
-conda activate downscaling_env
+conda activate seaice-downscaling
 export PYTHONPATH="/glade/work/skygale/projects/SeaIceDownscaling/Version6/evaluation:${PYTHONPATH:-}"
 cd /glade/work/skygale/projects/SeaIceDownscaling/Version6/evaluation
 python time_inference.py

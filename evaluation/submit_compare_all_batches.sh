@@ -34,7 +34,7 @@
 set -euo pipefail
 
 module load conda
-conda activate downscaling_env
+conda activate seaice-downscaling
 
 cd "$PBS_O_WORKDIR"
 
