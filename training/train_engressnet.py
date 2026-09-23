@@ -121,6 +121,10 @@ def parse_args():
                         "difference. Default off = current architecture (mask folds in early). "
                         "Not intended to stay in the codebase once that question is answered.")
     p.set_defaults(late_mask_fusion=False)
+    p.add_argument("--deterministic-mse", dest="deterministic_mse", action="store_true",
+                   help="Train the same backbone as a deterministic baseline: all noise stages "
+                        "zeroed, coastal-weighted MSE loss instead of the energy score, and "
+                        "every evaluation member is the (identical) deterministic prediction.")
     # Evaluation
     p.add_argument("--k-eval", type=int, default=6, help="Ensemble size during evaluation.")
     p.add_argument("--eval-batch-size", type=int, default=16)
@@ -223,6 +227,7 @@ def main():
         noise_channels=args.noise_channels,
         noise_kernel_size=args.noise_kernel_size,
         late_mask_fusion=args.late_mask_fusion,
+        deterministic_mse=args.deterministic_mse,
         k_eval=args.k_eval,
         eval_batch_size=args.eval_batch_size,
         make_figures=args.make_figures,

@@ -113,6 +113,7 @@ ATTN_NUM_HEADS="${ATTN_NUM_HEADS:-4}"
 NOISE_CHANNELS="${NOISE_CHANNELS:-1}"
 NOISE_KERNEL_SIZE="${NOISE_KERNEL_SIZE:-5}"
 LATE_MASK_FUSION="${LATE_MASK_FUSION:-false}"
+DETERMINISTIC_MSE="${DETERMINISTIC_MSE:-false}"
 
 # Optional batch folder name. When set, --output-dir is passed explicitly so
 # this run's output lands under results/<BATCH_NAME>/<run_tag> instead of the
@@ -143,7 +144,7 @@ echo "Seed: ${SEED}"
 echo "Coastal width / boost: ${COASTAL_WIDTH} / ${COASTAL_BOOST}"
 echo "Sub-domain: lat ${LAT_MIN}-${LAT_MAX}, lon ${LON_MIN}-${LON_MAX}"
 echo "Attention end: ${ATTENTION_END} (window ${ATTN_WINDOW_SIZE}, heads ${ATTN_NUM_HEADS})"
-echo "Noise channels: ${NOISE_CHANNELS}   Noise kernel size: ${NOISE_KERNEL_SIZE}   Late mask fusion: ${LATE_MASK_FUSION}"
+echo "Noise channels: ${NOISE_CHANNELS}   Noise kernel size: ${NOISE_KERNEL_SIZE}   Late mask fusion: ${LATE_MASK_FUSION}   Deterministic MSE: ${DETERMINISTIC_MSE}"
 echo "Batch name: ${BATCH_NAME:-<none, flat results/>}"
 echo "Init checkpoint: ${INIT_CHECKPOINT:-<none, random init>}   Collapse wind vector: ${COLLAPSE_WIND_VECTOR}"
 
@@ -190,6 +191,7 @@ fi
 
 ARGS+=(--noise-channels "$NOISE_CHANNELS" --noise-kernel-size "$NOISE_KERNEL_SIZE")
 [ "$LATE_MASK_FUSION" = true ] && ARGS+=(--late-mask-fusion)
+[ "$DETERMINISTIC_MSE" = true ] && ARGS+=(--deterministic-mse)
 [ -n "$INIT_CHECKPOINT" ] && ARGS+=(--init-checkpoint "$INIT_CHECKPOINT")
 [ "$COLLAPSE_WIND_VECTOR" = true ] && ARGS+=(--collapse-wind-vector)
 

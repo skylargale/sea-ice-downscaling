@@ -1275,7 +1275,10 @@ def build_coastal_weight_map(land_mask, coastal_width=5, coastal_boost=2.0):
 # ==============================================================
 
 def train_model(model, optimizer, X_train, Y_train, mask_train, device, K, num_epochs, batch_size,
-                 coastal_width=5, coastal_boost=2.0, beta=1.0, verbose=True):
+                 coastal_width=5, coastal_boost=2.0, beta=1.0, verbose=True, deterministic_mse=False):
+    """deterministic_mse=True trains the same backbone as a plain deterministic baseline: every
+    noise stage is zeroed (deterministic=True), K is ignored, and the loss is the same
+    coastal-weighted per-pixel MSE in normalized-increment space instead of the energy score."""
     loss_array = []
 
     for epoch in range(num_epochs):
@@ -1292,11 +1295,6 @@ def train_model(model, optimizer, X_train, Y_train, mask_train, device, K, num_e
             mask_batch = mask_train[batch_idx].to(device)
 
             B = X_batch.shape[0]
-            X_rep = X_batch.repeat_interleave(K, dim=0)
-            mask_rep = mask_batch.repeat_interleave(K, dim=0)
-
-            preds = model(X_rep, up_size=Y_batch.shape[-2:], mask=mask_rep)
-            preds = preds.reshape(B, K, preds.shape[1], preds.shape[2], preds.shape[3])
 
             # Per-sample loss weight: land at baseline weight 1, coastal ocean band
             # up-weighted -- built fresh per batch since mask_batch can vary across
@@ -1305,14 +1303,23 @@ def train_model(model, optimizer, X_train, Y_train, mask_train, device, K, num_e
             # (see UNet.forward), so its weight here mostly just keeps its near-zero loss
             # contribution from being silently dropped.
             coastal_weight = build_coastal_weight_map(mask_batch[:, 0], coastal_width, coastal_boost)
-            loss = energy_loss(preds, Y_batch, weight=coastal_weight, beta=beta)
+
+            if deterministic_mse:
+                preds = model(X_batch, up_size=Y_batch.shape[-2:], mask=mask_batch, deterministic=True)
+                loss = (coastal_weight.unsqueeze(1) * (preds - Y_batch) ** 2).mean()
+            else:
+                X_rep = X_batch.repeat_interleave(K, dim=0)
+                mask_rep = mask_batch.repeat_interleave(K, dim=0)
+                preds = model(X_rep, up_size=Y_batch.shape[-2:], mask=mask_rep)
+                preds = preds.reshape(B, K, preds.shape[1], preds.shape[2], preds.shape[3])
+                loss = energy_loss(preds, Y_batch, weight=coastal_weight, beta=beta)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
             epoch_loss += loss.item() * B
-            del X_batch, Y_batch, mask_batch, X_rep, mask_rep, preds, loss
+            del X_batch, Y_batch, mask_batch, preds, loss
 
         epoch_loss /= X_train.size(0)
         loss_array.append(epoch_loss)
@@ -1322,7 +1329,7 @@ def train_model(model, optimizer, X_train, Y_train, mask_train, device, K, num_e
     return loss_array
 
 
-def evaluate_model(model, X_test, Y_test, mask_test, device, K_eval, eval_batch_size):
+def evaluate_model(model, X_test, Y_test, mask_test, device, K_eval, eval_batch_size, deterministic_only=False):
     model.eval()
     preds_all, preds_mean, preds_std, preds_det = [], [], [], []
 
@@ -1338,7 +1345,7 @@ def evaluate_model(model, X_test, Y_test, mask_test, device, K_eval, eval_batch_
             # (below) forces z to exact zero instead.
             ensemble_preds = []
             for k in range(K_eval):
-                pred = model(X_batch, Y_batch.shape[-2:], mask=mask_batch)
+                pred = model(X_batch, Y_batch.shape[-2:], mask=mask_batch, deterministic=deterministic_only)
                 ensemble_preds.append(pred)
 
             preds = torch.stack(ensemble_preds, dim=0).permute(1, 0, 2, 3, 4)
@@ -2283,6 +2290,7 @@ def run_pipeline(config):
     loss_array = train_model(
         model, optimizer, X_train, Y_train, mask_train, device, config.k, config.num_epochs, config.batch_size,
         coastal_width=config.coastal_width, coastal_boost=config.coastal_boost, beta=config.beta,
+        deterministic_mse=getattr(config, "deterministic_mse", False),
     )
 
     torch.save(model.module.state_dict(), os.path.join(config.output_dir, "model_state_dict.pt"))
@@ -2296,7 +2304,10 @@ def run_pipeline(config):
     # Evaluate
     # ------------------------------------------------------------
     print("Running evaluation...")
-    preds_all, Y_pred, Y_spread, Y_pred_det = evaluate_model(model, X_test, Y_test, mask_test, device, config.k_eval, config.eval_batch_size)
+    preds_all, Y_pred, Y_spread, Y_pred_det = evaluate_model(
+        model, X_test, Y_test, mask_test, device, config.k_eval, config.eval_batch_size,
+        deterministic_only=getattr(config, "deterministic_mse", False),
+    )
 
     # De-normalize using the *increment's* own stats (not Y_mean/Y_std, which describe the
     # raw value's distribution, not the increment's), then add back the physical bilinear
