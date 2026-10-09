@@ -125,6 +125,41 @@ def parse_args():
                    help="Train the same backbone as a deterministic baseline: all noise stages "
                         "zeroed, coastal-weighted MSE loss instead of the energy score, and "
                         "every evaluation member is the (identical) deterministic prediction.")
+    p.add_argument("--crps-weight", type=float, default=0.0,
+                   help="Add this multiple of the fair per-pixel ensemble CRPS (same coastal weights) "
+                        "to the energy-score loss, targeting per-pixel calibration. ~250 makes the two "
+                        "terms comparable for MESA. Default 0 = energy score only (unchanged).")
+    # 2026-09-29 obs-evaluation tests (observations/engressnet_obs_evaluation.ipynb); all default off.
+    p.add_argument("--noise-amp-map", dest="noise_amp_map", action="store_true",
+                   help="T2: per-pixel noise amplitude predicted from each decoder stage's features (state-dependent spread).")
+    p.set_defaults(noise_amp_map=False)
+    p.add_argument("--energy-patch-size", type=int, default=0,
+                   help="T2: score the energy term over ~N x N tiles instead of the whole field (0 = whole field).")
+    p.add_argument("--aux-path", default=None,
+                   help="T3: file with A(ensemble,time,channel,lat,lon) high-res predictor channels for training samples.")
+    p.add_argument("--test-aux-path", default=None, help="T3: same for the test samples (defaults to --aux-path).")
+    p.add_argument("--static-path", default=None, help="T3: file with S(channel,lat,lon) static high-res channels.")
+    p.add_argument("--time-context", type=int, default=0,
+                   help="T4: add the previous N days' predictors as extra input channels (0 = off).")
+    p.add_argument("--obs-ft-x-path", default=None, help="T1: predictors for observation fine-tuning (e.g. PIOMAS-obs X).")
+    p.add_argument("--obs-ft-target-path", default=None, help="T1: gridded observation target, ~1 deg blocks (time, 15, 31).")
+    p.add_argument("--obs-ft-weight", type=float, default=100.0, help="T1: weight of the observation block-CRPS step.")
+    # 2026-10-07 calibration options (all default off)
+    p.add_argument("--noise-kernel-size-final", type=int, default=None,
+                   help="Option 1b: wider noise-kernel footprint for the 0.1 deg (final) stage only, edge-safe padding.")
+    p.add_argument("--noise-lr-mult", type=float, default=1.0,
+                   help="Option 1: learning-rate multiplier for the noise scalars and amplitude-map heads.")
+    p.add_argument("--train-only-noise", dest="train_only_noise", action="store_true",
+                   help="Option 2: freeze everything except the noise scalars and amplitude-map heads.")
+    p.set_defaults(train_only_noise=False)
+    p.add_argument("--obs-ft-only", dest="obs_ft_only", action="store_true",
+                   help="Option 2: train only on the --obs-ft-* observation set (no CICE steps); a full-res target "
+                        "(time, H, W) is scored with per-cell CRPS where observed.")
+    p.set_defaults(obs_ft_only=False)
+    p.add_argument("--output-floor", choices=["clamp", "softplus"], default="clamp",
+                   help="How physical thickness is kept >= 0: 'clamp' (default, at evaluation only) or 'softplus' (smooth floor "
+                        "applied in the training loss and at evaluation, 2026-10-08).")
+    p.add_argument("--output-floor-scale", type=float, default=0.02, help="Softplus floor scale in metres (default 0.02).")
     # Evaluation
     p.add_argument("--k-eval", type=int, default=6, help="Ensemble size during evaluation.")
     p.add_argument("--eval-batch-size", type=int, default=16)
@@ -228,6 +263,7 @@ def main():
         noise_kernel_size=args.noise_kernel_size,
         late_mask_fusion=args.late_mask_fusion,
         deterministic_mse=args.deterministic_mse,
+        crps_weight=args.crps_weight,
         k_eval=args.k_eval,
         eval_batch_size=args.eval_batch_size,
         make_figures=args.make_figures,
@@ -235,6 +271,21 @@ def main():
         seed=args.seed,
         init_checkpoint=args.init_checkpoint,
         collapse_wind_vector=args.collapse_wind_vector,
+        noise_amp_map=args.noise_amp_map,
+        energy_patch_size=args.energy_patch_size,
+        aux_path=args.aux_path,
+        test_aux_path=args.test_aux_path,
+        static_path=args.static_path,
+        time_context=args.time_context,
+        obs_ft_x_path=args.obs_ft_x_path,
+        obs_ft_target_path=args.obs_ft_target_path,
+        obs_ft_weight=args.obs_ft_weight,
+        noise_kernel_size_final=args.noise_kernel_size_final,
+        noise_lr_mult=args.noise_lr_mult,
+        train_only_noise=args.train_only_noise,
+        obs_ft_only=args.obs_ft_only,
+        output_floor=args.output_floor,
+        output_floor_scale=args.output_floor_scale,
     )
 
     fe.run_pipeline(config)

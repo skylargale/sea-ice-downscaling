@@ -6,11 +6,11 @@ import sys
 import time
 import torch
 
-sys.path.insert(0, "/glade/work/skygale/projects/SeaIceDownscaling/Version6/training")
-sys.path.insert(0, "/glade/work/skygale/projects/SeaIceDownscaling/Version6/evaluation")
+sys.path.insert(0, "/glade/work/skygale/projects/SeaIceDownscaling/training")
+sys.path.insert(0, "/glade/work/skygale/projects/SeaIceDownscaling/evaluation")
 import functions_engressnet as fe
 
-CKPT = "/glade/work/skygale/projects/SeaIceDownscaling/Version6/results/MESA_noise_cascade_avg/MESA_noisecasc_avg_2000-2005_2021_5956146.casper-pbs/model_state_dict.pt"
+CKPT = "/glade/work/skygale/projects/SeaIceDownscaling/results/MESA_noise_cascade_avg/MESA_noisecasc_avg_2000-2005_2021_5956146.casper-pbs/model_state_dict.pt"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("device:", device)
 

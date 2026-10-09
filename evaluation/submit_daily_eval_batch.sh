@@ -41,7 +41,7 @@ conda activate seaice-downscaling
 # this project (submit_engressnet_daily*.sh) and BASH_SOURCE-based resolution silently
 # broke under real PBS execution, since PBS spools/copies a submitted script at qsub time
 # and BASH_SOURCE[0] then points at that spool copy, not the real file on disk.
-cd "/glade/work/skygale/projects/SeaIceDownscaling/Version6"
+cd "/glade/work/skygale/projects/SeaIceDownscaling"
 
 echo "Batch dir: $BATCH_DIR"
 echo "Job started at $(date)"

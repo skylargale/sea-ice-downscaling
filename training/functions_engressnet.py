@@ -46,7 +46,7 @@ DEFAULT_DATA_DIR = "/glade/derecho/scratch/skygale/downscaling"
 DEFAULT_X_PATH = os.path.join(DEFAULT_DATA_DIR, "X_FOSI_HR_JRA55_interp.nc")
 DEFAULT_Y_PATH = os.path.join(DEFAULT_DATA_DIR, "Y_FOSI_HR_JRA55.nc")
 DEFAULT_WEIGHTED_GRIDS_DIR = "/glade/work/skygale/projects/SeaIceDownscaling/weighted_grids"
-DEFAULT_RESULTS_DIR = "/glade/work/skygale/projects/SeaIceDownscaling/Version6/results"
+DEFAULT_RESULTS_DIR = "/glade/work/skygale/projects/SeaIceDownscaling/results"
 
 DEFAULT_BBOX = {"lon_min": -190, "lon_max": -140, "lat_min": 60, "lat_max": 80}
 DEFAULT_BBOX_REGRID = {"lon_min": -200, "lon_max": -130, "lat_min": 55, "lat_max": 85}
@@ -804,10 +804,14 @@ class GaussianNoiseStage(nn.Module):
     permanent tuning parameter.)
     """
 
-    def __init__(self, channels=1, kernel_size=5, init_width=1.5, init_sigma=1.0):
+    def __init__(self, channels=1, kernel_size=5, init_width=1.5, init_sigma=1.0, pad_valid=False):
         super().__init__()
         self.channels = channels
         self.kernel_size = kernel_size
+        # pad_valid (2026-10-07, calibration option 1b): draw the white noise on a (H+k-1, W+k-1) grid and convolve
+        # without padding, so a wide kernel has no zero-padding variance loss near the domain edges. Default False =
+        # unchanged ("same" zero padding).
+        self.pad_valid = pad_valid
         self.log_width = nn.Parameter(torch.log(torch.expm1(torch.tensor(float(init_width)))))
         self.log_sigma = nn.Parameter(torch.log(torch.expm1(torch.tensor(float(init_sigma)))))
         coords = torch.arange(kernel_size, dtype=torch.float32) - kernel_size // 2
@@ -821,12 +825,17 @@ class GaussianNoiseStage(nn.Module):
         kernel2d = g[:, None] * g[None, :]
         return kernel2d.view(1, 1, self.kernel_size, self.kernel_size)
 
-    def forward(self, batch_size, height, width, device, dtype, deterministic=False):
+    def forward(self, batch_size, height, width, device, dtype, deterministic=False, amp=None):
         if deterministic:
             return torch.zeros(batch_size, self.channels, height, width, device=device, dtype=dtype)
-        eps = torch.randn(batch_size, self.channels, height, width, device=device, dtype=dtype)
         kernel = self._kernel(device, dtype)
-        blurred = F.conv2d(eps, kernel.expand(self.channels, 1, -1, -1), padding=self.kernel_size // 2, groups=self.channels)
+        if self.pad_valid:
+            k1 = self.kernel_size - 1
+            eps = torch.randn(batch_size, self.channels, height + k1, width + k1, device=device, dtype=dtype)
+            blurred = F.conv2d(eps, kernel.expand(self.channels, 1, -1, -1), padding=0, groups=self.channels)
+        else:
+            eps = torch.randn(batch_size, self.channels, height, width, device=device, dtype=dtype)
+            blurred = F.conv2d(eps, kernel.expand(self.channels, 1, -1, -1), padding=self.kernel_size // 2, groups=self.channels)
         # Undo exactly the variance the blur itself introduced (Var(output) =
         # Var(input) * Sum(kernel_weight^2) for unit-variance input), so
         # log_sigma alone is the final, literal amplitude -- independent of
@@ -834,6 +843,11 @@ class GaussianNoiseStage(nn.Module):
         renorm_factor = torch.sqrt((kernel ** 2).sum())
         renormed = blurred / renorm_factor
         sigma = F.softplus(self.log_sigma)
+        if amp is not None:
+            # 2026-09-29 (obs-eval test T2, --noise-amp-map): per-pixel amplitude map (B, 1, H, W) predicted from
+            # this stage's decoder features, so the ensemble spread can depend on the ice state. Multiplies the
+            # learnable scalar; the map's head is initialised to exactly 1 everywhere (see UNet).
+            return renormed * sigma * amp
         return renormed * sigma
 
 
@@ -927,7 +941,8 @@ class UNet(nn.Module):
 
     def __init__(self, in_channels, mask_channels=1,
                  attention_end=False, attn_window_size=8, attn_num_heads=4,
-                 noise_channels=1, noise_kernel_size=5, late_mask_fusion=False):
+                 noise_channels=1, noise_kernel_size=5, late_mask_fusion=False, noise_amp_map=False,
+                 noise_kernel_size_final=None):
         """
         Note on stochastic ensemble generation (redesigned 2026-09-16): each
         of the four decoder stages (d3, d2, d1, final) has its own
@@ -1007,6 +1022,19 @@ class UNet(nn.Module):
         self.attention_end = attention_end
         self.mask_channels = mask_channels
         self.late_mask_fusion = late_mask_fusion
+        # noise_amp_map (2026-09-29, obs-eval test T2): a 3x3-conv + softplus head per decoder stage turns that
+        # stage's features into a positive per-pixel noise amplitude. Zero weights and a softplus^-1(1) bias make
+        # it start as exactly the scalar-amplitude model. Default False = unchanged architecture/state_dict.
+        # mask_channels may also include extra high-res predictor channels (obs-eval test T3, run_pipeline's
+        # aux/static channels) -- they ride along with the land mask into the final fusion.
+        self.noise_amp_map = noise_amp_map
+        if noise_amp_map:
+            def amp_head(c):
+                conv = nn.Conv2d(c, 1, 3, padding=1)
+                nn.init.zeros_(conv.weight)
+                nn.init.constant_(conv.bias, float(np.log(np.expm1(1.0))))
+                return conv
+            self.amp_d3, self.amp_d2, self.amp_d1, self.amp_final = amp_head(256), amp_head(128), amp_head(64), amp_head(64)
 
         def conv_block(in_c, out_c):
             return nn.Sequential(
@@ -1038,7 +1066,13 @@ class UNet(nn.Module):
         self.noise_proj_d2 = nn.Conv2d(noise_channels, 128, 1)
         self.noise_d1 = GaussianNoiseStage(channels=noise_channels, kernel_size=noise_kernel_size)
         self.noise_proj_d1 = nn.Conv2d(noise_channels, 64, 1)
-        self.noise_final = GaussianNoiseStage(channels=noise_channels, kernel_size=noise_kernel_size)
+        # noise_kernel_size_final (2026-10-07, calibration option 1b): a wider footprint for the 0.1 deg stage only, so its
+        # learnable width can reach the ~50-160 km scales between the 5-tap final stage and the coarse stages (edge-safe
+        # "valid" noise padding). None = unchanged (same kernel as the other stages).
+        if noise_kernel_size_final:
+            self.noise_final = GaussianNoiseStage(channels=noise_channels, kernel_size=noise_kernel_size_final, pad_valid=True)
+        else:
+            self.noise_final = GaussianNoiseStage(channels=noise_channels, kernel_size=noise_kernel_size)
         self.noise_proj_final = nn.Conv2d(noise_channels, 64, 1)
 
         # Decoder
@@ -1132,21 +1166,26 @@ class UNet(nn.Module):
         # Bottleneck
         b = self.bottleneck(e4)
 
+        amp = (lambda head, feat: F.softplus(head(feat))) if self.noise_amp_map else (lambda head, feat: None)
+
         # Decoder
         d3 = self.up3(b)
-        n3 = self.noise_proj_d3(self.noise_d3(B, *d3.shape[-2:], d3.device, d3.dtype, deterministic))
+        n3 = self.noise_proj_d3(self.noise_d3(B, *d3.shape[-2:], d3.device, d3.dtype, deterministic,
+                                              amp=amp(getattr(self, "amp_d3", None), d3)))
         d3 = self.concat_d3(torch.cat([d3, n3], dim=1))
         d3 = torch.cat([d3, e3], dim=1)
         d3 = self.dec3(d3)
 
         d2 = self.up2(d3)
-        n2 = self.noise_proj_d2(self.noise_d2(B, *d2.shape[-2:], d2.device, d2.dtype, deterministic))
+        n2 = self.noise_proj_d2(self.noise_d2(B, *d2.shape[-2:], d2.device, d2.dtype, deterministic,
+                                              amp=amp(getattr(self, "amp_d2", None), d2)))
         d2 = self.concat_d2(torch.cat([d2, n2], dim=1))
         d2 = torch.cat([d2, e2], dim=1)
         d2 = self.dec2(d2)
 
         d1 = self.up1(d2)
-        n1 = self.noise_proj_d1(self.noise_d1(B, *d1.shape[-2:], d1.device, d1.dtype, deterministic))
+        n1 = self.noise_proj_d1(self.noise_d1(B, *d1.shape[-2:], d1.device, d1.dtype, deterministic,
+                                              amp=amp(getattr(self, "amp_d1", None), d1)))
         d1 = self.concat_d1(torch.cat([d1, n1], dim=1))
         d1 = torch.cat([d1, e1], dim=1)
         d1 = self.dec1(d1)
@@ -1154,7 +1193,12 @@ class UNet(nn.Module):
         # Output
         up = self.final_upsample(d1)
         up = F.interpolate(up, size=up_size, mode="bilinear", align_corners=False)
-        nf = self.noise_proj_final(self.noise_final(B, *up.shape[-2:], up.device, up.dtype, deterministic))
+        # Final-stage amplitude from the 1/4-resolution d1 features, bilinearly upsampled: a head on the full-res
+        # `up` features doubled the backward peak (~3.8 GB extra at B*K=320) and OOM'd 32 GB V100s in epoch 2.
+        amp_f = amp(getattr(self, "amp_final", None), d1)
+        if amp_f is not None:
+            amp_f = F.interpolate(amp_f, size=up.shape[-2:], mode="bilinear", align_corners=False)
+        nf = self.noise_proj_final(self.noise_final(B, *up.shape[-2:], up.device, up.dtype, deterministic, amp=amp_f))
 
         if self.late_mask_fusion:
             # Ablation-only path (see docstring): mask stays out of the fusion until
@@ -1231,6 +1275,140 @@ def energy_loss(preds, y, weight=None, beta=1.0):
     return s1 - 0.5 * s2
 
 
+def energy_loss_patched(preds, y, weight=None, beta=1.0, patch=30):
+    """Energy score averaged over ~patch x patch tiles instead of one score of the whole field (2026-09-29, obs-eval
+    test T2, --energy-patch-size). One ~46k-dimensional energy score is dominated by the ensemble-mean error and hardly
+    constrains local spread; tiles keep each member spatially coherent within a tile while scoring spread locally.
+    The field is split into round(H/patch) x round(W/patch) tiles of ceil size; when that doesn't divide the field, it is
+    zero-padded and the padding gets zero weight, so every pixel is scored. (Fixed 2026-10-06: the first version dropped the
+    remainder, e.g. the last 16 of 310 columns at patch=15, which then never entered the loss. Sizes that divide the field
+    exactly -- 30, 10, 5 on 150 x 310 -- are unchanged by the fix.)"""
+    B, K_, C, H, W = preds.shape
+    nh, nw = max(1, round(H / patch)), max(1, round(W / patch))
+    ph, pw = -(-H // nh), -(-W // nw)
+    Hp, Wp = nh * ph, nw * pw
+    w = torch.ones(B, H, W, dtype=preds.dtype, device=preds.device) if weight is None else \
+        torch.as_tensor(weight, dtype=preds.dtype, device=preds.device)
+    if w.dim() == 2:
+        w = w.unsqueeze(0).expand(B, H, W)
+    if (Hp, Wp) != (H, W):
+        preds = F.pad(preds.reshape(B * K_, C, H, W), (0, Wp - W, 0, Hp - H)).reshape(B, K_, C, Hp, Wp)
+        y = F.pad(y, (0, Wp - W, 0, Hp - H))
+        w = F.pad(w, (0, Wp - W, 0, Hp - H))  # zero weight on the padding
+    p = preds.reshape(B, K_, C, nh, ph, nw, pw).permute(0, 3, 5, 1, 2, 4, 6).reshape(B * nh * nw, K_, C, ph, pw)
+    yy = y.reshape(B, C, nh, ph, nw, pw).permute(0, 2, 4, 1, 3, 5).reshape(B * nh * nw, C, ph, pw)
+    w = w.reshape(B, nh, ph, nw, pw).permute(0, 1, 3, 2, 4).reshape(B * nh * nw, ph, pw)
+    return energy_loss(p, yy, weight=w, beta=beta)
+
+
+def block_crps_loss(phys, ocean, target, block=10):
+    """Fair ensemble CRPS of ocean-mean ~1 deg block values against a gridded observation (2026-09-29, obs-eval test T1).
+    phys: [B, K, H, W] physical thickness (land already 0); ocean: [H, W] 0/1; target: [B, H//block, W//block] with NaN
+    where unobserved. Only blocks with ocean cells and a finite target count."""
+    B, K, H, W = phys.shape
+    nh, nw = H // block, W // block
+    ph = phys[..., :nh * block, :nw * block].reshape(B, K, nh, block, nw, block).sum((3, 5))
+    oc = ocean[:nh * block, :nw * block].reshape(nh, block, nw, block).sum((1, 3))
+    x = ph / oc.clamp(min=1.0)
+    valid = torch.isfinite(target) & (oc > 0)
+    y = torch.nan_to_num(target)
+    t1 = (x - y.unsqueeze(1)).abs().mean(1)
+    xs, _ = torch.sort(x, dim=1)
+    w = (2 * torch.arange(1, K + 1, device=x.device, dtype=x.dtype) - K - 1).view(1, K, 1, 1)
+    crps = t1 - (xs * w).sum(1) / (K * (K - 1))
+    return (crps * valid).sum() / valid.sum().clamp(min=1)
+
+
+def pixel_obs_crps_loss(phys, target):
+    """Fair ensemble CRPS at the 0.1 deg cells that have an observation (2026-10-07, calibration option 2).
+    phys: [B, K, H, W] physical thickness; target: [B, H, W] with NaN where unobserved (e.g. ICESat-2 pass-cell means)."""
+    K = phys.shape[1]
+    valid = torch.isfinite(target)
+    y = torch.nan_to_num(target)
+    t1 = (phys - y.unsqueeze(1)).abs().mean(1)
+    xs, _ = torch.sort(phys, dim=1)
+    w = (2 * torch.arange(1, K + 1, device=phys.device, dtype=phys.dtype) - K - 1).view(1, K, 1, 1)
+    crps = t1 - (xs * w).sum(1) / (K * (K - 1))
+    return (crps * valid).sum() / valid.sum().clamp(min=1)
+
+
+def _obs_step(model, optimizer, obs_ft, oi, K, device):
+    """One optimizer step on observation batch `oi` (T1 block CRPS, or option-2 pixel CRPS when the target is full-res)."""
+    B = len(oi)
+    optimizer.zero_grad()
+    Xo = obs_ft["X"][oi].to(device)
+    mo = _model_mask(obs_ft["mask"][oi].to(device), obs_ft.get("aux"), oi)
+    H_, W_ = obs_ft["hw"]
+    po = model(Xo.repeat_interleave(K, dim=0), up_size=(H_, W_), mask=mo.repeat_interleave(K, dim=0))
+    po = po.reshape(B, K, H_, W_)
+    ocean = obs_ft["ocean"].to(device)
+    phys = (po * obs_ft["inc_scale"] + obs_ft["inc_mean"] + obs_ft["base"][oi].to(device).unsqueeze(1)).clamp(min=0.0) * ocean
+    tgt = obs_ft["target"][oi].to(device)
+    loss_o = obs_ft["weight"] * (pixel_obs_crps_loss(phys, tgt) if obs_ft.get("pixel") else block_crps_loss(phys, ocean, tgt))
+    loss_o.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    optimizer.step()
+    return loss_o.item()
+
+
+def smooth_floor(x, scale):
+    """Smooth non-negative floor for physical thickness (2026-10-08, --output-floor softplus): scale * softplus(x / scale).
+    ~x for x >> scale, -> 0 for x << -scale, scale*ln2 at x = 0; differentiable everywhere, unlike clamp(min=0)."""
+    return scale * F.softplus(x / scale)
+
+
+def _floor_in_increment_space(preds, base, floor):
+    """Apply the smooth physical floor to normalized-increment predictions preds [B, K, C, H, W] (base [B, C, H, W] physical
+    bilinear baseline) and map back to normalized-increment space, so the training loss scores exactly the non-negative members
+    that are evaluated (the clamp at evaluation is otherwise invisible to training)."""
+    sd, mu = floor["inc_std"], floor["inc_mean"]
+    b = base.unsqueeze(1)
+    phys = smooth_floor(preds * sd + mu + b, floor["scale"])
+    return (phys - b - mu) / sd
+
+
+def _model_mask(mask_batch, aux, idx):
+    """Land mask plus optional high-res predictor channels (obs-eval test T3) for the samples `idx`."""
+    if aux is None:
+        return mask_batch
+    parts = [mask_batch]
+    B = mask_batch.shape[0]
+    if aux.get("dyn") is not None:
+        parts.append(aux["dyn"][idx].to(mask_batch.device, mask_batch.dtype))
+    if aux.get("static") is not None:
+        parts.append(aux["static"].to(mask_batch.device, mask_batch.dtype).unsqueeze(0).expand(B, -1, -1, -1))
+    return torch.cat(parts, dim=1)
+
+
+def pixelwise_crps_loss(preds, y, weight=None):
+    """
+    Fair per-pixel ensemble CRPS, averaged over pixels (optionally weighted like energy_loss).
+
+    The energy score above is a single score of the whole flattened field (~46k values); in that
+    many dimensions it is dominated by the ensemble-mean error and only weakly penalizes a
+    per-pixel spread that is too narrow, which is what the corrected spread-skill ratio (~0.7)
+    measures. Adding this term (train_model's crps_weight) targets per-pixel calibration with a
+    proper score; the energy score term is kept for spatial coherence of each member.
+
+        CRPS_fair = mean_k |x_k - y| - sum_{i,j} |x_i - x_j| / (2K(K-1))
+    with the pairwise term computed from sorted members: sum_{i,j}|x_i-x_j| = 2 sum_k (2k-K-1) x_(k).
+    Sorting is differentiable with respect to the sorted values, so gradients flow to every member.
+
+    Args:
+        preds: [B, K, C, H, W]; y: [B, C, H, W]; weight: None, (H, W) or (B, H, W).
+    """
+    K = preds.shape[1]
+    term1 = (preds - y.unsqueeze(1)).abs().mean(1)
+    xs, _ = torch.sort(preds, dim=1)
+    w = (2 * torch.arange(1, K + 1, device=preds.device, dtype=preds.dtype) - K - 1).view(1, K, 1, 1, 1)
+    term2 = (xs * w).sum(1) / (K * (K - 1))
+    crps = term1 - term2  # [B, C, H, W]
+    if weight is not None:
+        w_map = torch.as_tensor(weight, dtype=preds.dtype, device=preds.device)
+        crps = crps * (w_map.unsqueeze(0).unsqueeze(0) if w_map.dim() == 2 else w_map.unsqueeze(1))
+    return crps.mean()
+
+
 def coastal_band_mask(land_mask, coastal_width=5):
     """
     Boolean (..., H, W) mask: True for ocean cells within `coastal_width` pixels of land,
@@ -1275,15 +1453,43 @@ def build_coastal_weight_map(land_mask, coastal_width=5, coastal_boost=2.0):
 # ==============================================================
 
 def train_model(model, optimizer, X_train, Y_train, mask_train, device, K, num_epochs, batch_size,
-                 coastal_width=5, coastal_boost=2.0, beta=1.0, verbose=True, deterministic_mse=False):
+                 coastal_width=5, coastal_boost=2.0, beta=1.0, verbose=True, deterministic_mse=False,
+                 crps_weight=0.0, energy_patch_size=0, aux_train=None, obs_ft=None, floor=None):
     """deterministic_mse=True trains the same backbone as a plain deterministic baseline: every
     noise stage is zeroed (deterministic=True), K is ignored, and the loss is the same
-    coastal-weighted per-pixel MSE in normalized-increment space instead of the energy score."""
+    coastal-weighted per-pixel MSE in normalized-increment space instead of the energy score.
+
+    crps_weight > 0 (2026-09-25, under-dispersion test) adds crps_weight * pixelwise_crps_loss to
+    the energy score, with the same coastal weight map. The energy score is ~235x the mean
+    per-pixel CRPS at the trained MESA solution (normalized units), so crps_weight ~250 makes the
+    two terms comparable. 0 = unchanged energy-score-only training.
+
+    2026-09-29 obs-eval tests (all default off): energy_patch_size > 0 scores the energy term per tile
+    (energy_loss_patched, T2); aux_train adds high-res predictor channels to the model's mask input (T3);
+    obs_ft (T1) interleaves an extra optimizer step per batch on an observation batch, loss =
+    obs_ft['weight'] * block_crps_loss of the ~1 deg ocean-block means against the gridded observation target."""
     loss_array = []
+
+    if obs_ft is not None and obs_ft.get("only"):
+        # 2026-10-07 calibration option 2 (--obs-ft-only): no CICE steps at all; each epoch is one shuffled pass over the
+        # observation days (usually with --train-only-noise, so only the spread parameters move).
+        n = obs_ft["X"].shape[0]
+        for epoch in range(num_epochs):
+            model.train()
+            tot = 0.0
+            perm = torch.randperm(n)
+            for i in range(0, n, batch_size):
+                oi = perm[i:i + batch_size]
+                tot += _obs_step(model, optimizer, obs_ft, oi, K, device) * len(oi)
+            loss_array.append(tot / n)
+            if verbose:
+                print(f"Epoch {epoch + 1}/{num_epochs} | obs-only CRPS loss: {tot / n:.6f}", flush=True)
+        return loss_array
 
     for epoch in range(num_epochs):
         model.train()
         epoch_loss = 0.0
+        epoch_es = epoch_crps = epoch_obs = 0.0
         idx = torch.randperm(X_train.size(0))
 
         for i in range(0, X_train.size(0), batch_size):
@@ -1293,6 +1499,7 @@ def train_model(model, optimizer, X_train, Y_train, mask_train, device, K, num_e
             X_batch = X_train[batch_idx].to(device)
             Y_batch = Y_train[batch_idx].to(device)
             mask_batch = mask_train[batch_idx].to(device)
+            model_mask = _model_mask(mask_batch, aux_train, batch_idx)
 
             B = X_batch.shape[0]
 
@@ -1305,14 +1512,24 @@ def train_model(model, optimizer, X_train, Y_train, mask_train, device, K, num_e
             coastal_weight = build_coastal_weight_map(mask_batch[:, 0], coastal_width, coastal_boost)
 
             if deterministic_mse:
-                preds = model(X_batch, up_size=Y_batch.shape[-2:], mask=mask_batch, deterministic=True)
+                preds = model(X_batch, up_size=Y_batch.shape[-2:], mask=model_mask, deterministic=True)
                 loss = (coastal_weight.unsqueeze(1) * (preds - Y_batch) ** 2).mean()
             else:
                 X_rep = X_batch.repeat_interleave(K, dim=0)
-                mask_rep = mask_batch.repeat_interleave(K, dim=0)
+                mask_rep = model_mask.repeat_interleave(K, dim=0)
                 preds = model(X_rep, up_size=Y_batch.shape[-2:], mask=mask_rep)
                 preds = preds.reshape(B, K, preds.shape[1], preds.shape[2], preds.shape[3])
-                loss = energy_loss(preds, Y_batch, weight=coastal_weight, beta=beta)
+                if floor is not None:  # --output-floor softplus: score the floored (non-negative) members
+                    preds = _floor_in_increment_space(preds, floor["base"][batch_idx].to(device), floor)
+                if energy_patch_size and energy_patch_size > 0:
+                    loss = energy_loss_patched(preds, Y_batch, weight=coastal_weight, beta=beta, patch=energy_patch_size)
+                else:
+                    loss = energy_loss(preds, Y_batch, weight=coastal_weight, beta=beta)
+                if crps_weight > 0:
+                    crps_term = pixelwise_crps_loss(preds, Y_batch, weight=coastal_weight)
+                    epoch_es += loss.item() * B
+                    epoch_crps += crps_term.item() * B
+                    loss = loss + crps_weight * crps_term
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -1321,15 +1538,26 @@ def train_model(model, optimizer, X_train, Y_train, mask_train, device, K, num_e
             epoch_loss += loss.item() * B
             del X_batch, Y_batch, mask_batch, preds, loss
 
+            if obs_ft is not None:
+                oi = torch.randint(0, obs_ft["X"].shape[0], (B,))
+                epoch_obs += _obs_step(model, optimizer, obs_ft, oi, K, device) * B
+
         epoch_loss /= X_train.size(0)
         loss_array.append(epoch_loss)
         if verbose:
-            print(f"Epoch {epoch + 1}/{num_epochs} | Loss: {epoch_loss:.6f}")
+            extra = ""
+            if crps_weight > 0 and not deterministic_mse:
+                n = X_train.size(0)
+                extra = (f" | energy: {epoch_es / n:.6f} | pixel CRPS: {epoch_crps / n:.6f}"
+                         f" (x{crps_weight:g} = {crps_weight * epoch_crps / n:.6f})")
+            if obs_ft is not None:
+                extra += f" | obs block CRPS term: {epoch_obs / X_train.size(0):.6f}"
+            print(f"Epoch {epoch + 1}/{num_epochs} | Loss: {epoch_loss:.6f}{extra}", flush=True)
 
     return loss_array
 
 
-def evaluate_model(model, X_test, Y_test, mask_test, device, K_eval, eval_batch_size, deterministic_only=False):
+def evaluate_model(model, X_test, Y_test, mask_test, device, K_eval, eval_batch_size, deterministic_only=False, aux_test=None):
     model.eval()
     preds_all, preds_mean, preds_std, preds_det = [], [], [], []
 
@@ -1337,7 +1565,8 @@ def evaluate_model(model, X_test, Y_test, mask_test, device, K_eval, eval_batch_
         for i in range(0, X_test.shape[0], eval_batch_size):
             X_batch = X_test[i:i + eval_batch_size].to(device)
             Y_batch = Y_test[i:i + eval_batch_size].to(device)
-            mask_batch = mask_test[i:i + eval_batch_size].to(device)
+            mask_batch = _model_mask(mask_test[i:i + eval_batch_size].to(device), aux_test,
+                                     torch.arange(i, min(i + eval_batch_size, X_test.shape[0])))
 
             # z=None (default) makes forward() sample its own fresh global latent
             # noise, so each ensemble member gets independent stochastic detail
@@ -1982,6 +2211,91 @@ def plot_error_figure(output_dir, Y_base_phys, Y_pred_det_phys, Y_pred_phys, Y_t
 # Full pipeline
 # ==============================================================
 
+def add_time_context(X, n):
+    """(obs-eval test T4, --time-context) Stack the previous n days' predictors as extra channels:
+    X (N, T, C, H, W) -> (N, T, C * (n + 1), H, W), order [t, t-1, ..., t-n]. The first n days repeat day 0.
+    Applied to the full record before the year split, so a test year's first days see the previous year."""
+    parts = [X]
+    for k in range(1, n + 1):
+        parts.append(np.concatenate([np.repeat(X[:, :1], k, axis=1), X[:, :-k]], axis=1))
+    return np.concatenate(parts, axis=2)
+
+
+def _crop_hr(arr, hlat, hlon, subdomain):
+    hi0, hi1 = crop_indices(hlat, subdomain["lat_min"], subdomain["lat_max"])
+    hj0, hj1 = crop_indices(np.asarray(hlon) % 360, subdomain["lon_min"] % 360, subdomain["lon_max"] % 360)
+    return arr[..., hi0:hi1, hj0:hj1]
+
+
+def build_aux_channels(config, time_train, member_train, time_test, member_test, hlat, hlon):
+    """(obs-eval test T3) High-res predictor channels on the Y grid, cropped to the sub-domain and standardised with
+    training statistics. aux_path / test_aux_path: files with A (ensemble, time, channel, lat, lon), matched to the
+    samples by timestamp (single-member files); static_path: S (channel, lat, lon). Returns (aux_train, aux_test, n)."""
+    if config.use_patches:
+        raise ValueError("aux/static channels are only implemented for --no-patches.")
+    out_tr, out_te, n = {"dyn": None, "static": None}, {"dyn": None, "static": None}, 0
+
+    def dyn(path, times):
+        da = xr.open_dataset(path)["A"]
+        idx = xr.CFTimeIndex(da["time"].values).get_indexer(np.asarray(times)) if not np.issubdtype(np.asarray(times).dtype, np.datetime64) \
+            else pd.DatetimeIndex(da["time"].values).get_indexer(np.asarray(times))
+        if (idx < 0).any():
+            raise ValueError(f"{path}: {int((idx < 0).sum())} sample times not found (e.g. {np.asarray(times)[idx < 0][:3]}).")
+        a = da.isel(ensemble=0).isel(time=idx).values  # only the matched days are read
+        return torch.tensor(_crop_hr(a, hlat, hlon, config.subdomain)).float()
+
+    if getattr(config, "aux_path", None):
+        tr = dyn(config.aux_path, time_train)
+        te = dyn(getattr(config, "test_aux_path", None) or config.aux_path, time_test)
+        m, s = tr.mean(dim=(0, 2, 3), keepdim=True), tr.std(dim=(0, 2, 3), keepdim=True)
+        out_tr["dyn"], out_te["dyn"] = (tr - m) / (s + 1e-6), (te - m) / (s + 1e-6)
+        n += tr.shape[1]
+        print(f"  aux channels: {tr.shape[1]} dynamic from {config.aux_path} (test: {getattr(config, 'test_aux_path', None) or 'same'})")
+    if getattr(config, "static_path", None):
+        S = torch.tensor(_crop_hr(xr.open_dataset(config.static_path)["S"].values, hlat, hlon, config.subdomain)).float()
+        S = (S - S.mean(dim=(1, 2), keepdim=True)) / (S.std(dim=(1, 2), keepdim=True) + 1e-6)
+        out_tr["static"] = out_te["static"] = S
+        n += S.shape[0]
+        print(f"  aux channels: {S.shape[0]} static from {config.static_path}")
+    return out_tr, out_te, n
+
+
+def build_obs_finetune_set(config, X_mean, X_std, inc_mean, inc_std, land_mask, llon, llat, hlon, hlat, hw, time_context):
+    """(obs-eval test T1) Observation fine-tuning batches: predictors from obs_ft_x_path (e.g. PIOMAS-obs X), normalised
+    with the *training* X statistics, matched by calendar day to obs_ft_target_path's `target` (time, 15, 31) ~1 deg
+    block means of the sub-domain grid (NaN = unobserved). Days without any observed block are dropped."""
+    Xo_da = xr.open_dataset(config.obs_ft_x_path)["X"]
+    Xo = Xo_da.values
+    Xo[:, :, 0] = np.clip(Xo[:, :, 0], None, 6.0)
+    if time_context > 0:
+        Xo = add_time_context(Xo, time_context)
+    xkeys = {(t.year, t.month, t.day): i for i, t in enumerate(Xo_da["time"].values)}
+    tg = xr.open_dataset(config.obs_ft_target_path)["target"]
+    tt = pd.DatetimeIndex(tg["time"].values)
+    pairs = [(k, xkeys[(t.year, t.month, t.day)]) for k, t in enumerate(tt)
+             if (t.year, t.month, t.day) in xkeys and np.isfinite(tg.values[k]).any()]
+    if not pairs:
+        raise ValueError("No overlapping days between obs_ft_x_path and obs_ft_target_path.")
+    ki, xi = map(np.array, zip(*pairs))
+    Xsel = torch.tensor(Xo[0, xi]).float()
+    Xn = (Xsel - X_mean) / (X_std + 1e-6)
+    dummy_Y = torch.zeros(Xn.shape[0], 1, len(hlat), len(hlon))
+    Xc, _, maskc, _, _ = extract_full_domain(Xn, dummy_Y, land_mask, llon, llat, hlon, hlat, config.subdomain)
+    sit = Xc[:, :1] * (X_std[:, :1] + 1e-6) + X_mean[:, :1]
+    base = F.interpolate(sit, size=tuple(hw), mode="bilinear", align_corners=False)[:, 0]
+    ocean = (1.0 - maskc[0, 0]).clamp(0, 1)
+    target = torch.tensor(tg.values[ki]).float()
+    nb = (hw[0] // 10, hw[1] // 10)
+    pixel = tuple(target.shape[-2:]) == tuple(hw)  # option 2: full-res target (e.g. ICESat-2 pass-cells), pixel CRPS
+    if not pixel and tuple(target.shape[-2:]) != nb:
+        raise ValueError(f"obs target {tuple(target.shape[-2:])} matches neither the sub-domain {tuple(hw)} nor its 10x10 blocks {nb}.")
+    print(f"  obs fine-tuning set: {len(ki)} days from {config.obs_ft_x_path} / {config.obs_ft_target_path}, "
+          f"weight {config.obs_ft_weight}")
+    return {"X": Xc, "mask": maskc, "base": base, "ocean": ocean, "target": target, "hw": tuple(hw),
+            "inc_mean": float(inc_mean.flatten()[0]), "inc_scale": float(inc_std.flatten()[0]) + 1e-6,
+            "weight": float(config.obs_ft_weight), "pixel": pixel, "only": bool(getattr(config, "obs_ft_only", False))}
+
+
 def run_pipeline(config):
     """
     End-to-end EngressNet pipeline: load data, build the land-sea mask,
@@ -2165,6 +2479,9 @@ def run_pipeline(config):
                 "the two datasets' predictor schemas manually."
             )
 
+        if int(getattr(config, "time_context", 0) or 0) > 0:
+            X = add_time_context(X, int(config.time_context))
+            X2 = add_time_context(X2, int(config.time_context))
         X_train_fields, Y_train_fields, time_train, member_train = select_by_years(
             X, Y, X_time, config.train_years, months=getattr(config, "months", None),
         )
@@ -2172,6 +2489,8 @@ def run_pipeline(config):
             X2, Y2, X_test_da["time"], config.test_years, months=getattr(config, "months", None),
         )
     else:
+        if int(getattr(config, "time_context", 0) or 0) > 0:
+            X = add_time_context(X, int(config.time_context))
         (X_train_fields, Y_train_fields, X_test_fields, Y_test_fields,
          time_train, time_test, member_train, member_test) = split_train_test(
             X, Y, X_time, config.train_years, config.test_years, config.train_frac, seed=config.seed,
@@ -2181,6 +2500,7 @@ def run_pipeline(config):
     # ------------------------------------------------------------
     # Normalize
     # ------------------------------------------------------------
+    time_context = int(getattr(config, "time_context", 0) or 0)
     X_mean = X_train_fields.mean(dim=(0, 2, 3), keepdim=True)
     X_std = X_train_fields.std(dim=(0, 2, 3), keepdim=True)
     Y_mean = Y_train_fields.mean(dim=(0, 2, 3), keepdim=True)
@@ -2260,16 +2580,30 @@ def run_pipeline(config):
           f"std={float(inc_std.flatten()[0]):.4f}")
 
     # ------------------------------------------------------------
+    # Optional high-res predictor channels (obs-eval test T3) and observation fine-tuning set (T1)
+    # ------------------------------------------------------------
+    aux_train = aux_test = None
+    n_aux = 0
+    if getattr(config, "aux_path", None) or getattr(config, "static_path", None):
+        aux_train, aux_test, n_aux = build_aux_channels(config, time_train, member_train, time_test, member_test, hlat, hlon)
+    obs_ft = None
+    if getattr(config, "obs_ft_x_path", None):
+        obs_ft = build_obs_finetune_set(config, X_mean, X_std, inc_mean, inc_std, land_mask, llon, llat, hlon, hlat,
+                                        Y_train.shape[-2:], time_context)
+
+    # ------------------------------------------------------------
     # Model
     # ------------------------------------------------------------
     model = UNet(
-        in_channels=X_train.shape[1], mask_channels=mask_train.shape[1],
+        in_channels=X_train.shape[1], mask_channels=mask_train.shape[1] + n_aux,
+        noise_amp_map=getattr(config, "noise_amp_map", False),
         attention_end=getattr(config, "attention_end", False),
         attn_window_size=getattr(config, "attn_window_size", 8),
         attn_num_heads=getattr(config, "attn_num_heads", 4),
         noise_channels=getattr(config, "noise_channels", 1),
         noise_kernel_size=getattr(config, "noise_kernel_size", 5),
         late_mask_fusion=getattr(config, "late_mask_fusion", False),
+        noise_kernel_size_final=getattr(config, "noise_kernel_size_final", None),
     )
     model = nn.DataParallel(model).to(device)
 
@@ -2280,7 +2614,33 @@ def run_pipeline(config):
         model.module.load_state_dict(state_dict)  # strict: architecture (incl. in_channels) must match exactly
         print("Pretrained weights loaded.")
 
-    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=config.lr)
+    # 2026-10-07 calibration options (default off): the "noise parameters" are the noise stages' width/amplitude scalars
+    # and the T2 amplitude-map heads -- everything that only scales or shapes the injected noise.
+    def _is_noise(name):
+        return name.split(".")[0] in ("noise_d3", "noise_d2", "noise_d1", "noise_final", "amp_d3", "amp_d2", "amp_d1", "amp_final")
+    if getattr(config, "train_only_noise", False):
+        for name, prm in model.module.named_parameters():
+            prm.requires_grad_(_is_noise(name))
+        print(f"  train_only_noise: {sum(p.numel() for p in model.parameters() if p.requires_grad)} trainable parameters "
+              f"(noise scalars + amplitude heads); everything that sets the ensemble mean is frozen")
+    mult = float(getattr(config, "noise_lr_mult", 1.0) or 1.0)
+    trainable = [(n, p) for n, p in model.module.named_parameters() if p.requires_grad]
+    if mult != 1.0:
+        groups = [{"params": [p for n, p in trainable if not _is_noise(n)], "lr": config.lr},
+                  {"params": [p for n, p in trainable if _is_noise(n)], "lr": config.lr * mult}]
+        optimizer = optim.Adam([g for g in groups if g["params"]], lr=config.lr)
+        print(f"  noise parameters at {mult:g}x lr ({config.lr * mult:.3g})")
+    else:
+        optimizer = optim.Adam([p for _, p in trainable], lr=config.lr)
+    # 2026-10-08 (--output-floor softplus): physical thickness = smooth_floor(raw, scale) in training *and* evaluation instead
+    # of clamp(min=0) at evaluation only, so noise can no longer add "free" ice over open water (negative noise was clamped
+    # away unseen by the loss, leaving members biased above ~0 m truth). Default "clamp" = unchanged.
+    floor = None
+    floor_mode = getattr(config, "output_floor", "clamp") or "clamp"
+    if floor_mode == "softplus":
+        floor = {"base": baseline_train_phys.cpu(), "inc_mean": inc_mean.to(device), "inc_std": (inc_std + 1e-6).to(device),
+                 "scale": float(getattr(config, "output_floor_scale", 0.02))}
+        print(f"  output floor: softplus, scale {floor['scale']} m (training loss + evaluation)")
     print("Model setup complete.")
 
     # ------------------------------------------------------------
@@ -2291,6 +2651,10 @@ def run_pipeline(config):
         model, optimizer, X_train, Y_train, mask_train, device, config.k, config.num_epochs, config.batch_size,
         coastal_width=config.coastal_width, coastal_boost=config.coastal_boost, beta=config.beta,
         deterministic_mse=getattr(config, "deterministic_mse", False),
+        crps_weight=getattr(config, "crps_weight", 0.0),
+        energy_patch_size=int(getattr(config, "energy_patch_size", 0) or 0),
+        aux_train=aux_train, obs_ft=obs_ft,
+        floor=floor,
     )
 
     torch.save(model.module.state_dict(), os.path.join(config.output_dir, "model_state_dict.pt"))
@@ -2306,7 +2670,7 @@ def run_pipeline(config):
     print("Running evaluation...")
     preds_all, Y_pred, Y_spread, Y_pred_det = evaluate_model(
         model, X_test, Y_test, mask_test, device, config.k_eval, config.eval_batch_size,
-        deterministic_only=getattr(config, "deterministic_mse", False),
+        deterministic_only=getattr(config, "deterministic_mse", False), aux_test=aux_test,
     )
 
     # De-normalize using the *increment's* own stats (not Y_mean/Y_std, which describe the
@@ -2323,6 +2687,12 @@ def run_pipeline(config):
     Y_spread_phys = Y_spread * (inc_std + 1e-6)
     Y_pred_det_phys = (Y_pred_det * (inc_std + 1e-6) + inc_mean + baseline_test_phys).clamp(min=0.0)
     preds_all_phys = (preds_all * (inc_std + 1e-6) + inc_mean + baseline_test_phys.unsqueeze(1)).clamp(min=0.0)
+    if floor is not None:
+        # same smooth floor as in training; the ensemble mean is the mean of the floored members
+        bt = baseline_test_phys.to(preds_all.device)
+        preds_all_phys = smooth_floor(preds_all * (inc_std + 1e-6).to(preds_all.device) + inc_mean.to(preds_all.device) + bt.unsqueeze(1), floor["scale"])
+        Y_pred_phys = preds_all_phys.mean(dim=1)
+        Y_pred_det_phys = smooth_floor(Y_pred_det * (inc_std + 1e-6).to(Y_pred_det.device) + inc_mean.to(Y_pred_det.device) + bt, floor["scale"])
 
     # Hard-zero land in the model's own physical-space predictions (not the bilinear
     # baseline or truth). This can't be done inside UNet.forward(): the model operates in

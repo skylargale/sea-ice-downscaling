@@ -39,7 +39,7 @@ conda activate seaice-downscaling
 # Hardcoded absolute path, not $PBS_O_WORKDIR-relative or BASH_SOURCE-based -- see
 # submit_daily_eval_batch.sh's matching comment for why (PBS spools a submitted script at
 # qsub time, so BASH_SOURCE-based self-location breaks under real execution).
-cd "/glade/work/skygale/projects/SeaIceDownscaling/Version6"
+cd "/glade/work/skygale/projects/SeaIceDownscaling"
 
 echo "Template run: $TEMPLATE_RUN"
 echo "K override: ${K:-none, using the template run k_eval}"

@@ -1,5 +1,190 @@
 # Recommended U-Net configuration — Version5
 
+## FINAL configuration (2026-10-07, used for all paper results): T2 + 10 px energy tiles + noise-parameter learning rate x10
+
+```
+DATA_VARIANT=avg
+NOISE_AMP_MAP=true        # T2: per-pixel noise amplitude from each decoder stage (state-dependent spread)
+ENERGY_PATCH_SIZE=10      # energy score over 10x10 px tiles (~110 x 45 km)
+NOISE_LR_MULT=10          # noise-stage widths/amplitudes + amplitude-map heads train at 10x the base lr (~0.0096)
+K=20 K_EVAL=20 BETA=0.8 NUM_EPOCHS=20, windows 2000-05 / 05-10 / 10-15 / 15-20, PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+```
+FOSI: `qsub -v BATCH_NAME=...,TRAIN_YEARS=...,TEST_YEARS=2021,DATA_VARIANT=avg,NOISE_AMP_MAP=true,ENERGY_PATCH_SIZE=10,NOISE_LR_MULT=10 training/submit_engressnet_daily.sh`
+(MESA: same variables with `training/submit_engressnet_daily_mesa.sh`, which gained these three flags 2026-10-07). Inference with these
+checkpoints needs `NOISE_AMP_MAP=true` (NOISE_LR_MULT only affects training). Submit-script defaults stay off so older runs reproduce.
+
+Final batches:
+- FOSI checkpoints / perfect model 2021: `results/CAL1a_noiselr_FOSI/` (trained as calibration option 1a)
+- MESA checkpoints / perfect model 2021: `results/MESA_final_avg/`
+- PIOMAS application 2010-2023: `results/PIOMAS_2010-2023_cdrv6_finalFOSI_4win/`; 2018-2022 for ICESat-2 scoring: `results/PIOMAS_2018-2022_CAL1a_noiselr_FOSI/`
+- Pooled observational product (PIOMAS + CS2SMOS + TOPAZ4-ML): scratch `downscaling/obs_product/EngressNet_final_pooled_obs_<year>.nc`
+
+Why NOISE_LR_MULT: in every earlier run the noise parameters never moved from their initial values (widths ~1.5 px, amplitude maps ~1
+everywhere), so T2's state-dependent spread was effectively inactive. At 10x lr the amplitude maps train (head weights ~10x larger)
+and noise shifts from the 0.1 deg stage toward the coarsest stage. Calibration-option comparison (`observations/processing/
+calibration_options_compare.py`, `figures/17_calibration_options.png`), north of 66N vs ICESat-2 pass-cell means, PIOMAS input:
+
+| | perfect spread-skill | perfect RMSE | IS2 CRPS | IS2 spread/error (+obs noise) | within-cell var / IS2 | 20-40 / 53-160 km var / IS2 |
+|---|---|---|---|---|---|---|
+| T2 10 px | 0.82 | 0.212 | 0.371 | 0.45 | 0.53 | 0.19 / 0.41 |
+| **final (T2 10 px + noise lr x10)** | **0.89** | 0.211 | 0.371 | 0.48 | 0.63 | 0.37 / 0.50 |
+| + 31-tap 0.1 deg noise kernel (1b) | 0.89 | 0.212 | 0.375 | 0.49 | 0.64 | 0.32 / 0.57 |
+| noise calibrated on ICESat-2, mean frozen (2) | 1.7 | 0.29 | 0.304 | 1.05 | 2.03 | 5.8 / 6.2 |
+| + MESA-trained members pooled (3) | - | - | 0.368 | 0.45 | 0.51 | 0.13 / 0.36 |
+
+Not adopted: 1b (the model did not widen the new kernel; slightly worse CRPS); 2 (calibrated point-wise on held-out winters, but only by
+fine-scale noise far beyond ICESat-2's variability and over-dispersed vs CICE); 3 (training-data choice barely matters -- robustness result).
+
+### What didn't work (and why)
+
+Record of approaches that were tried and rejected, bugs that were found and fixed, and limitations we kept, so none of it depends
+on chat history. Written 2026-10-09. The adopted model is the FINAL configuration above (noise
+cascade + T2 amplitude maps + 10 px energy-score tiles + noise-parameter learning rate x10, trained on FOSI or MESACLIP, 4 windows
+x 20 members).
+
+Unless stated otherwise, "ICESat-2" scores are against QC'd ICESat-2 pass-cell means (0.1 deg cell, same day, PIOMAS input,
+2018-2022; `observations/engressnet_obs_evaluation.ipynb`), and "perfect model" is FOSI or MESACLIP test year 2021. Spread-skill and
+spread/error: 1 = calibrated. Lower CRPS is better.
+
+#### Earlier history (documented in later sections of this file)
+
+| Topic | Section below |
+|---|---|
+| Coastal bias not fixed by land threshold, attention, deep mask head | "What did NOT resolve the coastal-bias problem" |
+| Conservative regridding of the target | "Data variant: conservative regridding ... resolved, negative" |
+| Season-only vs full-year training | "Season vs. full-year training -- resolved, negative" |
+| Toggle sweep (no standout) | "Toggle sweep: no other standout" |
+| Shared-bias, deep mask head, noise-mix variants | "Shared-bias / deep-mask-head / noise-mix results" |
+| `interp` vs `avg` input | "Data variant: `avg` beats `interp`" |
+| Patchy members from `LocallyConnected2d` (EnScale-lite refiner) | "Why the smooth-noise-fixed EnScale-lite refiner ..."; replaced by the Gaussian noise cascade (2026-09-16) |
+
+#### Model changes tested against ICESat-2 (2026-09-29 to 2026-10-08)
+
+| Test | What it was | Result | Why rejected |
+|---|---|---|---|
+| **T1** obs fine-tuning | Fine-tune on CS2SMOS ~1 deg block CRPS (2011-17) | ICESat-2 bias -0.35 m; CRPS 0.398 vs 0.368 baseline; perfect model slightly worse | Learned CS2SMOS's thin bias relative to ICESat-2 |
+| **T3** high-res predictors | + 25 km concentration, log depth, distance to land | Perfect model CRPS -11% (0.0753), RMSE 0.186; ICESat-2 CRPS 0.366 (= baseline), less fine-scale variance (20-40 km 0.07) | Gain did not transfer to observations; needs extra inputs at application |
+| **T4** pooled years + time context | One 2000-2020 window, 2 days of past predictors, 4 seeds | Perfect model better (RMSE 0.193); ICESat-2 CRPS 0.378 (worse), within-cell variability 0.33 | Worse against observations |
+| **Tile size** 30 / 15 / 5 px | Energy score over N x N px tiles (T2) | Perfect spread-skill 0.75 / 0.75 / 0.81 vs **0.82 at 10 px**; ICESat-2 CRPS 0.365 / 0.366 / 0.366 vs 0.364 | 5 px puts ~4x CICE's 20-40 km variance in (noise texture, worse placement r 0.31); 15 px no better than 30 |
+| **1b** wide final-stage noise kernel | 31-tap kernel at the 0.1 deg stage + noise lr x10 | Perfect spread-skill 0.89 (= 1a); ICESat-2 CRPS 0.375 vs 0.371 (1a) | Learned width stayed ~1.6 px, so the extra reach was unused; slightly worse CRPS |
+| **Option 2** noise calibrated on ICESat-2 | Mean frozen, only noise parameters trained against ICESat-2 (2 folds by winter, scored on held-out winters) | ICESat-2 CRPS **0.304**, spread/error 1.05, but within-cell variability 2.0x and 20-160 km variance ~6x ICESat-2; perfect model over-dispersed (1.7) and RMSE 0.21 -> 0.29 | Calibrated point-wise only by adding unrealistic fine-scale noise (members no longer realistic fields); close to post-hoc inflation |
+| **Option 3** FOSI + MESA-trained members pooled | Pool two training datasets | CRPS 0.371 -> 0.368; spread/error 0.45 -> 0.45; less fine-scale variance | Models agree too closely to add spread; kept only as a robustness result (training data barely matters) |
+| **Smooth output floor** | softplus (2 cm scale) instead of clamp at 0, in the training loss and at output | FOSI: domain spread-skill 0.89 -> 0.68; ice regimes 1.05/0.92/0.85 -> 0.79/0.73/0.65; ICESat-2 CRPS 0.363 -> 0.372; within-cell variability 0.63 -> 0.38; open-water rank-0 spike 3.5x -> 8.8x | Model shrank its noise everywhere; softplus never reaches 0 m, so ice-free truth always ranks below all members. MESA runs cancelled |
+
+#### Rejected without running (user decisions)
+
+- **Post-hoc, scale-selective variance inflation** (2026-10-06): rejected as "made up". Spread must come from training on real
+  targets or from real data.
+- **Synthetic input perturbation during training** (2026-10-06): rejected as "fake", for the same reason.
+- **ICESat-1 (GLAS) and the 2003-2008 period**: not used at all (2026-09-29); the related data were removed on purpose.
+
+#### Data and evaluation choices that did not hold up
+
+- **Petty GPSat** as an independent input or validation product: it is built from ICESat-2 freeboards, so it is flagged
+  "not independent" and kept out of the pooled product.
+- **IS2SITMOGR4** (ICESat-2 monthly) agrees best with the reference (RMSE 0.36 m) only because it is the same instrument.
+- **PIOMAS as the reference** (until 2026-10-06): replaced by ICESat-2 along-track pass-cells, because PIOMAS is a model and is
+  EngressNet's own input.
+- **10 km ICESat-2 sections** (`_sm` files): replaced by full-resolution segments grouped per 0.1 deg cell and pass.
+- **Median of per-cell ratios** for the CICE ceiling: replaced by pooled within-cell variance. The median made CICE look like ~1/3
+  of ICESat-2; pooled, FOSI CICE is 66% and MESACLIP 43% (`figures/build_cice_ceiling_bar.py`).
+- **Results emails** from Casper (mailx): exit code 0 but never delivered; cancelled.
+
+#### Bugs found and fixed
+
+- **Noise parameters never trained** (found 2026-10-07): widths and amplitudes stayed at their initial values in every run before
+  the final model, so T2's state-dependent spread was effectively off. Fixed by the noise learning rate x10 (adopted).
+- **Bilinear IIEE = 0.0**: asymmetric epsilon between normalising and de-normalising; fixed in `functions_engressnet.py`.
+- **Energy-score tiling** (2026-10-06): tile sizes that don't divide the field (15 px) dropped the remainder columns (the last 16 of
+  310 never entered the loss; RMSE 0.64 there). Fixed with zero-weight padding; 30 / 10 / 5 px were unaffected.
+- **T2 out of memory**: the full-resolution amplitude head doubled the backward peak; the final-stage amplitude is now computed from
+  the 1 deg (d1) features and upsampled.
+- **T3 inputs** missing 2000-01-01: the auxiliary file needed the 1999 file too.
+- **`/glade/work` quota full** (2026-10-09): three MESA smooth-floor checkpoints were truncated on save (16 KB instead of 54 MB).
+  Check `gladequota` before long runs.
+
+#### Limitations we kept (state in the paper)
+
+- **Accuracy cost on MESACLIP**: the final model's ensemble mean is less accurate than the deterministic model there (RMSE 0.113
+  vs 0.108 m, pattern correlation 0.850 vs 0.888; the earlier under-dispersed cascade matched it at 0.108 / 0.905). FOSI is
+  unaffected (0.211 vs 0.209 m, r 0.932 vs 0.936). Bias stays ~0 (+0.004 m). Cause not tested; likely residual member texture
+  in the finite ensemble mean.
+
+- **Open-water over-dispersion**: with the clamp, noise over ice-free cells can only add ice, so members carry a few cm of one-sided
+  spurious ice. Open-water spread-skill 1.44 (FOSI) / 2.24 (MESACLIP); rank-0 spike 3.5x / 6.5x. It averages out in the ensemble
+  mean (open-water RMSE 0.026-0.041 m). Ice regimes are near-calibrated (MESACLIP 1.17 / 1.03 / 0.99 thin / moderate / thick).
+- **CICE ceiling**: EngressNet learns sub-grid variability from CICE. Pooled within-1 deg variability vs ICESat-2: FOSI CICE 66%,
+  MESACLIP 43%, final EngressNet 59% (on PIOMAS), det-MSE 31%, PIOMAS 16-22%. In the perfect model EngressNet matches CICE (pooled
+  ratio 1.05; more in smooth cells, 0.89 in CICE's most variable 1%).
+- **Input error dominates** against observations: input choice changes CRPS ~10x more than model choice. Pooling independent inputs
+  (PIOMAS + CS2SMOS + TOPAZ4-ML) is the remaining lever (CRPS 0.31, spread/error 0.64).
+- **No coastal validation**: only 17 QC'd ICESat-2 pass-cells lie within 10 km of land (908 within 10-25 km).
+- **Winter only**: ICESat-2 thickness is Oct-Apr.
+
+#### Cleanup record (2026-10-09)
+
+- `/glade/work` hit its 2 TiB quota. Version1-5 moved to `/glade/derecho/scratch/skygale/downscaling/versions/` (absolute paths
+  inside them rewritten). Superseded Version6 results were deleted: T1-T4, 5 / 15 / 30 px tile runs, CAL1b, CAL2, older-model
+  input swaps, PIOMAS 2021-only and 2010-2023 old-baseline runs, era / older-window tests, appendix sensitivity raw runs, smooth-floor
+  runs. Their summary figures and tables remain in `evaluation/saved_figs/`, `evaluation/corrected_calibration/` and
+  `observations/data/alongtrack_eval/`, and their ICESat-2 samples remain on scratch
+  (`/glade/derecho/scratch/skygale/observations/ICESat2_IS2SITDAT4_cells/eval/`).
+- Code for those experiments was moved to `_to_delete_py/`; the opt-in training flags (`--obs-ft-*`, `--aux-path`,
+  `--time-context`, `--noise-kernel-size-final`, `--train-only-noise`, `--output-floor`) stay in the code, default off.
+
+## Previous recommendation (2026-10-07, superseded by the FINAL section above): noise cascade + T2 state-dependent spread, 10 px energy tiles
+
+Chosen after scoring every variant against ICESat-2 along-track data (full-resolution segments grouped per 0.1° cell and pass;
+`observations/engressnet_obs_evaluation.ipynb`, `observations/engressnet_inputs_and_ceiling.ipynb`):
+
+```
+DATA_VARIANT=avg
+NOISE_AMP_MAP=true        # per-pixel noise amplitude from each decoder stage (final stage from d1, upsampled)
+ENERGY_PATCH_SIZE=10      # energy score over 10x10 tiles (~110 x 45 km) instead of the whole field (2026-10-07; was 30)
+K=20 K_EVAL=20 BETA=0.8   # unchanged
+```
+i.e. `qsub -v BATCH_NAME=...,TRAIN_YEARS=...,TEST_YEARS=...,DATA_VARIANT=avg,NOISE_AMP_MAP=true,ENERGY_PATCH_SIZE=10 training/submit_engressnet_daily.sh`
+(add `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` on 32 GB V100s). The submit-script defaults are deliberately left off so
+older runs stay reproducible. **Inference with a T2 checkpoint also needs `NOISE_AMP_MAP=true`** (the amplitude heads are in the
+state_dict). FOSI checkpoints: `results/T2_statespread_p10_FOSI/` (4 windows, 2000-05 ... 2015-20); the 30 px T2 runs are
+`results/T2_statespread_FOSI/`.
+
+Tile-size sweep (2026-10-07, `observations/engressnet_tile_sweep.ipynb`, FOSI 2021 perfect model / ICESat-2 pass-cell means with PIOMAS input):
+
+| tiles | perfect spread-skill | perfect CRPS | IS2 CRPS | IS2 spread/error | 53-160 km var / IS2 | 20-40 km var / IS2 | within-cell r |
+|---|---|---|---|---|---|---|---|
+| none (baseline) | 0.64 | 0.085 | 0.368 | 0.40 | 0.29 | 0.12 | 0.36 |
+| 30 px | 0.75 | 0.083 | 0.365 | 0.43 | 0.37 | 0.15 | 0.35 |
+| 15 px | 0.75 | 0.083 | 0.366 | 0.42 | 0.33 | 0.14 | 0.35 |
+| **10 px** | **0.82** | 0.083 | **0.364** | 0.44 | 0.42 | 0.19 | 0.34 |
+| 5 px | 0.81 | 0.082 | 0.366 | 0.45 | 0.47 | 0.30 | 0.31 |
+
+10 px gives the best calibration and the most 50-160 km variance (CICE itself: 0.53) without overshooting; 5 px puts ~4x CICE's own
+20-40 km variance (0.08) in and places variability less well (r 0.31) -- noise texture. RMSE ~0.21 for all. CRPS differences are within
+seed noise; the spread-skill and mesoscale-variance gains at 10 px are consistent across all 4 windows. (The first 15 px run hit a tiling
+bug -- remainder columns dropped from the loss -- fixed 2026-10-06 by zero-weight padding; 30/10/5 are unaffected.)
+
+Why: T2 beats the noise-cascade baseline on **every** observational input (PIOMAS, CS2SMOS, TOPAZ4-ML, Petty GPSat) and on the
+perfect-model test, small but consistent: CRPS vs ICESat-2 cells -0.002 to -0.006 m, spread/error 0.42 -> 0.44, within-cell
+variability ratio 0.44 -> 0.50, 20-40 km variance 0.12 -> 0.15; perfect-model FOSI 2021 spread-skill 0.64 -> 0.75, CRPS -2%.
+The other tests did not transfer to observations: T1 (fine-tune on CS2SMOS) imported CS2SMOS's -0.35 m bias vs ICESat-2;
+T3 (high-res concentration + static fields) and T4 (pooled years + time context) improved the perfect-model test by ~10% but were
+neutral or worse against ICESat-2 (`sensitivity/obs_eval_tests/`).
+
+**Observational application product = multi-input pooled ensemble** (`observations/processing/build_pooled_product.py`):
+T2 (10 px since 2026-10-07; the numbers that follow are from the 30 px build) run on three independent coarse inputs (PIOMAS, CS2SMOS,
+TOPAZ4-ML) and pooled. Against ICESat-2 (pass-cell mean, north of
+66°N) CRPS 0.355 (PIOMAS only) -> 0.313 (pooled), raw spread/error 0.29 -> 0.55; against the pass-cell median 0.393 -> 0.243.
+The coarse input dominates the error (input choice moves CRPS ~10x more than the trained model), and pooling inputs is the
+largest gain found. Petty GPSat is ICESat-2-based, so it is reported separately and kept out of the pool used for validation.
+MESA-trained checkpoints score the same as FOSI-trained ones on every input.
+
+**Ceiling**: CICE's own 0.1° fields carry only ~1/3 of the within-cell variability ICESat-2 sees (FOSI 0.36, MESACLIP 0.30);
+EngressNet members already match CICE's variability (1.06 of FOSI truth in the perfect model), so the remaining fine-scale gap is
+a training-target (model physics) limit, not a network limit. The 50-160 km band (FOSI truth 0.53 vs EngressNet 0.27-0.35 of
+ICESat-2) is the scale with learnable headroom.
+
+
 Compiled 2026-08-14, updated 2026-08-17 after the follow-up round that swept the
 recommended config across the full 4-window grid (both data variants, both datasets),
 tested the refiner+land-threshold combo to completion, quantified run-to-run seed

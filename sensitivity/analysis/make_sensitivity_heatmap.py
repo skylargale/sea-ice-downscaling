@@ -141,7 +141,7 @@ def plot_badness_heatmap(value_df, title, figsize=None, cmap="Reds", fmt="{:.3f}
     return fig, ax
 
 
-OUT_DIR = "/glade/work/skygale/projects/SeaIceDownscaling/Version6/sensitivity/analysis"
+OUT_DIR = "/glade/work/skygale/projects/SeaIceDownscaling/sensitivity/analysis"
 
 fig1, ax1 = plot_badness_heatmap(
     mesa_df,

@@ -43,6 +43,9 @@ case "$DATA_VARIANT" in
     avg)    X_PATH="/glade/derecho/scratch/skygale/downscaling/X_FOSI_HR_JRA55_daily_avg.nc" ;;
     *) echo "Unknown DATA_VARIANT: $DATA_VARIANT (expected 'interp' or 'avg')" >&2; exit 1 ;;
 esac
+# Opt-in override of the X file picked by DATA_VARIANT above (2026-09-24, for the older-window
+# sweep's pre-subset MESA HIST+2021 file) -- same idea as Y_PATH_OVERRIDE just below.
+X_PATH="${X_PATH_OVERRIDE:-$X_PATH}"
 # Opt-in override so a one-off experiment (e.g. a conservative-regridded Y, testing
 # whether coastal-bias truth-regridding noise is the real driver) can point at an
 # alternate Y file without needing a separate submission script.
@@ -110,6 +113,8 @@ NOISE_CHANNELS="${NOISE_CHANNELS:-1}"
 NOISE_KERNEL_SIZE="${NOISE_KERNEL_SIZE:-5}"
 LATE_MASK_FUSION="${LATE_MASK_FUSION:-false}"
 DETERMINISTIC_MSE="${DETERMINISTIC_MSE:-false}"
+# Weight of the per-pixel CRPS term added to the energy score (train_engressnet.py --crps-weight). 0 = off.
+CRPS_WEIGHT="${CRPS_WEIGHT:-0}"
 
 # Optional batch folder name. When set, --output-dir is passed explicitly so
 # this run's output lands under results/<BATCH_NAME>/<run_tag> instead of the
@@ -124,6 +129,25 @@ BATCH_NAME="${BATCH_NAME:-}"
 # for normal random-init training. See train_engressnet.py --init-checkpoint/--collapse-wind-vector.
 INIT_CHECKPOINT="${INIT_CHECKPOINT:-}"
 COLLAPSE_WIND_VECTOR="${COLLAPSE_WIND_VECTOR:-false}"
+
+# 2026-09-29 obs-evaluation tests (see train_engressnet.py help); all default off / unchanged.
+NOISE_AMP_MAP="${NOISE_AMP_MAP:-false}"        # T2
+ENERGY_PATCH_SIZE="${ENERGY_PATCH_SIZE:-0}"    # T2
+AUX_PATH="${AUX_PATH:-}"                       # T3
+TEST_AUX_PATH="${TEST_AUX_PATH:-}"             # T3
+STATIC_PATH="${STATIC_PATH:-}"                 # T3
+TIME_CONTEXT="${TIME_CONTEXT:-0}"              # T4
+OBS_FT_X_PATH="${OBS_FT_X_PATH:-}"             # T1
+OBS_FT_TARGET_PATH="${OBS_FT_TARGET_PATH:-}"   # T1
+OBS_FT_WEIGHT="${OBS_FT_WEIGHT:-100}"          # T1
+LR="${LR:-}"                                   # blank = train_engressnet.py default
+# 2026-10-07 calibration options (see train_engressnet.py help); all default off / unchanged.
+NOISE_KERNEL_SIZE_FINAL="${NOISE_KERNEL_SIZE_FINAL:-}"   # option 1b
+NOISE_LR_MULT="${NOISE_LR_MULT:-1}"                     # option 1
+OUTPUT_FLOOR="${OUTPUT_FLOOR:-clamp}"                  # 2026-10-08: clamp (default) | softplus
+OUTPUT_FLOOR_SCALE="${OUTPUT_FLOOR_SCALE:-0.02}"
+TRAIN_ONLY_NOISE="${TRAIN_ONLY_NOISE:-false}"           # option 2
+OBS_FT_ONLY="${OBS_FT_ONLY:-false}"                     # option 2
 
 # ==============================================================
 
@@ -142,7 +166,7 @@ echo "Seed: ${SEED}"
 echo "Coastal width / boost: ${COASTAL_WIDTH} / ${COASTAL_BOOST}"
 echo "Sub-domain: lat ${LAT_MIN}-${LAT_MAX}, lon ${LON_MIN}-${LON_MAX}"
 echo "Attention end: ${ATTENTION_END} (window ${ATTN_WINDOW_SIZE}, heads ${ATTN_NUM_HEADS})"
-echo "Noise channels: ${NOISE_CHANNELS}   Noise kernel size: ${NOISE_KERNEL_SIZE}   Late mask fusion: ${LATE_MASK_FUSION}   Deterministic MSE: ${DETERMINISTIC_MSE}"
+echo "Noise channels: ${NOISE_CHANNELS}   Noise kernel size: ${NOISE_KERNEL_SIZE}   Late mask fusion: ${LATE_MASK_FUSION}   Deterministic MSE: ${DETERMINISTIC_MSE}   CRPS weight: ${CRPS_WEIGHT}"
 echo "Batch name: ${BATCH_NAME:-<none, flat results/>}"
 echo "Init checkpoint: ${INIT_CHECKPOINT:-<none, random init>}   Collapse wind vector: ${COLLAPSE_WIND_VECTOR}"
 
@@ -154,7 +178,7 @@ conda activate seaice-downscaling
 # relative to this script's own file location -- BASH_SOURCE[0]-based resolution worked
 # interactively but not inside an actual PBS job (PBS commonly spools/copies the script
 # before executing it).
-export PYTHONPATH="/glade/work/skygale/projects/SeaIceDownscaling/Version6/evaluation:${PYTHONPATH:-}"
+export PYTHONPATH="/glade/work/skygale/projects/SeaIceDownscaling/evaluation:${PYTHONPATH:-}"
 
 cd "$PBS_O_WORKDIR"
 
@@ -180,8 +204,25 @@ fi
 ARGS+=(--noise-channels "$NOISE_CHANNELS" --noise-kernel-size "$NOISE_KERNEL_SIZE")
 [ "$LATE_MASK_FUSION" = true ] && ARGS+=(--late-mask-fusion)
 [ "$DETERMINISTIC_MSE" = true ] && ARGS+=(--deterministic-mse)
+ARGS+=(--crps-weight "$CRPS_WEIGHT")
 [ -n "$INIT_CHECKPOINT" ] && ARGS+=(--init-checkpoint "$INIT_CHECKPOINT")
 [ "$COLLAPSE_WIND_VECTOR" = true ] && ARGS+=(--collapse-wind-vector)
+[ "$NOISE_AMP_MAP" = true ] && ARGS+=(--noise-amp-map)
+[ "$ENERGY_PATCH_SIZE" != 0 ] && ARGS+=(--energy-patch-size "$ENERGY_PATCH_SIZE")
+[ -n "$AUX_PATH" ] && ARGS+=(--aux-path "$AUX_PATH")
+[ -n "$TEST_AUX_PATH" ] && ARGS+=(--test-aux-path "$TEST_AUX_PATH")
+[ -n "$STATIC_PATH" ] && ARGS+=(--static-path "$STATIC_PATH")
+[ "$TIME_CONTEXT" != 0 ] && ARGS+=(--time-context "$TIME_CONTEXT")
+[ -n "$OBS_FT_X_PATH" ] && ARGS+=(--obs-ft-x-path "$OBS_FT_X_PATH" --obs-ft-target-path "$OBS_FT_TARGET_PATH" --obs-ft-weight "$OBS_FT_WEIGHT")
+[ -n "$LR" ] && ARGS+=(--lr "$LR")
+[ -n "$NOISE_KERNEL_SIZE_FINAL" ] && ARGS+=(--noise-kernel-size-final "$NOISE_KERNEL_SIZE_FINAL")
+[ "$NOISE_LR_MULT" != 1 ] && ARGS+=(--noise-lr-mult "$NOISE_LR_MULT")
+[ "$OUTPUT_FLOOR" != clamp ] && ARGS+=(--output-floor "$OUTPUT_FLOOR" --output-floor-scale "$OUTPUT_FLOOR_SCALE")
+echo "Output floor: ${OUTPUT_FLOOR} (scale ${OUTPUT_FLOOR_SCALE} m)"
+[ "$TRAIN_ONLY_NOISE" = true ] && ARGS+=(--train-only-noise)
+[ "$OBS_FT_ONLY" = true ] && ARGS+=(--obs-ft-only)
+echo "Calibration flags: final_kernel=${NOISE_KERNEL_SIZE_FINAL:-same} noise_lr_mult=${NOISE_LR_MULT} train_only_noise=${TRAIN_ONLY_NOISE} obs_ft_only=${OBS_FT_ONLY}"
+echo "Obs-eval test flags: amp_map=${NOISE_AMP_MAP} patch=${ENERGY_PATCH_SIZE} aux=${AUX_PATH:-none} test_aux=${TEST_AUX_PATH:-none} static=${STATIC_PATH:-none} time_ctx=${TIME_CONTEXT} obs_ft=${OBS_FT_X_PATH:-none} (w=${OBS_FT_WEIGHT}) lr=${LR:-default}"
 
 if [ -n "$BATCH_NAME" ]; then
     RUN_TAG="${PBS_JOBNAME}_${TRAIN_YEARS}_${TEST_YEARS}_${PBS_JOBID}"

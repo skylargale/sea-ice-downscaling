@@ -1,5 +1,7 @@
 # SeaIceDownscaling (Version 6)
 
+> Final model: `recommended_config.md` (FINAL section). Rejected approaches, fixed bugs, kept limitations and the 2026-10-09 cleanup: the "What didn't work" subsection of the same file.
+
 ## Purpose
 
 Version6 started as a deliberately narrow fork of `Version5/`'s code: same recommended-config
@@ -87,9 +89,7 @@ stage, and everything else in it moved to whichever stage actually produces/uses
   rank-histogram/reliability/spread-skill/CRPS/PSD figures) with
   `submit_4window_aggregate_figures.sh`, `build_analog_baseline.py` (nearest-neighbor
   distributional baseline) with `submit_analog_baseline.sh`, `compare_all_batches.ipynb` with
-  `submit_compare_all_batches.sh`, `recompute_iiee.py` (see
-  [[project-seaicedownscaling-v6-iiee-bugfix]]) with its `watch_and_fix_iiee.sh` watcher/driver
-  and `iiee_recompute_log.txt` journal, `time_inference.py` (one-off GPU inference-cost timing for
+  `submit_compare_all_batches.sh`, `time_inference.py` (one-off GPU inference-cost timing for
   the paper's computational-cost appendix, `computational_cost_appendix.tex`) with
   `submit_time_inference.sh`. **`saved_figs/`** — evaluation figures/tables generated from
   `results/`, mirroring its `<batch>/<run>/` structure, lives here too (moved from the `Version6/`
@@ -126,9 +126,10 @@ stage, and everything else in it moved to whichever stage actually produces/uses
     read live from `results/`) plus their `.tex`/`.csv` outputs, used by the paper's appendix.
 - `results/` — the flagship/default-config and retired-comparison runs' output (`metrics.csv`,
   `eval_data/`, checkpoints), one subfolder per batch, one run-folder per split inside each.
-- `.logs/` — PBS stdout/stderr for every `training/`/`evaluation/` submitted job (hidden so it
-  doesn't show up in a plain `ls`; still just a normal directory — `ls -a .logs/` or `cat
-  .logs/<jobid>.casper-pbs.OU` work as usual).
+- `logs/` — all PBS stdout/stderr (reorganized 2026-10-09). `training/` and `evaluation/` jobs
+  write to `logs/` itself; `observations/`, `sensitivity/` and `processing/` jobs write to
+  `logs/observation_logs/`, `logs/sensitivity_logs/` and `logs/processing_logs/`. Each stage's
+  `.logs` is a symlink into this folder, so scripts that use a relative `-o .logs/` still work.
 - `recommended_config.md` — currently an unmodified copy of `Version5/recommended_config.md`
   (the findings doc that established the recommended config this fork trains with); not yet
   updated with Version6-specific results, since no training run has been submitted here yet.

@@ -32,7 +32,7 @@ conda activate seaice-downscaling
 # Hardcoded absolute path -- see submit_daily_eval_batch.sh's matching comment for why
 # (PBS spools a submitted script at qsub time; BASH_SOURCE/$PBS_O_WORKDIR-based resolution
 # is fragile across invocation conventions).
-cd "/glade/work/skygale/projects/SeaIceDownscaling/Version6"
+cd "/glade/work/skygale/projects/SeaIceDownscaling"
 
 BATCH_NAME="$(basename "$BATCH_DIR")"
 SAVE_DIR="${SAVE_DIR:-evaluation/saved_figs/${BATCH_NAME}/_4window_aggregate}"

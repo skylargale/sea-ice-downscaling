@@ -185,7 +185,14 @@ def load_piomas(path=PIOMAS_PATH, daily_extra_paths=(PIOMAS_DAILY_2021_PATH,)):
         # are unambiguous (standard calendar is a strict superset).
         extra_times = pd.DatetimeIndex([pd.Timestamp(t.isoformat()) for t in ds_extra["time"].values])
         times = times.append(extra_times)
-    return hi, lat, lon, times
+    # Drop monthly records for any year that daily data now covers: monthly records are dated the
+    # 1st of the month, so on those days a monthly and a daily record would tie at gap 0 and
+    # argmin (first index = monthly) would pick the monthly value.
+    n_monthly = len(year)
+    daily_years = set(times[n_monthly:].year)
+    keep = np.ones(len(times), dtype=bool)
+    keep[:n_monthly] = ~np.isin(times[:n_monthly].year, list(daily_years))
+    return hi[keep], lat, lon, times[keep]
 
 
 def nearest_grid_indices(src_lat, src_lon, query_lat, query_lon):

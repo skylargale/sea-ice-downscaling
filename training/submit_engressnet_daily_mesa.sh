@@ -47,6 +47,9 @@ case "$DATA_VARIANT" in
     avg)    X_PATH="/glade/derecho/scratch/skygale/downscaling/X_MESA_HR_daily_avg.nc" ;;
     *) echo "Unknown DATA_VARIANT: $DATA_VARIANT (expected 'interp' or 'avg')" >&2; exit 1 ;;
 esac
+# Opt-in override of the X file picked by DATA_VARIANT above (2026-09-24, for the older-window
+# sweep's pre-subset MESA HIST+2021 file) -- same idea as Y_PATH_OVERRIDE just below.
+X_PATH="${X_PATH_OVERRIDE:-$X_PATH}"
 # Opt-in override so a one-off experiment (e.g. a conservative-regridded Y, testing
 # whether coastal-bias truth-regridding noise is the real driver) can point at an
 # alternate Y file without needing a separate submission script.
@@ -114,6 +117,8 @@ NOISE_CHANNELS="${NOISE_CHANNELS:-1}"
 NOISE_KERNEL_SIZE="${NOISE_KERNEL_SIZE:-5}"
 LATE_MASK_FUSION="${LATE_MASK_FUSION:-false}"
 DETERMINISTIC_MSE="${DETERMINISTIC_MSE:-false}"
+# Weight of the per-pixel CRPS term added to the energy score (train_engressnet.py --crps-weight). 0 = off.
+CRPS_WEIGHT="${CRPS_WEIGHT:-0}"
 
 # Optional batch folder name. When set, --output-dir is passed explicitly so
 # this run's output lands under results/<BATCH_NAME>/<run_tag> instead of the
@@ -126,6 +131,12 @@ BATCH_NAME="${BATCH_NAME:-}"
 # but kept here for symmetry/consistency with the FOSI template.
 INIT_CHECKPOINT="${INIT_CHECKPOINT:-}"
 COLLAPSE_WIND_VECTOR="${COLLAPSE_WIND_VECTOR:-false}"
+# 2026-10-07 final EngressNet configuration flags (as in submit_engressnet_daily.sh); all default off / unchanged.
+NOISE_AMP_MAP="${NOISE_AMP_MAP:-false}"        # T2 state-dependent spread
+ENERGY_PATCH_SIZE="${ENERGY_PATCH_SIZE:-0}"    # energy score over N x N px tiles
+NOISE_LR_MULT="${NOISE_LR_MULT:-1}"            # learning-rate multiplier for the noise parameters
+OUTPUT_FLOOR="${OUTPUT_FLOOR:-clamp}"                  # 2026-10-08: clamp (default) | softplus
+OUTPUT_FLOOR_SCALE="${OUTPUT_FLOOR_SCALE:-0.02}"
 
 # ==============================================================
 
@@ -144,7 +155,7 @@ echo "Seed: ${SEED}"
 echo "Coastal width / boost: ${COASTAL_WIDTH} / ${COASTAL_BOOST}"
 echo "Sub-domain: lat ${LAT_MIN}-${LAT_MAX}, lon ${LON_MIN}-${LON_MAX}"
 echo "Attention end: ${ATTENTION_END} (window ${ATTN_WINDOW_SIZE}, heads ${ATTN_NUM_HEADS})"
-echo "Noise channels: ${NOISE_CHANNELS}   Noise kernel size: ${NOISE_KERNEL_SIZE}   Late mask fusion: ${LATE_MASK_FUSION}   Deterministic MSE: ${DETERMINISTIC_MSE}"
+echo "Noise channels: ${NOISE_CHANNELS}   Noise kernel size: ${NOISE_KERNEL_SIZE}   Late mask fusion: ${LATE_MASK_FUSION}   Deterministic MSE: ${DETERMINISTIC_MSE}   CRPS weight: ${CRPS_WEIGHT}"
 echo "Batch name: ${BATCH_NAME:-<none, flat results/>}"
 echo "Init checkpoint: ${INIT_CHECKPOINT:-<none, random init>}   Collapse wind vector: ${COLLAPSE_WIND_VECTOR}"
 
@@ -166,7 +177,7 @@ conda activate seaice-downscaling
 # tested interactively but still failed inside the actual PBS job, since PBS commonly
 # copies/spools the submitted script before executing it -- BASH_SOURCE[0] then points
 # at that spool copy, not the real file under training/.
-export PYTHONPATH="/glade/work/skygale/projects/SeaIceDownscaling/Version6/evaluation:${PYTHONPATH:-}"
+export PYTHONPATH="/glade/work/skygale/projects/SeaIceDownscaling/evaluation:${PYTHONPATH:-}"
 
 cd "$PBS_O_WORKDIR"
 
@@ -192,8 +203,15 @@ fi
 ARGS+=(--noise-channels "$NOISE_CHANNELS" --noise-kernel-size "$NOISE_KERNEL_SIZE")
 [ "$LATE_MASK_FUSION" = true ] && ARGS+=(--late-mask-fusion)
 [ "$DETERMINISTIC_MSE" = true ] && ARGS+=(--deterministic-mse)
+ARGS+=(--crps-weight "$CRPS_WEIGHT")
 [ -n "$INIT_CHECKPOINT" ] && ARGS+=(--init-checkpoint "$INIT_CHECKPOINT")
 [ "$COLLAPSE_WIND_VECTOR" = true ] && ARGS+=(--collapse-wind-vector)
+[ "$NOISE_AMP_MAP" = true ] && ARGS+=(--noise-amp-map)
+[ "$ENERGY_PATCH_SIZE" != 0 ] && ARGS+=(--energy-patch-size "$ENERGY_PATCH_SIZE")
+[ "$NOISE_LR_MULT" != 1 ] && ARGS+=(--noise-lr-mult "$NOISE_LR_MULT")
+[ "$OUTPUT_FLOOR" != clamp ] && ARGS+=(--output-floor "$OUTPUT_FLOOR" --output-floor-scale "$OUTPUT_FLOOR_SCALE")
+echo "Output floor: ${OUTPUT_FLOOR} (scale ${OUTPUT_FLOOR_SCALE} m)"
+echo "Final-config flags: amp_map=${NOISE_AMP_MAP} patch=${ENERGY_PATCH_SIZE} noise_lr_mult=${NOISE_LR_MULT}"
 
 if [ -n "$BATCH_NAME" ]; then
     RUN_TAG="${PBS_JOBNAME}_${TRAIN_YEARS}_${TEST_YEARS}_${PBS_JOBID}"
