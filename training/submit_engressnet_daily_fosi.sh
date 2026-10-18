@@ -144,6 +144,10 @@ LR="${LR:-}"                                   # blank = train_engressnet.py def
 # 2026-10-07 calibration options (see train_engressnet.py help); all default off / unchanged.
 NOISE_KERNEL_SIZE_FINAL="${NOISE_KERNEL_SIZE_FINAL:-}"   # option 1b
 NOISE_LR_MULT="${NOISE_LR_MULT:-1}"                     # option 1
+EMA_DECAY="${EMA_DECAY:-0}"                # 2026-10-17: EMA of weights (e.g. 0.999); 0 = off
+MEAN_MSE_WEIGHT="${MEAN_MSE_WEIGHT:-0}"    # 2026-10-17: debiased ensemble-mean MSE term weight; 0 = off
+LR_SCHEDULE="${LR_SCHEDULE:-constant}"     # 2026-10-17: constant | cosine
+NOISE_LR_WARMUP_EPOCHS="${NOISE_LR_WARMUP_EPOCHS:-0}"  # 2026-10-17: epochs at base lr before NOISE_LR_MULT applies
 OUTPUT_FLOOR="${OUTPUT_FLOOR:-clamp}"                  # 2026-10-08: clamp (default) | softplus
 OUTPUT_FLOOR_SCALE="${OUTPUT_FLOOR_SCALE:-0.02}"
 TRAIN_ONLY_NOISE="${TRAIN_ONLY_NOISE:-false}"           # option 2
@@ -217,6 +221,11 @@ ARGS+=(--crps-weight "$CRPS_WEIGHT")
 [ -n "$LR" ] && ARGS+=(--lr "$LR")
 [ -n "$NOISE_KERNEL_SIZE_FINAL" ] && ARGS+=(--noise-kernel-size-final "$NOISE_KERNEL_SIZE_FINAL")
 [ "$NOISE_LR_MULT" != 1 ] && ARGS+=(--noise-lr-mult "$NOISE_LR_MULT")
+[ "$EMA_DECAY" != 0 ] && ARGS+=(--ema-decay "$EMA_DECAY")
+[ "$MEAN_MSE_WEIGHT" != 0 ] && ARGS+=(--mean-mse-weight "$MEAN_MSE_WEIGHT")
+[ "$LR_SCHEDULE" != constant ] && ARGS+=(--lr-schedule "$LR_SCHEDULE")
+[ "$NOISE_LR_WARMUP_EPOCHS" != 0 ] && ARGS+=(--noise-lr-warmup-epochs "$NOISE_LR_WARMUP_EPOCHS")
+echo "Ensemble-mean tests: ema_decay=${EMA_DECAY} mean_mse_weight=${MEAN_MSE_WEIGHT} lr_schedule=${LR_SCHEDULE} noise_lr_warmup_epochs=${NOISE_LR_WARMUP_EPOCHS}"
 [ "$OUTPUT_FLOOR" != clamp ] && ARGS+=(--output-floor "$OUTPUT_FLOOR" --output-floor-scale "$OUTPUT_FLOOR_SCALE")
 echo "Output floor: ${OUTPUT_FLOOR} (scale ${OUTPUT_FLOOR_SCALE} m)"
 [ "$TRAIN_ONLY_NOISE" = true ] && ARGS+=(--train-only-noise)

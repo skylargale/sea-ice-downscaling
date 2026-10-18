@@ -1,7 +1,7 @@
 """
 Paper Figure 7 (Observational application), final EngressNet (2026-10-07; T2 amplitude maps + 10 px energy tiles +
 noise-parameter lr x10, FOSI-trained, 4 windows x 20 members) driven by PIOMAS, with ICESat-2 along-track data as truth.
-Per user decision 2026-10-07: final model on PIOMAS input only, compared to ICESat-2 (supersedes build_fig7_piomas_application.py).
+Decision 2026-10-07: final model on PIOMAS input only, compared to ICESat-2 (supersedes build_fig7_piomas_application.py).
 
   (a) ensemble mean, 10 Mar 2021, with that day's ICESat-2 pass-cells (QC'd 0.1 deg cell means) overlaid on the same colour scale
   (b) one ensemble member, same day and overlay (what a single realization looks like)
@@ -27,9 +27,9 @@ import numpy as np
 import pandas as pd
 
 V6 = "/glade/work/skygale/projects/SeaIceDownscaling"
-BATCH = f"{V6}/results/PIOMAS_2018-2022_CAL1a_noiselr_FOSI"
+BATCH = f"{V6}/results/PIOMAS_2018-2022_FOSI_final_ema"  # 2026-10-18: EMA model
 IS2C = "/glade/derecho/scratch/skygale/observations/ICESat2_IS2SITDAT4_cells"
-NPZ = f"{IS2C}/eval/cal1a_piomas_cells.npz"
+NPZ = f"{IS2C}/eval/ema_piomas_cells.npz"
 OUT = f"{V6}/figures/final_figures/07b_piomas_vs_icesat2_evaluation.png"  # supplementary; Fig 7 = build_fig7_final_piomas_application.py
 DAY = pd.Timestamp("2021-03-10")
 GRANULE = "IS2SITDAT4_01_20210310204006_11741001_005_01_bnum5gt1r_001"

@@ -29,7 +29,7 @@ IS2C = "/glade/derecho/scratch/skygale/observations/ICESat2_IS2SITDAT4_cells"
 YEAR = 2021
 
 piomas_app_matches = [
-    d for d in sorted(glob.glob(os.path.join(BASE, "results", "PIOMAS_2010-2023_cdrv6_finalFOSI_4win", f"*_2015-2020_{YEAR}_*")))
+    d for d in sorted(glob.glob(os.path.join(BASE, "results", "PIOMAS_2010-2023_cdrv6_emaFOSI_4win", f"*_2015-2020_{YEAR}_*")))
     if os.path.isdir(d) and os.path.exists(os.path.join(d, "eval_data", "fields.npz"))
 ]
 assert len(piomas_app_matches) == 1, piomas_app_matches

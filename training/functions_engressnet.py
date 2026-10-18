@@ -13,6 +13,7 @@ in one place.
 
 import datetime
 import json
+import math
 import os
 import pickle
 import re
@@ -856,8 +857,8 @@ class WindowedSelfAttention2d(nn.Module):
     Non-overlapping windowed multi-head self-attention over a 2D feature
     map (Swin-style W-MSA, not shifted), applied once at the very end of the
     decoder -- a "sliding window" attention mechanism placed at the decoder
-    end rather than the encoder, per the user's explicit framing (2026-08-06
-    conversation): full quadratic self-attention over the whole up-sampled
+    end rather than the encoder, a deliberate design choice (2026-08-06):
+    full quadratic self-attention over the whole up-sampled
     field is too expensive at these domain sizes (e.g. ~150x310 for the
     medium no-patch domain), and encoder-side attention operates several
     layers upstream of where the model's coastal smoothing is actually
@@ -1452,9 +1453,31 @@ def build_coastal_weight_map(land_mask, coastal_width=5, coastal_boost=2.0):
 # Train / evaluate
 # ==============================================================
 
+class EmaWeights:
+    """Exponential moving average of a model's weights (2026-10-17, --ema-decay). Kept on the model's device; floating-point
+    tensors are averaged, everything else is copied. The effective decay ramps up as min(decay, (1+n)/(10+n)) so the
+    average is not dominated by the random initialisation early on."""
+
+    def __init__(self, module, decay):
+        self.decay = float(decay)
+        self.n = 0
+        self.state = {k: v.detach().clone() for k, v in module.state_dict().items()}
+
+    @torch.no_grad()
+    def update(self, module):
+        self.n += 1
+        d = min(self.decay, (1 + self.n) / (10 + self.n))
+        for k, v in module.state_dict().items():
+            if v.dtype.is_floating_point:
+                self.state[k].mul_(d).add_(v.detach(), alpha=1 - d)
+            else:
+                self.state[k].copy_(v)
+
+
 def train_model(model, optimizer, X_train, Y_train, mask_train, device, K, num_epochs, batch_size,
                  coastal_width=5, coastal_boost=2.0, beta=1.0, verbose=True, deterministic_mse=False,
-                 crps_weight=0.0, energy_patch_size=0, aux_train=None, obs_ft=None, floor=None):
+                 crps_weight=0.0, energy_patch_size=0, aux_train=None, obs_ft=None, floor=None,
+                 mean_mse_weight=0.0, ema=None, lr_schedule="constant", noise_lr_warmup_epochs=0):
     """deterministic_mse=True trains the same backbone as a plain deterministic baseline: every
     noise stage is zeroed (deterministic=True), K is ignored, and the loss is the same
     coastal-weighted per-pixel MSE in normalized-increment space instead of the energy score.
@@ -1467,7 +1490,16 @@ def train_model(model, optimizer, X_train, Y_train, mask_train, device, K, num_e
     2026-09-29 obs-eval tests (all default off): energy_patch_size > 0 scores the energy term per tile
     (energy_loss_patched, T2); aux_train adds high-res predictor channels to the model's mask input (T3);
     obs_ft (T1) interleaves an extra optimizer step per batch on an observation batch, loss =
-    obs_ft['weight'] * block_crps_loss of the ~1 deg ocean-block means against the gridded observation target."""
+    obs_ft['weight'] * block_crps_loss of the ~1 deg ocean-block means against the gridded observation target.
+
+    2026-10-17 ensemble-mean accuracy tests (default off): mean_mse_weight > 0 adds mean_mse_weight * the coastal-weighted,
+    debiased ensemble-mean MSE, mean[(ens mean - y)^2 - ens var / K]. Subtracting var/K makes it an unbiased estimate of the
+    infinite-ensemble mean's MSE, so it rewards a more accurate mean without rewarding smaller spread (plain finite-K mean MSE
+    would). ema (an EmaWeights) is updated after every optimizer step. lr_schedule="cosine" decays every param group's lr per
+    step as 0.01 + 0.99 * 0.5 * (1 + cos(pi * step / total_steps)) of its initial value (constant = unchanged, the only
+    behaviour before 2026-10-17). noise_lr_warmup_epochs > 0 holds param groups tagged "noise_mult" at initial_lr /
+    noise_mult (i.e. the base lr) for that many epochs, so the mean settles before the noise parameters move at the
+    multiplied rate."""
     loss_array = []
 
     if obs_ft is not None and obs_ft.get("only"):
@@ -1486,13 +1518,30 @@ def train_model(model, optimizer, X_train, Y_train, mask_train, device, K, num_e
                 print(f"Epoch {epoch + 1}/{num_epochs} | obs-only CRPS loss: {tot / n:.6f}", flush=True)
         return loss_array
 
+    for g in optimizer.param_groups:
+        g.setdefault("initial_lr", g["lr"])
+    steps_per_epoch = -(-X_train.size(0) // batch_size)
+    total_steps = max(1, num_epochs * steps_per_epoch)
+    step = 0
+
+    def _set_lr(epoch, step):
+        f = 1.0
+        if lr_schedule == "cosine":
+            f = 0.01 + 0.99 * 0.5 * (1 + math.cos(math.pi * step / total_steps))
+        for g in optimizer.param_groups:
+            warm = epoch < noise_lr_warmup_epochs and g.get("noise_mult", 1.0) != 1.0
+            g["lr"] = g["initial_lr"] * f / (g["noise_mult"] if warm else 1.0)
+
     for epoch in range(num_epochs):
         model.train()
         epoch_loss = 0.0
-        epoch_es = epoch_crps = epoch_obs = 0.0
+        epoch_es = epoch_crps = epoch_obs = epoch_mm = 0.0
         idx = torch.randperm(X_train.size(0))
 
         for i in range(0, X_train.size(0), batch_size):
+            if lr_schedule != "constant" or noise_lr_warmup_epochs > 0:
+                _set_lr(epoch, step)
+            step += 1
             optimizer.zero_grad()
 
             batch_idx = idx[i:i + batch_size]
@@ -1530,10 +1579,18 @@ def train_model(model, optimizer, X_train, Y_train, mask_train, device, K, num_e
                     epoch_es += loss.item() * B
                     epoch_crps += crps_term.item() * B
                     loss = loss + crps_weight * crps_term
+                if mean_mse_weight > 0:
+                    mm = (coastal_weight.unsqueeze(1) * ((preds.mean(1) - Y_batch) ** 2 - preds.var(1) / K)).mean()
+                    if crps_weight <= 0:
+                        epoch_es += loss.item() * B
+                    epoch_mm += mm.item() * B
+                    loss = loss + mean_mse_weight * mm
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            if ema is not None:
+                ema.update(model.module)
 
             epoch_loss += loss.item() * B
             del X_batch, Y_batch, mask_batch, preds, loss
@@ -1550,8 +1607,14 @@ def train_model(model, optimizer, X_train, Y_train, mask_train, device, K, num_e
                 n = X_train.size(0)
                 extra = (f" | energy: {epoch_es / n:.6f} | pixel CRPS: {epoch_crps / n:.6f}"
                          f" (x{crps_weight:g} = {crps_weight * epoch_crps / n:.6f})")
+            if mean_mse_weight > 0 and not deterministic_mse:
+                n = X_train.size(0)
+                extra += (f" | energy: {epoch_es / n:.6f} | debiased mean MSE: {epoch_mm / n:.6f}"
+                          f" (x{mean_mse_weight:g} = {mean_mse_weight * epoch_mm / n:.6f})")
             if obs_ft is not None:
                 extra += f" | obs block CRPS term: {epoch_obs / X_train.size(0):.6f}"
+            if lr_schedule != "constant" or noise_lr_warmup_epochs > 0:
+                extra += " | lr: " + ", ".join(f"{g['lr']:.3g}" for g in optimizer.param_groups)
             print(f"Epoch {epoch + 1}/{num_epochs} | Loss: {epoch_loss:.6f}{extra}", flush=True)
 
     return loss_array
@@ -2460,7 +2523,7 @@ def run_pipeline(config):
             # cross-dataset path was smoke-tested. Collapse whichever side has the
             # vector-wind pair down to a single derived speed channel so both sides
             # present the same channel count/order (see collapse_wind_vector_channel's
-            # docstring) -- confirmed by the user as the preferred fix over dropping
+            # docstring) -- chosen as the preferred fix over dropping
             # wind entirely. Uses the *original* dataset channel coordinate, not
             # X.shape.
             train_channel_names = list(X_da["channel"].values)
@@ -2627,7 +2690,7 @@ def run_pipeline(config):
     trainable = [(n, p) for n, p in model.module.named_parameters() if p.requires_grad]
     if mult != 1.0:
         groups = [{"params": [p for n, p in trainable if not _is_noise(n)], "lr": config.lr},
-                  {"params": [p for n, p in trainable if _is_noise(n)], "lr": config.lr * mult}]
+                  {"params": [p for n, p in trainable if _is_noise(n)], "lr": config.lr * mult, "noise_mult": mult}]
         optimizer = optim.Adam([g for g in groups if g["params"]], lr=config.lr)
         print(f"  noise parameters at {mult:g}x lr ({config.lr * mult:.3g})")
     else:
@@ -2647,6 +2710,13 @@ def run_pipeline(config):
     # Train
     # ------------------------------------------------------------
     print("Starting training...")
+    ema_decay = float(getattr(config, "ema_decay", 0.0) or 0.0)
+    ema = EmaWeights(model.module, ema_decay) if ema_decay > 0 and config.num_epochs > 0 else None
+    if ema is not None:
+        print(f"  EMA of weights, decay {ema_decay:g} (evaluation and model_state_dict.pt use the EMA weights)")
+    mean_mse_weight = float(getattr(config, "mean_mse_weight", 0.0) or 0.0)
+    if mean_mse_weight > 0:
+        print(f"  debiased ensemble-mean MSE term, weight {mean_mse_weight:g}")
     loss_array = train_model(
         model, optimizer, X_train, Y_train, mask_train, device, config.k, config.num_epochs, config.batch_size,
         coastal_width=config.coastal_width, coastal_boost=config.coastal_boost, beta=config.beta,
@@ -2655,8 +2725,15 @@ def run_pipeline(config):
         energy_patch_size=int(getattr(config, "energy_patch_size", 0) or 0),
         aux_train=aux_train, obs_ft=obs_ft,
         floor=floor,
+        mean_mse_weight=mean_mse_weight, ema=ema,
+        lr_schedule=getattr(config, "lr_schedule", "constant") or "constant",
+        noise_lr_warmup_epochs=int(getattr(config, "noise_lr_warmup_epochs", 0) or 0),
     )
 
+    if ema is not None:
+        # keep the last-step weights too, then evaluate/save the EMA weights as the run's checkpoint
+        torch.save(model.module.state_dict(), os.path.join(config.output_dir, "model_state_dict_last_step.pt"))
+        model.module.load_state_dict(ema.state)
     torch.save(model.module.state_dict(), os.path.join(config.output_dir, "model_state_dict.pt"))
     np.save(os.path.join(config.output_dir, "loss_array.npy"), np.array(loss_array))
     print("Saved model checkpoint and loss history.")

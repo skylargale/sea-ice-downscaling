@@ -17,8 +17,9 @@ import pandas as pd
 
 V6 = "/glade/work/skygale/projects/SeaIceDownscaling"
 OUT = f"{V6}/figures/final_figures/final_results_table"
-PERFECT = {("FOSI", "EngressNet (final)"): "CAL1a_noiselr_FOSI", ("FOSI", "det-MSE"): "FOSI_deterministic_mse_avg",
-           ("MESACLIP", "EngressNet (final)"): "MESA_final_avg", ("MESACLIP", "det-MSE"): "MESA_deterministic_mse_avg"}
+# 2026-10-18: EngressNet (final) = 2026-10-07 configuration + EMA; det-MSE = matched det-MSE + EMA (seed 0)
+PERFECT = {("FOSI", "EngressNet (final)"): "FOSI_final_ema", ("FOSI", "det-MSE"): "FOSI_detmse_ema",
+           ("MESACLIP", "EngressNet (final)"): "MESA_final_ema", ("MESACLIP", "det-MSE"): "MESA_detmse_ema"}
 
 
 def perfect_rows():

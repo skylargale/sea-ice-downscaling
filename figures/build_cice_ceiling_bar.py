@@ -44,8 +44,8 @@ def pooled_std(F, groups, dof):
 def main():
     ev = c.EV2
     ct, cb = np.load(f"{ev}/cice_truth_cells.npz"), np.load(f"{ev}/cice_truth_bins.npz")
-    eng, engb = np.load(f"{ev}/cal1a_piomas_cells.npz"), np.load(f"{ev}/cal1a_piomas_bins.npz")
-    det = np.load(f"{ev}/detmse_FOSI_cells.npz")
+    eng, engb = np.load(f"{ev}/ema_piomas_cells.npz"), np.load(f"{ev}/ema_piomas_bins.npz")  # 2026-10-18: EMA model
+    det = np.load(f"{ev}/detmse_ema_piomas_cells.npz")  # matched det-MSE + EMA
     F = {"CICE (FOSI)\ntruth": ct["fosi"].astype(float), "CICE (MESACLIP)\ntruth": ct["mesa"].astype(float),
          "EngressNet (final)\non PIOMAS": eng["members"].astype(float),
          "Deterministic U-Net\n(det-MSE) on PIOMAS": det["ensmean"].astype(float),

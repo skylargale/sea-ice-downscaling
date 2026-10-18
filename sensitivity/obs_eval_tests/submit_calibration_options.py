@@ -1,5 +1,5 @@
 """
-Calibration options for EngressNet against ICESat-2 (2026-10-07; user: "do all 3, then report which is best"). Everything
+Calibration options for EngressNet against ICESat-2 (2026-10-07; all three run, then compared). Everything
 starts from the recommended T2 10 px configuration (T2_statespread_p10_FOSI); only real data are used.
 
   1a noise lr   T2p10 retrained from scratch (4 windows) with the noise scalars + amplitude-map heads at 10x lr

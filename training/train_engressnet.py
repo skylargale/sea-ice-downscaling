@@ -156,6 +156,17 @@ def parse_args():
                    help="Option 2: train only on the --obs-ft-* observation set (no CICE steps); a full-res target "
                         "(time, H, W) is scored with per-cell CRPS where observed.")
     p.set_defaults(obs_ft_only=False)
+    # 2026-10-17 ensemble-mean accuracy tests (default off)
+    p.add_argument("--ema-decay", type=float, default=0.0,
+                   help="Exponential moving average of the weights with this decay (e.g. 0.999); evaluation and the saved "
+                        "checkpoint use the EMA weights (last-step weights saved as model_state_dict_last_step.pt). 0 = off.")
+    p.add_argument("--mean-mse-weight", type=float, default=0.0,
+                   help="Add this multiple of the coastal-weighted debiased ensemble-mean MSE, mean[(ens mean - y)^2 - var/K], "
+                        "to the energy score (does not reward smaller spread). 0 = off.")
+    p.add_argument("--lr-schedule", choices=["constant", "cosine"], default="constant",
+                   help="Per-step learning-rate schedule: constant (default, unchanged) or cosine decay to 1%% of the initial lr.")
+    p.add_argument("--noise-lr-warmup-epochs", type=int, default=0,
+                   help="With --noise-lr-mult: keep the noise parameters at the base lr for this many epochs first. 0 = off.")
     p.add_argument("--output-floor", choices=["clamp", "softplus"], default="clamp",
                    help="How physical thickness is kept >= 0: 'clamp' (default, at evaluation only) or 'softplus' (smooth floor "
                         "applied in the training loss and at evaluation, 2026-10-08).")
@@ -286,6 +297,10 @@ def main():
         obs_ft_only=args.obs_ft_only,
         output_floor=args.output_floor,
         output_floor_scale=args.output_floor_scale,
+        ema_decay=args.ema_decay,
+        mean_mse_weight=args.mean_mse_weight,
+        lr_schedule=args.lr_schedule,
+        noise_lr_warmup_epochs=args.noise_lr_warmup_epochs,
     )
 
     fe.run_pipeline(config)

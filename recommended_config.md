@@ -1,6 +1,47 @@
 # Recommended U-Net configuration — Version5
 
-## FINAL configuration (2026-10-07, used for all paper results): T2 + 10 px energy tiles + noise-parameter learning rate x10
+## FINAL configuration (2026-10-18): the 2026-10-07 configuration below + EMA of the weights
+
+```
+(everything in the 2026-10-07 block below) + EMA_DECAY=0.9995 (MESA) / 0.997 (FOSI)   # --ema-decay; ~last 2-3 epochs
+```
+Evaluation and the saved `model_state_dict.pt` use the EMA weights; last-step weights are kept as `model_state_dict_last_step.pt`.
+The deterministic baseline is now det-MSE trained with the same EMA (`DETERMINISTIC_MSE=true,K_EVAL=2,EMA_DECAY=...`).
+Paper evaluation (2026-10-18): perfect-model accuracy/CRPS with K_EVAL=100 (`results/{MESA,FOSI}_final_ema_K100/`:
+MESA RMSE 0.1031 vs det 0.1060, FOSI 0.2037 vs 0.2057, every window; CRPS 0.0308 / 0.0773); calibration figures and Table 4 at K=20;
+ICESat-2 application 4 x 20 = 80 members. Manuscript edit list: `paper/manuscript_edits_2026-10-18.md`.
+Checkpoints: `results/{MESA,FOSI}_final_ema/` (seed 0; seeds 1-2 in `_seed1`, `_seed2`); baseline `results/{MESA,FOSI}_detmse_ema/`.
+Observation re-run (2026-10-18): `PIOMAS_2018-2022_FOSI_{final,detmse}_ema`, `INPUTSWAP_{c2s_smos,topaz4ml}_ema_4win`,
+`PIOMAS_2010-2023_cdrv6_{ema,detmseema}FOSI_4win`.
+
+Why: the 2026-10-07 model's ensemble mean lost to det-MSE on MESACLIP RMSE (diagnosis in "Limitations we kept"). The learning rate
+is constant and the noise parameters train at 10x, so the last-step checkpoint is noisy and the result varied by window. EMA fixed the
+bad MESACLIP 2010-15 window (0.124 -> 0.106 m). 3-seed x 4-window means, ocean cells, test year 2021, K=20
+(`evaluation/summarize_ensmean_sweep.py` -> `evaluation/corrected_calibration/ensmean_sweep_summary.txt`):
+
+| | RMSE | CRPS (det: MAE) | IIEE | pattern corr | spread-skill |
+|---|---|---|---|---|---|
+| MESACLIP EngressNet + EMA | 0.1057 | 0.0321 | 0.128 | 0.863 | 1.04 |
+| MESACLIP det-MSE + EMA | 0.1058 | 0.0450 | 0.230 | 0.897 | - |
+| FOSI EngressNet + EMA | 0.2066 | 0.0798 | 0.088 | 0.937 | 0.87 |
+| FOSI det-MSE + EMA | 0.2056 | 0.1089 | 0.162 | 0.938 | - |
+
+(IIEE, pattern corr and spread-skill are from seed 0.) EMA improves det-MSE as well (MESA 0.1076 -> 0.1060, FOSI 0.2093 -> 0.2057), so the
+fair comparison is EMA against EMA. Against it, the ensemble mean ties on RMSE (FOSI det-MSE is ahead by 0.5%, beyond seed spread)
+and loses pattern correlation, SSIM, gradient MAE and coastal RMSE by 1-4%. EngressNet clearly wins CRPS (-27 to -29%), IIEE
+(about -45%) and calibration.
+
+Tested alongside and not adopted (FOSI unless noted):
+- cosine lr decay + noise lr warmup (RMSE 0.2106, spread-skill 0.79)
+- + 40 epochs; det-MSE at 40 epochs gets worse too (0.2164)
+- beta 1.2 (spread-skill 0.67)
+- debiased ensemble-mean MSE term x1 / x5: no RMSE gain, spread-skill 0.81-0.82 on FOSI
+- coastal boost 3: marginal (MESA 0.1051, FOSI 0.2060)
+- K_EVAL=100 on the 2026-10-07 checkpoints: -0.003 m RMSE (FOSI 0.2082, MESA 0.1104)
+- pooled 2000-2020 single window (6 epochs): helps both models, det-MSE more (MESA 0.0980 vs 0.1015, FOSI 0.1871 vs 0.1959); kept as a
+  4-window design.
+
+## FINAL configuration (2026-10-07; superseded 2026-10-18 by + EMA above): T2 + 10 px energy tiles + noise-parameter learning rate x10
 
 ```
 DATA_VARIANT=avg
@@ -37,8 +78,8 @@ fine-scale noise far beyond ICESat-2's variability and over-dispersed vs CICE); 
 
 ### What didn't work (and why)
 
-Record of approaches that were tried and rejected, bugs that were found and fixed, and limitations we kept, so none of it depends
-on chat history. Written 2026-10-09. The adopted model is the FINAL configuration above (noise
+Record of approaches that were tried and rejected, bugs that were found and fixed, and limitations we kept, all in one place.
+Written 2026-10-09. The adopted model is the FINAL configuration above (noise
 cascade + T2 amplitude maps + 10 px energy-score tiles + noise-parameter learning rate x10, trained on FOSI or MESACLIP, 4 windows
 x 20 members).
 
@@ -71,11 +112,11 @@ spread/error: 1 = calibrated. Lower CRPS is better.
 | **Option 3** FOSI + MESA-trained members pooled | Pool two training datasets | CRPS 0.371 -> 0.368; spread/error 0.45 -> 0.45; less fine-scale variance | Models agree too closely to add spread; kept only as a robustness result (training data barely matters) |
 | **Smooth output floor** | softplus (2 cm scale) instead of clamp at 0, in the training loss and at output | FOSI: domain spread-skill 0.89 -> 0.68; ice regimes 1.05/0.92/0.85 -> 0.79/0.73/0.65; ICESat-2 CRPS 0.363 -> 0.372; within-cell variability 0.63 -> 0.38; open-water rank-0 spike 3.5x -> 8.8x | Model shrank its noise everywhere; softplus never reaches 0 m, so ice-free truth always ranks below all members. MESA runs cancelled |
 
-#### Rejected without running (user decisions)
+#### Rejected without running
 
-- **Post-hoc, scale-selective variance inflation** (2026-10-06): rejected as "made up". Spread must come from training on real
+- **Post-hoc, scale-selective variance inflation** (2026-10-06): rejected as not physically grounded. Spread must come from training on real
   targets or from real data.
-- **Synthetic input perturbation during training** (2026-10-06): rejected as "fake", for the same reason.
+- **Synthetic input perturbation during training** (2026-10-06): rejected for the same reason.
 - **ICESat-1 (GLAS) and the 2003-2008 period**: not used at all (2026-09-29); the related data were removed on purpose.
 
 #### Data and evaluation choices that did not hold up
@@ -107,8 +148,35 @@ spread/error: 1 = calibrated. Lower CRPS is better.
 
 - **Accuracy cost on MESACLIP**: the final model's ensemble mean is less accurate than the deterministic model there (RMSE 0.113
   vs 0.108 m, pattern correlation 0.850 vs 0.888; the earlier under-dispersed cascade matched it at 0.108 / 0.905). FOSI is
-  unaffected (0.211 vs 0.209 m, r 0.932 vs 0.936). Bias stays ~0 (+0.004 m). Cause not tested; likely residual member texture
-  in the finite ensemble mean.
+  unaffected (0.211 vs 0.209 m, r 0.932 vs 0.936). Bias stays ~0 (+0.004 m).
+  **Cause (diagnosed 2026-10-17)**, from saved MESACLIP 2021 fields, ocean cells. "K=inf" is the unbiased estimate
+  mean[(ens mean - truth)^2 - ens var / K]; RMSE over K = 1, 2, 5, 10, 20 member subsets follows MSE(K) = MSE(inf) + var/K exactly:
+
+  | Window | spread-skill | ens-mean RMSE K=20 | K=inf | det-MSE | gap mainly from |
+  |---|---|---|---|---|---|
+  | 2000-05 | 1.11 | 0.1101 | 0.1068 | 0.1076 | finite ensemble only |
+  | 2005-10 | 1.07 | **0.1056** | **0.1027** | 0.1075 | none (ensemble mean wins) |
+  | 2010-15 | 0.98 | 0.1238 | 0.1209 | 0.1086 | thick ice (>1 m): 0.232 vs 0.196, 88% of the gap, every month |
+  | 2015-20 | 1.18 | 0.1123 | 0.1085 | 0.1067 | positive mean bias: open water +0.012, thin +0.026, moderate +0.028 m; open-water spread-skill 2.2; Sep-Nov about 2x det-MSE |
+
+  So there are three separate causes:
+  1. **Finite ensemble.** A calibrated ensemble's 20-member mean keeps var/K of member noise. The earlier cascade was
+     under-dispersed (0.70-0.75), so it paid less of this cost, which is why it matched det-MSE (K=inf 0.106-0.108 per window).
+  2. **Window-to-window training variability.** The 2010-15 window's mean is worse at any K.
+  3. **Positive mean bias**, mostly in the 2015-20 window. This is the network's own mean, not the clamp: the reported ensemble
+     mean (`Y_pred_phys`) already averages unclamped members and clamps afterwards, and the mean of clamped members gives the
+     same RMSE (0.1101 vs 0.1107 in 2000-05). So "average before clamping" is already in place and is not a remedy.
+
+  - Not the cause: member texture. A 3x3-smoothed ensemble mean is worse (0.123 in 2000-05), and the ensemble median equals the mean.
+  - In expectation an energy-score ensemble mean and an MSE model estimate the same conditional mean, so an RMSE tie is the
+    expected outcome. The probabilistic gain is CRPS vs det-MSE MAE.
+  - Diagnostic: `evaluation/diag_ensmean_vs_det.py`; per-regime/per-month numbers in `evaluation/corrected_calibration/MESA_final_avg_ensmean_diag.csv` (cascade: `MESA_noise_cascade_avg_ensmean_diag.csv`).
+  - Remedies being tested (2026-10-17): K_EVAL=100 on the existing checkpoints (`results/MESA_final_avg_K100/`,
+    `results/CAL1a_noiselr_FOSI_K100/`), and retraining with EMA weights (`--ema-decay`, 0.9995 MESA / 0.997 FOSI) alone and
+    with a debiased ensemble-mean MSE term (`--mean-mse-weight` 1 and 5): `results/{MESA,FOSI}_final_{ema,emamm1,emamm5}/`.
+    Second sweep, all with EMA + cosine lr decay (`--lr-schedule cosine`): noise-lr x1 for 3 epochs first
+    (`--noise-lr-warmup-epochs 3`) `final_ema_cos_nw3`, + 40 epochs `_e40`, + beta 1.2 `_b12`, one 2000-2020 window (6 epochs)
+    `_pooled`; det-MSE controls with the same changes `detmse_ema_cos{,_e40,_pooled}`.
 
 - **Open-water over-dispersion**: with the clamp, noise over ice-free cells can only add ice, so members carry a few cm of one-sided
   spurious ice. Open-water spread-skill 1.44 (FOSI) / 2.24 (MESACLIP); rank-0 spike 3.5x / 6.5x. It averages out in the ensemble
@@ -368,7 +436,7 @@ same 4 windows (train 2000-2004/2005-2009/2010-2014/2015-2019, test 2020).
 land-threshold (see table above) — real RMSE cost (FOSI +6.8%, MESA +8.4%) for a smaller
 Coastal RMSE gain (FOSI −3.0%, MESA −1.6%), and calibration moves slightly further from
 1.0 in both cases rather than improving. Since this experiment specifically targeted the
-2000-2020 window the user is downscaling for (not a smaller test slice standing in for a
+2000-2020 window being downscaled (not a smaller test slice standing in for a
 future full-record rebuild), **this question is fully closed, not just deferred** — there
 is no larger production-data rebuild decision hanging on this result. Stick with the
 existing bilinear-regridded truth.
