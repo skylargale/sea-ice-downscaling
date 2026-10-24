@@ -171,6 +171,9 @@ def parse_args():
                    help="How physical thickness is kept >= 0: 'clamp' (default, at evaluation only) or 'softplus' (smooth floor "
                         "applied in the training loss and at evaluation, 2026-10-08).")
     p.add_argument("--output-floor-scale", type=float, default=0.02, help="Softplus floor scale in metres (default 0.02).")
+    p.add_argument("--coarse-zero", action="store_true",
+                   help="2026-10-23: at evaluation, set members to exactly 0 on ocean cells whose bilinear coarse SIT is exactly 0 "
+                        "(the area-mean coarse input is 0 only where the high-res truth is 0). Training is unchanged. Off by default.")
     # Evaluation
     p.add_argument("--k-eval", type=int, default=6, help="Ensemble size during evaluation.")
     p.add_argument("--eval-batch-size", type=int, default=16)
@@ -297,6 +300,7 @@ def main():
         obs_ft_only=args.obs_ft_only,
         output_floor=args.output_floor,
         output_floor_scale=args.output_floor_scale,
+        coarse_zero=args.coarse_zero,
         ema_decay=args.ema_decay,
         mean_mse_weight=args.mean_mse_weight,
         lr_schedule=args.lr_schedule,

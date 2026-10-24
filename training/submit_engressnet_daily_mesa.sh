@@ -135,12 +135,15 @@ COLLAPSE_WIND_VECTOR="${COLLAPSE_WIND_VECTOR:-false}"
 NOISE_AMP_MAP="${NOISE_AMP_MAP:-false}"        # T2 state-dependent spread
 ENERGY_PATCH_SIZE="${ENERGY_PATCH_SIZE:-0}"    # energy score over N x N px tiles
 NOISE_LR_MULT="${NOISE_LR_MULT:-1}"            # learning-rate multiplier for the noise parameters
+AUX_PATH="${AUX_PATH:-}"                       # T3 25 km concentration channel (2026-10-22)
+TEST_AUX_PATH="${TEST_AUX_PATH:-}"             # T3, test-time file (blank = AUX_PATH)
 EMA_DECAY="${EMA_DECAY:-0}"                # 2026-10-17: EMA of weights (e.g. 0.999); 0 = off
 MEAN_MSE_WEIGHT="${MEAN_MSE_WEIGHT:-0}"    # 2026-10-17: debiased ensemble-mean MSE term weight; 0 = off
 LR_SCHEDULE="${LR_SCHEDULE:-constant}"     # 2026-10-17: constant | cosine
 NOISE_LR_WARMUP_EPOCHS="${NOISE_LR_WARMUP_EPOCHS:-0}"  # 2026-10-17: epochs at base lr before NOISE_LR_MULT applies
 OUTPUT_FLOOR="${OUTPUT_FLOOR:-clamp}"                  # 2026-10-08: clamp (default) | softplus
 OUTPUT_FLOOR_SCALE="${OUTPUT_FLOOR_SCALE:-0.02}"
+COARSE_ZERO="${COARSE_ZERO:-false}"                    # 2026-10-23: at evaluation, members exactly 0 where coarse SIT is 0; false = off
 
 # ==============================================================
 
@@ -220,7 +223,11 @@ ARGS+=(--crps-weight "$CRPS_WEIGHT")
 echo "Ensemble-mean tests: ema_decay=${EMA_DECAY} mean_mse_weight=${MEAN_MSE_WEIGHT} lr_schedule=${LR_SCHEDULE} noise_lr_warmup_epochs=${NOISE_LR_WARMUP_EPOCHS}"
 [ "$OUTPUT_FLOOR" != clamp ] && ARGS+=(--output-floor "$OUTPUT_FLOOR" --output-floor-scale "$OUTPUT_FLOOR_SCALE")
 echo "Output floor: ${OUTPUT_FLOOR} (scale ${OUTPUT_FLOOR_SCALE} m)"
-echo "Final-config flags: amp_map=${NOISE_AMP_MAP} patch=${ENERGY_PATCH_SIZE} noise_lr_mult=${NOISE_LR_MULT}"
+[ "$COARSE_ZERO" = true ] && ARGS+=(--coarse-zero)
+echo "Coarse-zero constraint: ${COARSE_ZERO}"
+[ -n "$AUX_PATH" ] && ARGS+=(--aux-path "$AUX_PATH")
+[ -n "$TEST_AUX_PATH" ] && ARGS+=(--test-aux-path "$TEST_AUX_PATH")
+echo "Final-config flags: amp_map=${NOISE_AMP_MAP} patch=${ENERGY_PATCH_SIZE} noise_lr_mult=${NOISE_LR_MULT} aux=${AUX_PATH:-none} test_aux=${TEST_AUX_PATH:-none}"
 
 if [ -n "$BATCH_NAME" ]; then
     RUN_TAG="${PBS_JOBNAME}_${TRAIN_YEARS}_${TEST_YEARS}_${PBS_JOBID}"

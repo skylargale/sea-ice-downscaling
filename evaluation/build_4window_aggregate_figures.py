@@ -76,8 +76,10 @@ def accumulate_window(run_dir, acc, seed):
     # ---- Rank histogram: accumulate rank_counts (additive) ----
     print(f"    computing rank histogram...", flush=True)
     rng = np.random.default_rng(seed)
-    below = (ens_ocean < truth_ocean[:, None]).sum(axis=1)
-    ties = (ens_ocean == truth_ocean[:, None]).sum(axis=1)
+    ens_r, truth_r = rdeb.detection_limited(ens_ocean, truth_ocean)  # RANK_TOL detection limit, see run_daily_eval_batch.py
+    below = (ens_r < truth_r[:, None]).sum(axis=1)
+    ties = (ens_r == truth_r[:, None]).sum(axis=1)
+    del ens_r, truth_r
     ranks = below + rng.integers(0, ties + 1)
     rank_counts = np.bincount(ranks, minlength=K + 1)
     acc["rank_counts"] = acc.get("rank_counts", np.zeros(K + 1, dtype=np.int64)) + rank_counts

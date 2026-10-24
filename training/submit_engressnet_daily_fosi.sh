@@ -150,6 +150,7 @@ LR_SCHEDULE="${LR_SCHEDULE:-constant}"     # 2026-10-17: constant | cosine
 NOISE_LR_WARMUP_EPOCHS="${NOISE_LR_WARMUP_EPOCHS:-0}"  # 2026-10-17: epochs at base lr before NOISE_LR_MULT applies
 OUTPUT_FLOOR="${OUTPUT_FLOOR:-clamp}"                  # 2026-10-08: clamp (default) | softplus
 OUTPUT_FLOOR_SCALE="${OUTPUT_FLOOR_SCALE:-0.02}"
+COARSE_ZERO="${COARSE_ZERO:-false}"                    # 2026-10-23: at evaluation, members exactly 0 where coarse SIT is 0; false = off
 TRAIN_ONLY_NOISE="${TRAIN_ONLY_NOISE:-false}"           # option 2
 OBS_FT_ONLY="${OBS_FT_ONLY:-false}"                     # option 2
 
@@ -228,6 +229,8 @@ ARGS+=(--crps-weight "$CRPS_WEIGHT")
 echo "Ensemble-mean tests: ema_decay=${EMA_DECAY} mean_mse_weight=${MEAN_MSE_WEIGHT} lr_schedule=${LR_SCHEDULE} noise_lr_warmup_epochs=${NOISE_LR_WARMUP_EPOCHS}"
 [ "$OUTPUT_FLOOR" != clamp ] && ARGS+=(--output-floor "$OUTPUT_FLOOR" --output-floor-scale "$OUTPUT_FLOOR_SCALE")
 echo "Output floor: ${OUTPUT_FLOOR} (scale ${OUTPUT_FLOOR_SCALE} m)"
+[ "$COARSE_ZERO" = true ] && ARGS+=(--coarse-zero)
+echo "Coarse-zero constraint: ${COARSE_ZERO}"
 [ "$TRAIN_ONLY_NOISE" = true ] && ARGS+=(--train-only-noise)
 [ "$OBS_FT_ONLY" = true ] && ARGS+=(--obs-ft-only)
 echo "Calibration flags: final_kernel=${NOISE_KERNEL_SIZE_FINAL:-same} noise_lr_mult=${NOISE_LR_MULT} train_only_noise=${TRAIN_ONLY_NOISE} obs_ft_only=${OBS_FT_ONLY}"

@@ -14,6 +14,7 @@ changes, re-sync this file from it.
 """
 import argparse
 import json
+import os
 import pickle
 from pathlib import Path
 
@@ -33,6 +34,17 @@ from scipy.spatial import cKDTree
 # just parameterized by eval_dir/save_dir instead of the interactively-set globals, and using
 # a seeded RNG for the ensemble-figure sample choice (section 3) so batch reruns are reproducible.
 POINT_HOPE_LAT = 68.3415
+
+# Rank-histogram detection limit (m, env RANK_TOL; 2026-10-22). Truth and member values below it are both set to exactly 0
+# before ranking (ties then broken at random), so sub-cm open-water values that no observation can resolve don't skew the
+# histogram. 0 = off (default). Only the rank histogram uses it.
+RANK_TOL = float(os.environ.get("RANK_TOL", "0"))
+
+
+def detection_limited(ens, truth):
+    if RANK_TOL <= 0:
+        return ens, truth
+    return np.where(ens < RANK_TOL, 0, ens), np.where(truth < RANK_TOL, 0, truth)
 POINT_HOPE_LON_360 = -166.7578 % 360
 
 
@@ -329,8 +341,9 @@ def run_all_sections(eval_dir, save_dir, show=False):
     truth_ocean = Y_test_phys[:, 0][ocean_bool]
 
     rng = np.random.default_rng(0)
-    below = (ens_ocean < truth_ocean[:, None]).sum(axis=1)
-    ties = (ens_ocean == truth_ocean[:, None]).sum(axis=1)
+    ens_r, truth_r = detection_limited(ens_ocean, truth_ocean)
+    below = (ens_r < truth_r[:, None]).sum(axis=1)
+    ties = (ens_r == truth_r[:, None]).sum(axis=1)
     ranks = below + rng.integers(0, ties + 1)
     rank_counts = np.bincount(ranks, minlength=K_eval_here + 1)
     rank_freq = rank_counts / rank_counts.sum()

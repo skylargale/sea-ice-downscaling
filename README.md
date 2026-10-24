@@ -1,6 +1,6 @@
 # SeaIceDownscaling (Version 6)
 
-> Final model: `recommended_config.md` (FINAL section; 2026-10-18: the 2026-10-07 configuration trained with an exponential moving average of the weights, evaluated with 100 members). Rejected approaches, fixed bugs, kept limitations and the 2026-10-09 cleanup: the "What didn't work" subsection of the same file.
+> Final model: `recommended_config.md` (FINAL section; 2026-10-24: the 2026-10-07 configuration trained with an exponential moving average of the weights, with members set to zero at inference where the coarse input has no ice, evaluated with 20 members against the original, un-normalized truth). Rejected approaches, fixed bugs, kept limitations and the 2026-10-09 cleanup: the "What didn't work" subsection of the same file.
 
 ## Purpose
 

@@ -1,6 +1,54 @@
 # Recommended U-Net configuration — Version5
 
-## FINAL configuration (2026-10-18): the 2026-10-07 configuration below + EMA of the weights
+## FINAL configuration (2026-10-24): the 2026-10-18 model + coarse-zero rule at inference, scored against the original truth
+
+```
+(everything in the 2026-10-18 block below, same checkpoints, no retraining) + COARSE_ZERO=true   # --coarse-zero, evaluation only
+```
+**Coarse-zero rule.** At inference, members (and the det-MSE prediction) are set to exactly 0 on ocean cells whose bilinear coarse SIT is
+exactly 0 (`coarse_zero_mask` in `training/functions_engressnet.py`). The `avg` coarse input is the area mean of the native field and SIT
+>= 0, so the truth is 0 there: in 2021 it never exceeds 4e-5 m in those cells, which are 14% (FOSI) / 29% (MESACLIP) of ocean cells.
+Applied to the saved outputs with `evaluation/apply_coarse_zero_fields.py` (every other member value unchanged); future inference
+passes `COARSE_ZERO=true` (`observations/inference/*.py` do). It also removes rare large spurious coastal values (up to ~7 m in a few
+summer members).
+
+**Original truth.** `Y_test_phys` was saved after a normalize/de-normalize round trip (float32 error up to 1e-6 m): about a quarter of
+true zeros came back as +-2e-9 m (MESACLIP 2015-20 window: 33% of ocean truth negative), which ranked below or above members that are
+exactly 0 and made most of the open-water rank-0 spike. `evaluation/restore_raw_truth.py` rewrote it from the Y files for the four
+perfect-model batches (checked |change| <= 1e-5 m). Only rank histograms moved: MESACLIP pooled rank 0 3.3x -> 1.17x of uniform,
+open water 4.7x -> 1.16x, outside 12.1% (ideal 9.5%).
+
+**Evaluation size.** The paper uses K_EVAL=20 throughout (the K=100 batches were deleted 2026-10-24).
+
+Final numbers (test year 2021, ocean cells, 4 windows, seed 0; `evaluation/corrected_calibration/ensmean_sweep_summary.txt`):
+
+| | RMSE | CRPS (det: MAE) | IIEE | pattern corr | spread-skill |
+|---|---|---|---|---|---|
+| MESACLIP EngressNet | 0.1052 | 0.0319 | 0.075 | 0.884 | 1.02 |
+| MESACLIP det-MSE | 0.1060 | 0.0447 | 0.091 | 0.908 | - |
+| FOSI EngressNet | 0.2065 | 0.0797 | 0.058 | 0.937 | 0.86 |
+| FOSI det-MSE | 0.2056 | 0.1085 | 0.076 | 0.938 | - |
+
+Regime spread-skill (thin / moderate / thick / open): MESACLIP 1.07 / 0.99 / 0.98 / 1.77, FOSI 1.00 / 0.88 / 0.84 / 1.35. Open water
+is over-dispersed in the mean-square sense only: far from the edge (coarse < 1 cm) the ratio is 3.5-3.9 but those cells carry 2-9% of
+the open-water squared error, and the open-water rank histogram is near uniform. ICESat-2 (PIOMAS input, 2018-22) is unchanged:
+CRPS 0.366 vs det 0.388 vs bilinear 0.419, spread/error 0.45.
+
+Kept on disk: `results/{FOSI,MESA}_{final,detmse}_ema`, `PIOMAS_2018-2022_FOSI_{final,detmse}_ema`, `PIOMAS_2010-2023_cdrv6_emaFOSI_4win`
+(43 other batches deleted 2026-10-24; list in `evaluation/corrected_calibration/deleted_batches_2026-10-24.txt`, their metric CSVs
+kept). Paper figures: `figures/final_figures/`. The paper itself is not kept on disk.
+
+Tried for the open-water rank-0 spike before the truth fix, not adopted (records in `evaluation/corrected_calibration/`):
+- hurdle presence head, 3 variants (`hurdle*_compare.txt`): moved the excess to the top ranks, missed ice x10, less spread in ice
+- coarse-zero rule inside the training loss (`coarse_zero_compare.txt`): same open-water gain, spread -2 to -5% in every ice regime,
+  CRPS +1%
+- 1-deg block-mean conservation rescaling (no-training check): more cells outside the ensemble in every regime
+- 25 km concentration input (T3): fixed near-edge open water and cut CRPS 13-15%, dropped because the input is not readily available
+
+## FINAL configuration (2026-10-18; superseded 2026-10-24 by the coarse-zero rule above): the 2026-10-07 configuration below + EMA of the weights
+
+Note (2026-10-24): the K=100, seed-1/2, pooled, cosine and mean-term batches named below, the `INPUTSWAP_*` and det-MSE 2010-2023 runs,
+and `paper/` no longer exist; their numbers are pre-rule.
 
 ```
 (everything in the 2026-10-07 block below) + EMA_DECAY=0.9995 (MESA) / 0.997 (FOSI)   # --ema-decay; ~last 2-3 epochs

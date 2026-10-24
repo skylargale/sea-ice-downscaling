@@ -1368,6 +1368,15 @@ def _floor_in_increment_space(preds, base, floor):
     return (phys - b - mu) / sd
 
 
+def coarse_zero_mask(base_phys, mask):
+    """Ocean cells whose bilinear coarse SIT is exactly 0 (2026-10-23, --coarse-zero). base_phys [N, C, H, W] physical
+    bilinear baseline, mask [N, 1, H, W] land mask; returns bool [N, 1, H, W]. The coarse input is the area mean of the
+    high-res field and SIT >= 0, so where every coarse cell a pixel is interpolated from is 0, the high-res truth is 0.
+    Applied at evaluation only, like the clamp: also applying it in the training loss gave the same open-water rank
+    histogram but less spread in every ice regime and a worse CRPS (FOSI, evaluation/corrected_calibration/coarse_zero_compare.txt)."""
+    return (base_phys[:, :1] <= 0) & (mask[:, :1].to(base_phys.device) <= 0.5)
+
+
 def _model_mask(mask_batch, aux, idx):
     """Land mask plus optional high-res predictor channels (obs-eval test T3) for the samples `idx`."""
     if aux is None:
@@ -2293,23 +2302,33 @@ def _crop_hr(arr, hlat, hlon, subdomain):
 def build_aux_channels(config, time_train, member_train, time_test, member_test, hlat, hlon):
     """(obs-eval test T3) High-res predictor channels on the Y grid, cropped to the sub-domain and standardised with
     training statistics. aux_path / test_aux_path: files with A (ensemble, time, channel, lat, lon), matched to the
-    samples by timestamp (single-member files); static_path: S (channel, lat, lon). Returns (aux_train, aux_test, n)."""
+    samples by timestamp, and by ensemble member when the file has more than one (MESA, 2026-10-22; a single-member
+    file is shared by every member); static_path: S (channel, lat, lon). Returns (aux_train, aux_test, n)."""
     if config.use_patches:
         raise ValueError("aux/static channels are only implemented for --no-patches.")
     out_tr, out_te, n = {"dyn": None, "static": None}, {"dyn": None, "static": None}, 0
 
-    def dyn(path, times):
+    def dyn(path, times, members):
         da = xr.open_dataset(path)["A"]
         idx = xr.CFTimeIndex(da["time"].values).get_indexer(np.asarray(times)) if not np.issubdtype(np.asarray(times).dtype, np.datetime64) \
             else pd.DatetimeIndex(da["time"].values).get_indexer(np.asarray(times))
         if (idx < 0).any():
             raise ValueError(f"{path}: {int((idx < 0).sum())} sample times not found (e.g. {np.asarray(times)[idx < 0][:3]}).")
-        a = da.isel(ensemble=0).isel(time=idx).values  # only the matched days are read
+        if da.sizes["ensemble"] == 1:
+            a = da.isel(ensemble=0).isel(time=idx).values  # only the matched days are read
+        else:
+            members = np.asarray(members)
+            if members.max() >= da.sizes["ensemble"]:
+                raise ValueError(f"{path}: has {da.sizes['ensemble']} members, samples need member {members.max()}.")
+            a = np.empty((len(idx),) + da.shape[2:], dtype=np.float32)
+            for m in np.unique(members):  # one read per member
+                rows = np.where(members == m)[0]
+                a[rows] = da.isel(ensemble=int(m)).isel(time=idx[rows]).values
         return torch.tensor(_crop_hr(a, hlat, hlon, config.subdomain)).float()
 
     if getattr(config, "aux_path", None):
-        tr = dyn(config.aux_path, time_train)
-        te = dyn(getattr(config, "test_aux_path", None) or config.aux_path, time_test)
+        tr = dyn(config.aux_path, time_train, member_train)
+        te = dyn(getattr(config, "test_aux_path", None) or config.aux_path, time_test, member_test)
         m, s = tr.mean(dim=(0, 2, 3), keepdim=True), tr.std(dim=(0, 2, 3), keepdim=True)
         out_tr["dyn"], out_te["dyn"] = (tr - m) / (s + 1e-6), (te - m) / (s + 1e-6)
         n += tr.shape[1]
@@ -2770,6 +2789,16 @@ def run_pipeline(config):
         preds_all_phys = smooth_floor(preds_all * (inc_std + 1e-6).to(preds_all.device) + inc_mean.to(preds_all.device) + bt.unsqueeze(1), floor["scale"])
         Y_pred_phys = preds_all_phys.mean(dim=1)
         Y_pred_det_phys = smooth_floor(Y_pred_det * (inc_std + 1e-6).to(Y_pred_det.device) + inc_mean.to(Y_pred_det.device) + bt, floor["scale"])
+    if getattr(config, "coarse_zero", False):
+        # 2026-10-23 (--coarse-zero): members exactly 0 on ocean cells whose bilinear coarse SIT is exactly 0 (evaluation only,
+        # see coarse_zero_mask); the ensemble mean is the mean of the constrained members, spread 0 on those cells
+        zero_test = coarse_zero_mask(baseline_test_phys, mask_test).to(preds_all_phys.device)
+        keep = (~zero_test).to(preds_all_phys.dtype)
+        preds_all_phys = preds_all_phys * keep.unsqueeze(1)
+        Y_pred_phys = preds_all_phys.mean(dim=1)
+        Y_pred_det_phys = Y_pred_det_phys * keep.to(Y_pred_det_phys.device)
+        Y_spread_phys = Y_spread_phys * keep.to(Y_spread_phys.device)
+        print(f"  coarse-zero constraint: {float(zero_test.sum() / (mask_test[:, :1] <= 0.5).sum()):.3f} of test ocean cells")
 
     # Hard-zero land in the model's own physical-space predictions (not the bilinear
     # baseline or truth). This can't be done inside UNet.forward(): the model operates in

@@ -1,7 +1,7 @@
 """
 Paper Fig. 3 (example fields) from the 100-member EMA run (2026-10-18; perfect-model accuracy is reported with 100 members).
 Generated from figures/all_figures_by_run.ipynb cells 2 (setup) and 15 (example fields) with RUN = MESA_final_ema_K100;
-same samples (rng seed 0 on the truth), deterministic panel = det-MSE + EMA. Writes final_figures/03_example_fields_K100.png.
+same samples (rng seed 0 on the truth), deterministic panel = det-MSE + EMA. Writes final_figures/03_example_fields.png (2026-10-24: 20-member batch MESA_final_ema; was K100).
 """
 import matplotlib
 matplotlib.use("Agg")
@@ -25,7 +25,7 @@ import run_daily_eval_batch as rdeb
 import functions_engressnet as fe
 
 # ---- Choose run here ----
-RUN    = "MESA_final_ema_K100"  # final EngressNet (2026-10-18: 2026-10-07 configuration + EMA; was MESA_final_avg) -- subdirectory under results/ and evaluation/saved_figs/
+RUN    = os.environ.get("FIG3_RUN", "MESA_final_ema")  # 2026-10-24: 20-member final EngressNet (was MESA_final_ema_K100) -- subdirectory under results/ and evaluation/saved_figs/
 WINDOW = "2015-2020"       # training-window substring; only used by the raw-npz (map) cells
 
 
@@ -113,4 +113,4 @@ for row, idx in enumerate(SAMPLE_IDXS):
 cbar = fig.colorbar(im, ax=axs, aspect=30, shrink=0.9, pad=0.02)
 cbar.set_label("Sea ice thickness (m)", fontsize=18)
 cbar.ax.tick_params(labelsize=14)
-plt.savefig(os.path.join(BASE, 'figures', 'final_figures', '03_example_fields_K100.png'), dpi=300, bbox_inches='tight')
+plt.savefig(os.path.join(BASE, 'figures', 'final_figures', '03_example_fields.png'), dpi=300, bbox_inches='tight')

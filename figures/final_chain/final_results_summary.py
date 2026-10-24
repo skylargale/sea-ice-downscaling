@@ -6,7 +6,8 @@ lr x10) against the separately trained deterministic U-Net (det-MSE) and bilinea
     RMSE / MAE of the best estimate (ensemble mean; det-MSE prediction; bilinear), CRPS (= MAE for single-valued estimates),
     corrected spread-skill (evaluation/corrected_calibration; 1 = calibrated)
   Observations (ICESat-2 pass-cell means, 2018-2022, from observations/data/alongtrack_eval/):
-    PIOMAS input (scoreboard.csv) and pooled independent inputs PIOMAS + CS2SMOS + TOPAZ4-ML (input_comparison_scores.csv)
+    PIOMAS input (scoreboard.csv). The pooled-input rows (PIOMAS + CS2SMOS + TOPAZ4-ML) were removed 2026-10-24: their
+    input-swap runs were deleted and they predate the coarse-zero rule.
 Writes figures/final_figures/final_results_table.csv and .md.
 """
 import glob
@@ -63,14 +64,6 @@ def obs_rows():
                          "MAE": x["MAE of mean"], "bias": x["bias (est − IS2)"], "r": x["r"], "CRPS": x["CRPS"],
                          "spread/error (+obs noise)": x["spread/error + obs noise"],
                          "within-cell var / IS2": x["subgrid std ratio (median)"], "53-160 km var / IS2": x["PSD ratio 53-160 km"]})
-    ic = pd.read_csv(f"{V6}/observations/data/alongtrack_eval/input_comparison_scores.csv")
-    for region in ("whole domain", "north of 66°N"):
-        q = ic[(ic["reference | region"] == f"mean | {region}") & ic.estimate.str.startswith("EngressNet (final) | pooled independent")]
-        for _, x in q.iterrows():
-            rows.append({"test": f"ICESat-2 pass-cell mean, pooled inputs (PIOMAS+CS2SMOS+TOPAZ4-ML), {region}",
-                         "estimate": "EngressNet (final)", "RMSE": x["RMSE of mean"], "bias": x["bias (est − IS2)"], "r": x["r"],
-                         "CRPS": x["CRPS"], "spread/error (+obs noise)": x["spread/error + obs noise"],
-                         "within-cell var / IS2": x["subgrid std ratio"]})
     return rows
 
 
