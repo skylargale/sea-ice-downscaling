@@ -2,23 +2,20 @@
 train_engressnet.py
 
 CLI entry point for EngressNet SIT downscaling training. Parses arguments
-(training/test years, patches vs. single sub-domain, sub-domain bounds,
-model/training hyperparameters, ...) and hands off to run_pipeline() in
-functions_engressnet.py, which does the actual data loading, training,
-evaluation, and figure generation.
+(training/test years, sub-domain bounds, model/training hyperparameters, ...)
+and hands off to run_pipeline() in functions_engressnet.py, which does the
+actual data loading, training, evaluation, and figure generation. The final
+model's flags are in recommended_config.md; the PBS templates are
+submit_engressnet_daily.sh (FOSI) and submit_engressnet_daily_mesa.sh (MESACLIP).
 
-Examples:
-    # Patch-based, as before, with an explicit train/test year split
-    python train_engressnet.py --train-years 1980-2005 --test-years 2006-2014 --patches
+Example (sub-domain must be inside the ML domain: lat 60-80, lon -190 to -140):
+    python train_engressnet.py --train-years 2000-2020 --test-years 2021 \\
+        --lat-min 60 --lat-max 75 --lon-min -182 --lon-max -151
 
-    # No patches: train directly on one lat/lon sub-domain (must be inside
-    # the ML domain: lat 60-80, lon -190 to -140), and also get a domain
-    # SIT time series for the test period
-    python train_engressnet.py --train-years 1980-2005 --test-years 2006-2014 \\
-        --no-patches --lat-min 65 --lat-max 72 --lon-min -170 --lon-max -155
-
-    # No year filter -> falls back to the original random 80/20 split
-    python train_engressnet.py --patches
+Flags of rejected experiments (patch mode, obs fine-tuning, CRPS/mean-MSE loss terms,
+softplus output floor, time context, aux inputs, cosine lr, noise-lr warm-up, windowed
+attention, wide final noise kernel, mult/add_feat noise, MC-dropout) were removed in the
+2026-11 cleanup; the pre-cleanup code is in scratch downscaling/archive/records/.
 """
 
 import argparse
@@ -54,26 +51,16 @@ def parse_args():
                         'the year split, e.g. "3-7" for March-July. Comma/range syntax like '
                         '--train-years. No wraparound (e.g. "11-2") support. Default: all months.')
 
-    # Patches vs. single sub-domain
-    patch_group = p.add_mutually_exclusive_group()
-    patch_group.add_argument("--patches", dest="use_patches", action="store_true", help="Use sliding-window patch extraction (default).")
-    patch_group.add_argument("--no-patches", dest="use_patches", action="store_false", help="Train on one full lat/lon sub-domain instead of patches.")
-    p.set_defaults(use_patches=True)
-
-    p.add_argument("--lat-min", type=float, default=None, help="Required with --no-patches.")
-    p.add_argument("--lat-max", type=float, default=None, help="Required with --no-patches.")
-    p.add_argument("--lon-min", type=float, default=None, help="Required with --no-patches.")
-    p.add_argument("--lon-max", type=float, default=None, help="Required with --no-patches.")
-
-    # Patch geometry (only used when --patches)
-    p.add_argument("--context-size", type=int, nargs=2, default=list(fe.DEFAULT_CONTEXT_SIZE), metavar=("H", "W"))
-    p.add_argument("--target-size", type=int, nargs=2, default=list(fe.DEFAULT_TARGET_SIZE), metavar=("H", "W"))
-    p.add_argument("--stride", type=int, default=fe.DEFAULT_STRIDE)
+    # Sub-domain (patch mode was removed in the 2026-11 cleanup; --no-patches is accepted and ignored)
+    p.add_argument("--no-patches", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--lat-min", type=float, required=True)
+    p.add_argument("--lat-max", type=float, required=True)
+    p.add_argument("--lon-min", type=float, required=True)
+    p.add_argument("--lon-max", type=float, required=True)
 
     # Model / training hyperparameters
-    # lr/k/batch_size defaults come from optimization/trial_results.csv trial 11 (best rmse,
-    # 0.1321, tied with trial 13) -- see the caveats in submit_engressnet.sh before trusting
-    # these blindly on top of the coastal-loss/ocean_frac changes made after that HPO run.
+    # lr/k/batch_size defaults come from an early (Version4) hyperparameter search; the final model
+    # overrides k (see recommended_config.md).
     p.add_argument("--k", type=int, default=9, help="Ensemble size during training.")
     p.add_argument("--num-epochs", type=int, default=20)
     p.add_argument("--batch-size", type=int, default=16)
@@ -89,88 +76,32 @@ def parse_args():
                    help="Power parameter of the energy-score loss (functions_engressnet.energy_loss). "
                         "Lowering below 1 shifts relative weight toward the ensemble-spread term vs. "
                         "the mean-accuracy term; default 1.0 matches prior behavior unchanged.")
-    p.add_argument("--attention-end", dest="attention_end", action="store_true",
-                   help="Sensitivity-test toggle: apply local windowed self-attention "
-                        "(WindowedSelfAttention2d) to the final 32-channel decoder feature map, "
-                        "after the mask+noise fusion. 'Sliding window' attention at the decoder "
-                        "end rather than the encoder. Default off = unchanged architecture.")
-    p.set_defaults(attention_end=False)
-    p.add_argument("--attn-window-size", type=int, default=8,
-                   help="Window size for --attention-end's local self-attention. No effect "
-                        "unless --attention-end is set.")
-    p.add_argument("--attn-num-heads", type=int, default=4,
-                   help="Number of attention heads for --attention-end (32 channels must be "
-                        "divisible by this). No effect unless --attention-end is set.")
     p.add_argument("--noise-channels", type=int, default=1,
-                   help="2026-09-17 sensitivity-test knob: number of independent noise channels "
-                        "drawn per decoder stage (see functions_engressnet.GaussianNoiseStage). "
-                        "Default 1, the settled value for this single-target-variable model -- "
-                        "not intended as a permanent per-run tuning parameter.")
+                   help="Appendix ablation (2026-09-17): number of independent noise channels drawn per "
+                        "decoder stage (see functions_engressnet.GaussianNoiseStage). Default 1 (final model).")
     p.add_argument("--noise-kernel-size", type=int, default=5,
-                   help="2026-09-17 sensitivity-test knob: fixed footprint (same at all four "
-                        "decoder stages) of each GaussianNoiseStage's correlating kernel. "
-                        "Default 5, the settled value -- not intended as a permanent per-run "
-                        "tuning parameter.")
+                   help="Appendix ablation (2026-09-17): fixed footprint (same at all four decoder stages) "
+                        "of each GaussianNoiseStage's correlating kernel. Default 5 (final model).")
     p.add_argument("--late-mask-fusion", dest="late_mask_fusion", action="store_true",
-                   help="2026-09-17 ablation-only toggle: reverts the final stage's land-mask "
-                        "concatenation to how every earlier version of this model did it -- "
-                        "after a noise-only fusion (and after --attention-end, if set) instead "
-                        "of before -- while keeping the per-stage noise cascade unchanged "
-                        "everywhere, including at the final stage. Isolates whether the "
-                        "mask-timing change or the noise-cascade change drives any observed "
-                        "difference. Default off = current architecture (mask folds in early). "
-                        "Not intended to stay in the codebase once that question is answered.")
+                   help="Appendix ablation (2026-09-17): concatenate the land mask after a noise-only "
+                        "final fusion (every earlier version of this model) instead of before it. "
+                        "Default off = final architecture.")
     p.set_defaults(late_mask_fusion=False)
     p.add_argument("--deterministic-mse", dest="deterministic_mse", action="store_true",
                    help="Train the same backbone as a deterministic baseline: all noise stages "
                         "zeroed, coastal-weighted MSE loss instead of the energy score, and "
                         "every evaluation member is the (identical) deterministic prediction.")
-    p.add_argument("--crps-weight", type=float, default=0.0,
-                   help="Add this multiple of the fair per-pixel ensemble CRPS (same coastal weights) "
-                        "to the energy-score loss, targeting per-pixel calibration. ~250 makes the two "
-                        "terms comparable for MESA. Default 0 = energy score only (unchanged).")
-    # 2026-09-29 obs-evaluation tests (observations/engressnet_obs_evaluation.ipynb); all default off.
+    # Final-model options (2026-09/10; all default off so older runs reproduce)
     p.add_argument("--noise-amp-map", dest="noise_amp_map", action="store_true",
-                   help="T2: per-pixel noise amplitude predicted from each decoder stage's features (state-dependent spread).")
+                   help="Per-pixel noise amplitude predicted from each decoder stage's features (state-dependent spread).")
     p.set_defaults(noise_amp_map=False)
     p.add_argument("--energy-patch-size", type=int, default=0,
-                   help="T2: score the energy term over ~N x N tiles instead of the whole field (0 = whole field).")
-    p.add_argument("--aux-path", default=None,
-                   help="T3: file with A(ensemble,time,channel,lat,lon) high-res predictor channels for training samples.")
-    p.add_argument("--test-aux-path", default=None, help="T3: same for the test samples (defaults to --aux-path).")
-    p.add_argument("--static-path", default=None, help="T3: file with S(channel,lat,lon) static high-res channels.")
-    p.add_argument("--time-context", type=int, default=0,
-                   help="T4: add the previous N days' predictors as extra input channels (0 = off).")
-    p.add_argument("--obs-ft-x-path", default=None, help="T1: predictors for observation fine-tuning (e.g. PIOMAS-obs X).")
-    p.add_argument("--obs-ft-target-path", default=None, help="T1: gridded observation target, ~1 deg blocks (time, 15, 31).")
-    p.add_argument("--obs-ft-weight", type=float, default=100.0, help="T1: weight of the observation block-CRPS step.")
-    # 2026-10-07 calibration options (all default off)
-    p.add_argument("--noise-kernel-size-final", type=int, default=None,
-                   help="Option 1b: wider noise-kernel footprint for the 0.1 deg (final) stage only, edge-safe padding.")
+                   help="Score the energy term over ~N x N tiles instead of the whole field (0 = whole field).")
     p.add_argument("--noise-lr-mult", type=float, default=1.0,
-                   help="Option 1: learning-rate multiplier for the noise scalars and amplitude-map heads.")
-    p.add_argument("--train-only-noise", dest="train_only_noise", action="store_true",
-                   help="Option 2: freeze everything except the noise scalars and amplitude-map heads.")
-    p.set_defaults(train_only_noise=False)
-    p.add_argument("--obs-ft-only", dest="obs_ft_only", action="store_true",
-                   help="Option 2: train only on the --obs-ft-* observation set (no CICE steps); a full-res target "
-                        "(time, H, W) is scored with per-cell CRPS where observed.")
-    p.set_defaults(obs_ft_only=False)
-    # 2026-10-17 ensemble-mean accuracy tests (default off)
+                   help="Learning-rate multiplier for the noise scalars and amplitude-map heads.")
     p.add_argument("--ema-decay", type=float, default=0.0,
                    help="Exponential moving average of the weights with this decay (e.g. 0.999); evaluation and the saved "
                         "checkpoint use the EMA weights (last-step weights saved as model_state_dict_last_step.pt). 0 = off.")
-    p.add_argument("--mean-mse-weight", type=float, default=0.0,
-                   help="Add this multiple of the coastal-weighted debiased ensemble-mean MSE, mean[(ens mean - y)^2 - var/K], "
-                        "to the energy score (does not reward smaller spread). 0 = off.")
-    p.add_argument("--lr-schedule", choices=["constant", "cosine"], default="constant",
-                   help="Per-step learning-rate schedule: constant (default, unchanged) or cosine decay to 1%% of the initial lr.")
-    p.add_argument("--noise-lr-warmup-epochs", type=int, default=0,
-                   help="With --noise-lr-mult: keep the noise parameters at the base lr for this many epochs first. 0 = off.")
-    p.add_argument("--output-floor", choices=["clamp", "softplus"], default="clamp",
-                   help="How physical thickness is kept >= 0: 'clamp' (default, at evaluation only) or 'softplus' (smooth floor "
-                        "applied in the training loss and at evaluation, 2026-10-08).")
-    p.add_argument("--output-floor-scale", type=float, default=0.02, help="Softplus floor scale in metres (default 0.02).")
     p.add_argument("--coarse-zero", action="store_true",
                    help="2026-10-23: at evaluation, set members to exactly 0 on ocean cells whose bilinear coarse SIT is exactly 0 "
                         "(the area-mean coarse input is 0 only where the high-res truth is 0). Training is unchanged. Off by default.")
@@ -201,22 +132,32 @@ def parse_args():
                         "channel counts (see functions_engressnet.collapse_wind_vector_channel).")
     p.set_defaults(collapse_wind_vector=False)
 
+    # 2026-11 co-author revisions. Every default reproduces the earlier pipeline exactly; the final model (FINAL2)
+    # uses --train-random-days 1825 --random-days-seed 0 over --train-years 2000-2020.
+    p.add_argument("--train-random-days", type=int, default=0,
+                   help="F: train on this many random dates drawn from --train-years (the pool; --test-years excluded) instead "
+                        "of every date in --train-years. All members of each chosen date are used. 0 = off (default).")
+    p.add_argument("--random-days-seed", type=int, default=None,
+                   help="F: seed for the random date draw (default: --seed, so each seed draws its own dates).")
+    p.add_argument("--grad-accum-steps", type=int, default=1,
+                   help="Split each batch into this many equal chunks (forward/backward per chunk, one optimizer step): same "
+                        "gradient, less GPU memory. 1 = off (default).")
+    p.add_argument("--random-days-exclude-years", default=None,
+                   help="With --train-random-days: years excluded from the date pool (default: --test-years). Inference of a "
+                        "random-days model on other test years must pass the training run's test years here (e.g. 2021).")
+    p.add_argument("--noise-ablate", default="",
+                   help="H.1: comma-separated noise stages to switch off at inference only (d3,d2,d1,final). Empty = none.")
+
     args = p.parse_args()
 
-    if not args.use_patches:
-        missing = [name for name in ("lat_min", "lat_max", "lon_min", "lon_max") if getattr(args, name) is None]
-        if missing:
-            flags = ", ".join("--" + m.replace("_", "-") for m in missing)
-            p.error(f"--no-patches requires {flags}")
+    if args.train_random_days and not (args.train_years and args.test_years):
+        p.error("--train-random-days needs --train-years (the pool) and --test-years")
 
     if bool(args.test_x_path) != bool(args.test_y_path):
         p.error("--test-x-path and --test-y-path must be given together.")
     if args.test_x_path and not (args.train_years and args.test_years):
         p.error("--test-x-path/--test-y-path (cross-dataset evaluation) requires both "
                 "--train-years and --test-years.")
-
-    if args.attention_end and 32 % args.attn_num_heads != 0:
-        p.error(f"--attn-num-heads ({args.attn_num_heads}) must divide the decoder's 32 channels.")
 
     return args
 
@@ -238,12 +179,10 @@ def main():
         run_tag = f"{job_name}_{job_tag}"
     output_dir = args.output_dir or os.path.join(fe.DEFAULT_RESULTS_DIR, run_tag)
 
-    subdomain = None
-    if not args.use_patches:
-        subdomain = {
-            "lat_min": args.lat_min, "lat_max": args.lat_max,
-            "lon_min": args.lon_min, "lon_max": args.lon_max,
-        }
+    subdomain = {
+        "lat_min": args.lat_min, "lat_max": args.lat_max,
+        "lon_min": args.lon_min, "lon_max": args.lon_max,
+    }
 
     config = argparse.Namespace(
         x_path=x_path,
@@ -254,11 +193,8 @@ def main():
         weighted_grids_dir=args.weighted_grids_dir,
         bbox=fe.DEFAULT_BBOX,
         bbox_regrid=fe.DEFAULT_BBOX_REGRID,
-        use_patches=args.use_patches,
+        use_patches=False,
         subdomain=subdomain,
-        context_size=tuple(args.context_size),
-        target_size=tuple(args.target_size),
-        stride=args.stride,
         train_years=fe.parse_years(args.train_years),
         test_years=fe.parse_years(args.test_years),
         train_frac=args.train_frac,
@@ -270,14 +206,10 @@ def main():
         coastal_width=args.coastal_width,
         coastal_boost=args.coastal_boost,
         beta=args.beta,
-        attention_end=args.attention_end,
-        attn_window_size=args.attn_window_size,
-        attn_num_heads=args.attn_num_heads,
         noise_channels=args.noise_channels,
         noise_kernel_size=args.noise_kernel_size,
         late_mask_fusion=args.late_mask_fusion,
         deterministic_mse=args.deterministic_mse,
-        crps_weight=args.crps_weight,
         k_eval=args.k_eval,
         eval_batch_size=args.eval_batch_size,
         make_figures=args.make_figures,
@@ -287,24 +219,14 @@ def main():
         collapse_wind_vector=args.collapse_wind_vector,
         noise_amp_map=args.noise_amp_map,
         energy_patch_size=args.energy_patch_size,
-        aux_path=args.aux_path,
-        test_aux_path=args.test_aux_path,
-        static_path=args.static_path,
-        time_context=args.time_context,
-        obs_ft_x_path=args.obs_ft_x_path,
-        obs_ft_target_path=args.obs_ft_target_path,
-        obs_ft_weight=args.obs_ft_weight,
-        noise_kernel_size_final=args.noise_kernel_size_final,
         noise_lr_mult=args.noise_lr_mult,
-        train_only_noise=args.train_only_noise,
-        obs_ft_only=args.obs_ft_only,
-        output_floor=args.output_floor,
-        output_floor_scale=args.output_floor_scale,
         coarse_zero=args.coarse_zero,
         ema_decay=args.ema_decay,
-        mean_mse_weight=args.mean_mse_weight,
-        lr_schedule=args.lr_schedule,
-        noise_lr_warmup_epochs=args.noise_lr_warmup_epochs,
+        train_random_days=args.train_random_days,
+        random_days_seed=args.random_days_seed,
+        noise_ablate=[s.strip() for s in args.noise_ablate.split(",") if s.strip()],
+        grad_accum_steps=args.grad_accum_steps,
+        random_days_exclude_years=fe.parse_years(args.random_days_exclude_years) if args.random_days_exclude_years else None,
     )
 
     fe.run_pipeline(config)

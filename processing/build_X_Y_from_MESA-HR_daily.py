@@ -1,4 +1,4 @@
-"""Auto-generated from build_X_Y_from_MESA-HR_daily.ipynb. Do not hand-edit; edit the notebook and regenerate."""
+"""Production build script, run by submit_build_X_Y_from_MESA-HR_daily.sh (the matching .ipynb was older and was retired 2026-11-13)."""
 
 import glob
 import torch
@@ -453,7 +453,7 @@ for method in ("interp", "avg"):
     X_ds = X_ds.transpose("ensemble", "time", "channel", "lat", "lon")  # arrange dimensions
 
     # Save
-    save_path = f"/glade/derecho/scratch/skygale/downscaling/X_MESA_HR_HIST_daily_{method}.nc"
+    save_path = f"/glade/derecho/scratch/skygale/downscaling/training_data/mesa_hist_1920-2005/X_MESA_HR_HIST_daily_{method}.nc"
     X_ds.to_netcdf(save_path)
     print("\nSaved to:", save_path)
 
@@ -523,15 +523,15 @@ Y_ds.attrs["variables"] = (
 )
 
 # Save
-save_path = "/glade/derecho/scratch/skygale/downscaling/Y_MESA_HR_HIST_daily.nc"
+save_path = "/glade/derecho/scratch/skygale/downscaling/training_data/mesa_hist_1920-2005/Y_MESA_HR_HIST_daily.nc"
 Y_ds.to_netcdf(save_path)
 print("\nSaved to:", save_path)
 
 # ### 5. Check shapes
 
-X1 = xr.open_dataset('/glade/derecho/scratch/skygale/downscaling/X_MESA_HR_HIST_daily_interp.nc').X
-X2 = xr.open_dataset('/glade/derecho/scratch/skygale/downscaling/X_MESA_HR_HIST_daily_avg.nc').X
-Y = xr.open_dataset('/glade/derecho/scratch/skygale/downscaling/Y_MESA_HR_HIST_daily.nc').Y
+X1 = xr.open_dataset('/glade/derecho/scratch/skygale/downscaling/training_data/mesa_hist_1920-2005/X_MESA_HR_HIST_daily_interp.nc').X
+X2 = xr.open_dataset('/glade/derecho/scratch/skygale/downscaling/training_data/mesa_hist_1920-2005/X_MESA_HR_HIST_daily_avg.nc').X
+Y = xr.open_dataset('/glade/derecho/scratch/skygale/downscaling/training_data/mesa_hist_1920-2005/Y_MESA_HR_HIST_daily.nc').Y
 
 print(X1.shape, X2.shape, Y.shape)
 

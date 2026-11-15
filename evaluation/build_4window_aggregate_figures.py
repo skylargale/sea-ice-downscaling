@@ -23,8 +23,8 @@ additional averaging step and much cheaper than re-deriving it from raw FFTs.
 
 Usage:
     python evaluation/build_4window_aggregate_figures.py \\
-        --batch-dir results/MESA_stochastic_refine_sweep_avg_sharedbias \\
-        --save-dir evaluation/saved_figs/MESA_stochastic_refine_sweep_avg_sharedbias/_4window_aggregate
+        --batch-dir results/MESA_final_ema \\
+        --save-dir evaluation/saved_figs/MESA_final_ema/_4window_aggregate
 """
 import argparse
 import glob

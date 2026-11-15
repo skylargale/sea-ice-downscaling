@@ -10,3 +10,8 @@ optimization/log.txt
 .member_metrics_cache.json
 .member_rmse_cache.json
 
+# generated figure outputs (made by figures/v2/make_v2_figures.ipynb; not versioned)
+*.png
+*.csv
+figures/v2/data_*/
+figures/v2/final_results_table.*

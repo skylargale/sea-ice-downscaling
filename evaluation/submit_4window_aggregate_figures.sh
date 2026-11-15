@@ -9,7 +9,7 @@
 # memory guarantee at all.
 #
 # Submit with:
-#   qsub -v BATCH_DIR="results/MESA_stochastic_refine_sweep_avg_sharedbias" submit_4window_aggregate_figures.sh
+#   qsub -v BATCH_DIR="results/MESA_final_ema" submit_4window_aggregate_figures.sh
 # ==============================================================
 
 #PBS -N agg_4window
@@ -24,7 +24,7 @@
 
 set -euo pipefail
 
-BATCH_DIR="${BATCH_DIR:?Must set BATCH_DIR, e.g. -v BATCH_DIR=results/MESA_stochastic_refine_sweep_avg_sharedbias}"
+BATCH_DIR="${BATCH_DIR:?Must set BATCH_DIR, e.g. -v BATCH_DIR=results/MESA_final_ema}"
 
 module load conda
 conda activate seaice-downscaling

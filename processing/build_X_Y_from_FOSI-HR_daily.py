@@ -1,4 +1,4 @@
-"""Auto-generated from build_X_Y_from_FOSI-HR_daily.ipynb. Do not hand-edit; edit the notebook and regenerate."""
+"""Production build script, run by submit_build_X_Y_from_FOSI-HR_daily.sh (the matching .ipynb was older and was retired 2026-11-13)."""
 
 # # Build perfect-model X/Y from FOSI_BGC HR (prescribed-atmosphere t13 run), daily
 #
@@ -430,7 +430,7 @@ for method in regridders_ice:
 
     X_ds = X_ds.transpose("ensemble", "time", "channel", "lat", "lon")
 
-    save_path = f"/glade/derecho/scratch/skygale/downscaling/X_{run_name}_{method}.nc"
+    save_path = f"/glade/derecho/scratch/skygale/downscaling/training_data/X_{run_name}_{method}.nc"
     X_ds.to_netcdf(save_path)
     print("Saved to:", save_path)
 
@@ -459,7 +459,7 @@ Y_ds.attrs["created_by"] = "Sky Gale"
 Y_ds.attrs["date_created"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 Y_ds.attrs["variables"] = "hi_d: sea ice thickness (m)"
 
-save_path = f"/glade/derecho/scratch/skygale/downscaling/Y_{run_name}.nc"
+save_path = f"/glade/derecho/scratch/skygale/downscaling/training_data/Y_{run_name}.nc"
 Y_ds.to_netcdf(save_path)
 print("Saved to:", save_path)
 
@@ -469,9 +469,9 @@ print("Saved to:", save_path)
 # `ensemble` differs: 1 vs 10), plus a tight-domain wind quiver check zoomed to the actual
 # regional bbox so individual arrows are visible rather than rendering as solid texture.
 
-X_interp = xr.open_dataset(f"/glade/derecho/scratch/skygale/downscaling/X_{run_name}_interp.nc").X
-X_avg = xr.open_dataset(f"/glade/derecho/scratch/skygale/downscaling/X_{run_name}_avg.nc").X
-Y_check = xr.open_dataset(f"/glade/derecho/scratch/skygale/downscaling/Y_{run_name}.nc").Y
+X_interp = xr.open_dataset(f"/glade/derecho/scratch/skygale/downscaling/training_data/X_{run_name}_interp.nc").X
+X_avg = xr.open_dataset(f"/glade/derecho/scratch/skygale/downscaling/training_data/X_{run_name}_avg.nc").X
+Y_check = xr.open_dataset(f"/glade/derecho/scratch/skygale/downscaling/training_data/Y_{run_name}.nc").Y
 print("X interp:", X_interp.shape, X_interp.channel.values)
 print("X avg:   ", X_avg.shape, X_avg.channel.values)
 print("Y:       ", Y_check.shape)
@@ -500,7 +500,7 @@ try:
     ax.quiver(lon2d, lat2d, u, v, transform=ccrs.PlateCarree())
     ax.set_title(f"JRA55 wind (true east/north, avg method), t={t}")
 
-    fig_path = f"/glade/derecho/scratch/skygale/downscaling/{run_name}_wind_check.png"
+    fig_path = f"/glade/derecho/scratch/skygale/downscaling/training_data/{run_name}_wind_check.png"
     fig.savefig(fig_path, dpi=150, bbox_inches="tight")
     print("Wind check figure saved to:", fig_path)
 except Exception as exc:

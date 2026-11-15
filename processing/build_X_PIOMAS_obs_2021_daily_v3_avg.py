@@ -49,10 +49,11 @@ CDR_START = os.environ.get("CDR_START", "1979-01-01")
 CDR_END = os.environ.get("CDR_END", "2021-12-31")
 FILE_TAG = os.environ.get("FILE_TAG", "")  # 2026-09-29: e.g. "_cdrv6" so the 2010-2023 rebuild doesn't overwrite existing years
 JRA55_DIR = "/glade/p/cesmdata/cseg/inputdata/ocn/jra55/v1.5_noleap"
-V2_X_PATH = f"/glade/derecho/scratch/skygale/downscaling/X_PIOMAS_obs_{YEAR}{FILE_TAG}_daily_v2_interp.nc"
-FOSI_AVG_X_PATH = "/glade/derecho/scratch/skygale/downscaling/X_FOSI_HR_JRA55_daily_avg.nc"
+V2_X_PATH = f"/glade/derecho/scratch/skygale/downscaling/application_inputs/piomas_2010-2023/X_PIOMAS_obs_{YEAR}{FILE_TAG}_daily_v2_interp.nc"
+FOSI_AVG_X_PATH = "/glade/derecho/scratch/skygale/downscaling/training_data/X_FOSI_HR_JRA55_daily_avg.nc"
 WEIGHTED_GRIDS_DIR = "/glade/work/skygale/projects/SeaIceDownscaling/weighted_grids"
-OUT_DIR = "/glade/derecho/scratch/skygale/downscaling"
+OUT_DIR = "/glade/derecho/scratch/skygale/downscaling/training_data"  # FOSI training files read for the land mask / coastfill
+PIOMAS_DIR = "/glade/derecho/scratch/skygale/downscaling/application_inputs/piomas_2010-2023"  # per-year PIOMAS-input X/Y
 
 NLAT, NLON = 120, 360
 
@@ -289,8 +290,8 @@ X_new.attrs["description"] = (
 )
 X_new.attrs["regrid_method"] = "avg (conservative)"
 X_new.attrs["date_created"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-save_path = (f"{OUT_DIR}/X_PIOMAS_obs_{YEAR}{FILE_TAG}_daily_v4_avg_coastfill.nc" if COAST_FILL
-             else f"{OUT_DIR}/X_PIOMAS_obs_{YEAR}{FILE_TAG}_daily_v3_avg.nc")
+save_path = (f"{PIOMAS_DIR}/X_PIOMAS_obs_{YEAR}{FILE_TAG}_daily_v4_avg_coastfill.nc" if COAST_FILL
+             else f"{PIOMAS_DIR}/X_PIOMAS_obs_{YEAR}{FILE_TAG}_daily_v3_avg.nc")
 if COAST_FILL:
     X_new.attrs["description"] += (" v4: PIOMAS-land/FOSI-ocean coastal cells in hi_d filled from neighbouring "
                                    "PIOMAS cells instead of 0 (PIOMAS_COAST_FILL=1).")

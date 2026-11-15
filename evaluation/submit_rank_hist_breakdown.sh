@@ -1,6 +1,6 @@
 #!/bin/bash
-# Open-water/frazil CRPS breakdown (rank_hist_breakdown.py).
-# Submit with: qsub -v BATCH_DIRS="results/A results/B" submit_open_water_crps_breakdown.sh
+# Rank histograms by regime (rank_hist_breakdown.py).
+# Submit with: qsub -v BATCH_DIRS="results/A results/B" submit_rank_hist_breakdown.sh
 #PBS -N rank_bd
 #PBS -A P93300065
 #PBS -q casper

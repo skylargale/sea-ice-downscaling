@@ -20,7 +20,7 @@ python -u evaluation/recompute_ocean_metrics.py --out-dir $C $B || echo "!!!!! r
 python -u evaluation/recompute_spread_skill.py --out-dir $C $B || echo "!!!!! recompute_spread_skill failed"
 python -u evaluation/summarize_ensmean_sweep.py > /dev/null || echo "!!!!! summarize failed"
 for D in FOSI MESA; do
-    python -u evaluation/compare_output_floor.py results/${D}_final_ema > $C/coarse_zero_final_${D}_regimes.txt 2>&1 || echo "!!!!! compare $D failed"
+    python -u evaluation/regime_table.py results/${D}_final_ema > $C/coarse_zero_final_${D}_regimes.txt 2>&1 || echo "!!!!! compare $D failed"
     PYTHONPATH=evaluation python -u evaluation/rank_hist_breakdown.py results/${D}_final_ema > $C/coarse_zero_final_${D}_rank_hist.txt 2>&1 || echo "!!!!! rank hist $D failed"
 done
 cat $C/coarse_zero_final_FOSI_regimes.txt $C/coarse_zero_final_FOSI_rank_hist.txt $C/coarse_zero_final_MESA_regimes.txt \

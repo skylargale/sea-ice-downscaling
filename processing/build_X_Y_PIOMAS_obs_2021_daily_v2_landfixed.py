@@ -34,9 +34,10 @@ YEAR = int(os.environ.get("PIOMAS_YEAR", "2021"))  # 2026-09-24: year overridabl
 IO_MASK_PATH = "/glade/derecho/scratch/skygale/observations/PIOMAS_daily/utilities/io.dat_360_120.output"
 PIOMAS_DAILY_PATH = f"/glade/derecho/scratch/skygale/observations/PIOMAS_daily/PIOMAS_hiday_{YEAR}.nc"
 FILE_TAG = os.environ.get("FILE_TAG", "")  # 2026-09-29: e.g. "_cdrv6" so the 2010-2023 rebuild doesn't overwrite existing years
-OLD_X_PATH = f"/glade/derecho/scratch/skygale/downscaling/X_PIOMAS_obs_{YEAR}{FILE_TAG}_daily_interp.nc"
+OLD_X_PATH = f"/glade/derecho/scratch/skygale/downscaling/application_inputs/piomas_2010-2023/X_PIOMAS_obs_{YEAR}{FILE_TAG}_daily_interp.nc"
 WEIGHTED_GRIDS_DIR = "/glade/work/skygale/projects/SeaIceDownscaling/weighted_grids"
-OUT_DIR = "/glade/derecho/scratch/skygale/downscaling"
+OUT_DIR = "/glade/derecho/scratch/skygale/downscaling/training_data"  # FOSI training files read for the land mask / coastfill
+PIOMAS_DIR = "/glade/derecho/scratch/skygale/downscaling/application_inputs/piomas_2010-2023"  # per-year PIOMAS-input X/Y
 
 bbox_regrid = {"lon_min": -200, "lon_max": -130, "lat_min": 55, "lat_max": 85}
 lon_min_regrid = bbox_regrid["lon_min"] % 360
@@ -145,7 +146,7 @@ X_new.attrs["description"] = (
 )
 X_new.attrs["date_created"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-save_path_X = f"{OUT_DIR}/X_PIOMAS_obs_{YEAR}{FILE_TAG}_daily_v2_interp.nc"
+save_path_X = f"{PIOMAS_DIR}/X_PIOMAS_obs_{YEAR}{FILE_TAG}_daily_v2_interp.nc"
 X_new.to_netcdf(save_path_X)
 print("Saved X to:", save_path_X)
 
@@ -164,7 +165,7 @@ Y_ds.attrs["description"] = (
 )
 Y_ds.attrs["date_created"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-save_path_Y = f"{OUT_DIR}/Y_PIOMAS_obs_{YEAR}{FILE_TAG}_daily_v2.nc"
+save_path_Y = f"{PIOMAS_DIR}/Y_PIOMAS_obs_{YEAR}{FILE_TAG}_daily_v2.nc"
 Y_ds.to_netcdf(save_path_Y)
 print("Saved Y to:", save_path_Y)
 

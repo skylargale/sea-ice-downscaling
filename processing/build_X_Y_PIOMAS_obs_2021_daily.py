@@ -41,7 +41,8 @@ CDR_END = os.environ.get("CDR_END", "2021-12-31")
 JRA55_DIR = "/glade/p/cesmdata/cseg/inputdata/ocn/jra55/v1.5_noleap"
 
 WEIGHTED_GRIDS_DIR = "/glade/work/skygale/projects/SeaIceDownscaling/weighted_grids"
-OUT_DIR = "/glade/derecho/scratch/skygale/downscaling"
+OUT_DIR = "/glade/derecho/scratch/skygale/downscaling/training_data"  # FOSI training files read for the land mask / coastfill
+PIOMAS_DIR = "/glade/derecho/scratch/skygale/downscaling/application_inputs/piomas_2010-2023"  # per-year PIOMAS-input X/Y
 
 bbox_regrid = {"lon_min": -200, "lon_max": -130, "lat_min": 55, "lat_max": 85}
 lon_min_regrid = bbox_regrid["lon_min"] % 360
@@ -207,7 +208,7 @@ X_ds.attrs["variables"] = (
 )
 X_ds = X_ds.transpose("ensemble", "time", "channel", "lat", "lon")
 
-save_path_X = f"{OUT_DIR}/X_{run_name}_interp.nc"
+save_path_X = f"{PIOMAS_DIR}/X_{run_name}_interp.nc"
 X_ds.to_netcdf(save_path_X)
 print("Saved X to:", save_path_X)
 
@@ -225,7 +226,7 @@ Y_ds.attrs["created_by"] = "Sky Gale"
 Y_ds.attrs["date_created"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 Y_ds.attrs["variables"] = "hi_d: PIOMAS v2.1 daily sea ice thickness (m)"
 
-save_path_Y = f"{OUT_DIR}/Y_{run_name}.nc"
+save_path_Y = f"{PIOMAS_DIR}/Y_{run_name}.nc"
 Y_ds.to_netcdf(save_path_Y)
 print("Saved Y to:", save_path_Y)
 

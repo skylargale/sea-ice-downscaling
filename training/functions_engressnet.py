@@ -2,18 +2,16 @@
 functions_engressnet.py
 
 Shared functions for EngressNet SIT downscaling: data loading, land-sea
-masking, patch extraction (or single sub-domain cropping when patches are
-disabled), the stochastic UNet model, training/evaluation loops, metrics,
-figure generation, and the domain SIT time series output.
+masking, sub-domain cropping, the stochastic UNet model, training/evaluation
+loops, metrics, figure generation, and the domain SIT time series output.
 
-Imported by train_engressnet.py and hpo_engressnet.py -- run_pipeline() is
-the single entry point both scripts call, so the full pipeline only lives
-in one place.
+Imported by train_engressnet.py (CLI) -- run_pipeline() is the single entry
+point, so the full pipeline only lives in one place. Evaluation scripts import
+the metrics, plotting and grid helpers.
 """
 
 import datetime
 import json
-import math
 import os
 import pickle
 import re
@@ -25,7 +23,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import torch.utils.checkpoint as torch_checkpoint
 import xarray as xr
 import xesmf as xe
 import pop_tools
@@ -43,7 +40,7 @@ warnings.filterwarnings("ignore", message=r"Latitude is outside of \[-90, 90\]")
 # Defaults (all overridable via the config object passed to run_pipeline)
 # ==============================================================
 
-DEFAULT_DATA_DIR = "/glade/derecho/scratch/skygale/downscaling"
+DEFAULT_DATA_DIR = "/glade/derecho/scratch/skygale/downscaling/training_data"
 DEFAULT_X_PATH = os.path.join(DEFAULT_DATA_DIR, "X_FOSI_HR_JRA55_interp.nc")
 DEFAULT_Y_PATH = os.path.join(DEFAULT_DATA_DIR, "Y_FOSI_HR_JRA55.nc")
 DEFAULT_WEIGHTED_GRIDS_DIR = "/glade/work/skygale/projects/SeaIceDownscaling/weighted_grids"
@@ -65,11 +62,6 @@ CANDIDATE_POINTS = {
     "Point Hope": {"lat": 68.3415, "lon": -166.7578 % 360},
 }
 
-DEFAULT_CONTEXT_SIZE = (16, 24)
-DEFAULT_TARGET_SIZE = (8, 12)
-DEFAULT_STRIDE = 4
-
-
 def save_run_config(config):
     """
     Write the full run config to <output_dir>/run_config.json (machine-
@@ -88,11 +80,8 @@ def save_run_config(config):
     with open(os.path.join(config.output_dir, "run_config.json"), "w") as f:
         json.dump(cfg_dict, f, indent=2, default=str)
 
-    if config.use_patches:
-        domain_desc = f"patches (context {tuple(config.context_size)}, target {tuple(config.target_size)}, stride {config.stride})"
-    else:
-        sd = config.subdomain
-        domain_desc = f"no-patches sub-domain (lat {sd['lat_min']} to {sd['lat_max']}, lon {sd['lon_min']} to {sd['lon_max']})"
+    sd = config.subdomain
+    domain_desc = f"sub-domain (lat {sd['lat_min']} to {sd['lat_max']}, lon {sd['lon_min']} to {sd['lon_max']})"
 
     train_desc = ",".join(str(y) for y in config.train_years) if config.train_years else f"random {config.train_frac:.0%} split"
     test_desc = ",".join(str(y) for y in config.test_years) if config.test_years else f"random {1 - config.train_frac:.0%} split"
@@ -225,7 +214,21 @@ def months_mask(time_coord, months):
     return np.array([int(m) in months_set for m in time_months])
 
 
-def split_train_test(X, Y, time_coord, train_years, test_years, train_frac, seed=0, months=None):
+def random_train_day_mask(time_coord, pool_years, test_years, n_days, seed):
+    """2026-11 revisions, F (randomized-in-time training): boolean mask over time_coord selecting n_days distinct dates
+    drawn uniformly without replacement from pool_years, never from test_years. All ensemble members of a chosen date
+    are used (as in the contiguous windows). The draw depends only on (seed, pool, n_days)."""
+    pool = years_mask(time_coord, pool_years) & ~years_mask(time_coord, test_years)
+    idx = np.flatnonzero(pool)
+    if n_days > idx.size:
+        raise ValueError(f"train_random_days={n_days} exceeds the {idx.size} pool dates")
+    chosen = np.sort(np.random.default_rng(seed).choice(idx, size=int(n_days), replace=False))
+    mask = np.zeros(len(time_coord), dtype=bool)
+    mask[chosen] = True
+    return mask
+
+
+def split_train_test(X, Y, time_coord, train_years, test_years, train_frac, seed=0, months=None, train_mask_override=None):
     """
     Split X, Y (numpy arrays, shape (N, T, C, H, W) / (N, T, Cy, Hh, Wh))
     into train/test sets, either by explicit year lists (train_years /
@@ -251,6 +254,8 @@ def split_train_test(X, Y, time_coord, train_years, test_years, train_frac, seed
         X = X[:, month_mask_t]
         Y = Y[:, month_mask_t]
         time_coord = time_coord[month_mask_t]
+        if train_mask_override is not None:
+            train_mask_override = np.asarray(train_mask_override)[month_mask_t]
 
     N, T, C, H, W = X.shape
     _, _, Cy, Hy, Wy = Y.shape
@@ -260,7 +265,8 @@ def split_train_test(X, Y, time_coord, train_years, test_years, train_frac, seed
         if train_years is None or test_years is None:
             raise ValueError("Provide both train_years and test_years, or neither (for a random split).")
 
-        train_mask_t = years_mask(time_coord, train_years)
+        # train_mask_override (2026-11, F): explicit training dates (random_train_day_mask); None = by year (unchanged)
+        train_mask_t = years_mask(time_coord, train_years) if train_mask_override is None else np.asarray(train_mask_override, bool)
         test_mask_t = years_mask(time_coord, test_years)
 
         if not train_mask_t.any():
@@ -307,7 +313,7 @@ def split_train_test(X, Y, time_coord, train_years, test_years, train_frac, seed
     return X_train, Y_train, X_test, Y_test, time_train, time_test, member_train, member_test
 
 
-def select_by_years(X, Y, time_coord, years, months=None):
+def select_by_years(X, Y, time_coord, years, months=None, train_mask_override=None):
     """
     One-sided counterpart to split_train_test: restrict X, Y (numpy arrays,
     shape (N, T, C, H, W) / (N, T, Cy, Hy, Wy)) to timestamps matching
@@ -330,12 +336,16 @@ def select_by_years(X, Y, time_coord, years, months=None):
         X = X[:, month_mask_t]
         Y = Y[:, month_mask_t]
         time_coord = time_coord[month_mask_t]
+        if train_mask_override is not None:
+            train_mask_override = np.asarray(train_mask_override)[month_mask_t]
 
     N, T, C, H, W = X.shape
     _, _, Cy, Hy, Wy = Y.shape
     time_vals = time_coord.values
 
-    mask_t = years_mask(time_coord, years)
+    # train_mask_override (2026-11): explicit training dates (random_train_day_mask), so inference with --test-x-path
+    # normalizes with exactly the training days of a --train-random-days model. None = by year (unchanged).
+    mask_t = years_mask(time_coord, years) if train_mask_override is None else np.asarray(train_mask_override, bool)
     if not mask_t.any():
         raise ValueError(f"No timestamps in the data match the requested years {years}.")
 
@@ -583,67 +593,6 @@ def plot_domain_diagnostic(output_dir, bbox, llat, llon, hlat, hlon, land_mask, 
 # Patch extraction (sliding-window) and single sub-domain cropping
 # ==============================================================
 
-def extract_patches(X, Y, land_mask, context_size, target_size, stride, llon=None, llat=None, hlon=None, hlat=None):
-    """
-    llon/llat/hlon/hlat are optional 1D coordinate arrays for the low-res (X)
-    and high-res (Y) grids. When supplied, the function additionally returns
-    tile_ids (which tile each output patch came from) and tile_geometry (the
-    lon/lat slice for each tile's context and target windows), so a later
-    patch index can be mapped back to real map coordinates -- used by the
-    ensemble/error figures to plot patches on a cartopy projection.
-    """
-    N, C, H, W = X.shape
-    _, C_out, H_hi, W_hi = Y.shape
-    context_h, context_w = context_size
-    target_h, target_w = target_size
-
-    if context_h > H or context_w > W:
-        raise ValueError(f"Context size {context_size} exceeds LR grid size ({H}, {W})")
-    if target_h > context_h or target_w > context_w:
-        raise ValueError(f"Target size {target_size} must be <= context size {context_size}")
-
-    scale_y = H_hi / H
-    scale_x = W_hi / W
-    pad_h = (context_h - target_h) // 2
-    pad_w = (context_w - target_w) // 2
-
-    tiles = []
-    for i in range(0, H - context_h + 1, stride):
-        for j in range(0, W - context_w + 1, stride):
-            y0 = round((i + pad_h) * scale_y)
-            x0 = round((j + pad_w) * scale_x)
-            y1 = y0 + int(round(target_h * scale_y))
-            x1 = x0 + int(round(target_w * scale_x))
-            mask_patch = land_mask[0, :, y0:y1, x0:x1]  # (C_mask, target_h, target_w)
-            tiles.append((i, j, y0, x0, y1, x1, mask_patch))
-
-    X_patches, Y_patches, mask_patches, tile_ids = [], [], [], []
-    for n_ in range(N):
-        for t_idx, (i, j, y0, x0, y1, x1, mask_patch) in enumerate(tiles):
-            X_patches.append(X[n_, :, i:i + context_h, j:j + context_w])
-            Y_patches.append(Y[n_, :, y0:y1, x0:x1])
-            mask_patches.append(mask_patch)
-            tile_ids.append(t_idx)
-
-    X_patches = torch.stack(X_patches)
-    Y_patches = torch.stack(Y_patches)
-    mask_patches = torch.stack(mask_patches)
-    tile_ids = torch.tensor(tile_ids, dtype=torch.long)
-
-    tile_geometry = None
-    if llon is not None and llat is not None and hlon is not None and hlat is not None:
-        tile_geometry = []
-        for (i, j, y0, x0, y1, x1, _mask_patch) in tiles:
-            tile_geometry.append({
-                "context_lon": llon[j:j + context_w],
-                "context_lat": llat[i:i + context_h],
-                "target_lon": hlon[x0:x1],
-                "target_lat": hlat[y0:y1],
-            })
-
-    return X_patches, Y_patches, mask_patches, tile_ids, tile_geometry
-
-
 def validate_subdomain(subdomain, bbox):
     if subdomain["lat_min"] >= subdomain["lat_max"]:
         raise ValueError("subdomain lat_min must be < lat_max")
@@ -685,7 +634,7 @@ def crop_indices(coord_1d, lo, hi):
 
 def extract_full_domain(X, Y, land_mask, llon, llat, hlon, hlat, subdomain, divisor=8):
     """
-    No-patch alternative to extract_patches(): crop X, Y and land_mask to
+    Crop X, Y and land_mask to
     `subdomain` and treat every sample's full cropped field as one
     training/eval example (instead of tiling). Returns the same signature
     as extract_patches so the rest of the pipeline (model, training loop,
@@ -805,14 +754,10 @@ class GaussianNoiseStage(nn.Module):
     permanent tuning parameter.)
     """
 
-    def __init__(self, channels=1, kernel_size=5, init_width=1.5, init_sigma=1.0, pad_valid=False):
+    def __init__(self, channels=1, kernel_size=5, init_width=1.5, init_sigma=1.0):
         super().__init__()
         self.channels = channels
         self.kernel_size = kernel_size
-        # pad_valid (2026-10-07, calibration option 1b): draw the white noise on a (H+k-1, W+k-1) grid and convolve
-        # without padding, so a wide kernel has no zero-padding variance loss near the domain edges. Default False =
-        # unchanged ("same" zero padding).
-        self.pad_valid = pad_valid
         self.log_width = nn.Parameter(torch.log(torch.expm1(torch.tensor(float(init_width)))))
         self.log_sigma = nn.Parameter(torch.log(torch.expm1(torch.tensor(float(init_sigma)))))
         coords = torch.arange(kernel_size, dtype=torch.float32) - kernel_size // 2
@@ -827,16 +772,13 @@ class GaussianNoiseStage(nn.Module):
         return kernel2d.view(1, 1, self.kernel_size, self.kernel_size)
 
     def forward(self, batch_size, height, width, device, dtype, deterministic=False, amp=None):
-        if deterministic:
+        # `disabled` (2026-11 revisions, H.1 --noise-ablate): a plain attribute, not a parameter or buffer, set only at
+        # inference to switch this one stage's noise off. Absent / False = unchanged.
+        if deterministic or getattr(self, "disabled", False):
             return torch.zeros(batch_size, self.channels, height, width, device=device, dtype=dtype)
         kernel = self._kernel(device, dtype)
-        if self.pad_valid:
-            k1 = self.kernel_size - 1
-            eps = torch.randn(batch_size, self.channels, height + k1, width + k1, device=device, dtype=dtype)
-            blurred = F.conv2d(eps, kernel.expand(self.channels, 1, -1, -1), padding=0, groups=self.channels)
-        else:
-            eps = torch.randn(batch_size, self.channels, height, width, device=device, dtype=dtype)
-            blurred = F.conv2d(eps, kernel.expand(self.channels, 1, -1, -1), padding=self.kernel_size // 2, groups=self.channels)
+        eps = torch.randn(batch_size, self.channels, height, width, device=device, dtype=dtype)
+        blurred = F.conv2d(eps, kernel.expand(self.channels, 1, -1, -1), padding=self.kernel_size // 2, groups=self.channels)
         # Undo exactly the variance the blur itself introduced (Var(output) =
         # Var(input) * Sum(kernel_weight^2) for unit-variance input), so
         # log_sigma alone is the final, literal amplitude -- independent of
@@ -845,105 +787,17 @@ class GaussianNoiseStage(nn.Module):
         renormed = blurred / renorm_factor
         sigma = F.softplus(self.log_sigma)
         if amp is not None:
-            # 2026-09-29 (obs-eval test T2, --noise-amp-map): per-pixel amplitude map (B, 1, H, W) predicted from
+            # 2026-09-29 (--noise-amp-map, part of the final model): per-pixel amplitude map (B, 1, H, W) predicted from
             # this stage's decoder features, so the ensemble spread can depend on the ice state. Multiplies the
             # learnable scalar; the map's head is initialised to exactly 1 everywhere (see UNet).
             return renormed * sigma * amp
         return renormed * sigma
 
 
-class WindowedSelfAttention2d(nn.Module):
-    """
-    Non-overlapping windowed multi-head self-attention over a 2D feature
-    map (Swin-style W-MSA, not shifted), applied once at the very end of the
-    decoder -- a "sliding window" attention mechanism placed at the decoder
-    end rather than the encoder, a deliberate design choice (2026-08-06):
-    full quadratic self-attention over the whole up-sampled
-    field is too expensive at these domain sizes (e.g. ~150x310 for the
-    medium no-patch domain), and encoder-side attention operates several
-    layers upstream of where the model's coastal smoothing is actually
-    introduced (the bilinear decoder). Restricting attention to small local
-    windows keeps cost linear in H*W (O(H*W*window_size^2) instead of
-    O((H*W)^2)) while still letting each output pixel incorporate its local
-    neighborhood right before out_conv.
-
-    Pads H, W up to a multiple of window_size (reflect padding) before
-    windowing and crops back after, so this works for any domain crop size,
-    not just ones divisible by window_size -- no new constraint on top of
-    the existing divisor-8/16 sub-domain sizing rule.
-
-    max_window_batch chunks the flattened (B*nH*nW, ws*ws, C) call to
-    nn.MultiheadAttention instead of running it in one shot, AND each chunk
-    runs under torch.utils.checkpoint so its intermediate activations aren't
-    retained for backward (recomputed on demand instead). Both pieces turned
-    out necessary the hard way (2026-08-06): at the medium no-patch domain
-    (~150x310 up-sampled) with window_size=8 and a real training batch
-    (batch_size=16, K=20), B*nH*nW reaches ~237k. An un-chunked call tries
-    to materialize a (237k*num_heads, 64, 64) attention-score tensor and
-    OOMs outright (tried to allocate 14.47 GiB). Chunking alone (bounding
-    each individual attention call's peak to ~256 MiB) still OOM'd on the
-    resubmitted jobs -- turns out standard autograd retains *every* chunk's
-    saved activations simultaneously across the whole sequential loop, so
-    the *total* memory across ~58 chunks accumulated to more than the GPU
-    had left after the rest of the model's own activations (the medium-
-    domain baseline already runs close to the 32GB ceiling at K=20/batch=16
-    without any attention module at all). Per-chunk checkpointing discards
-    each chunk's activations immediately after producing its output and
-    recomputes them during backward, so only one chunk's activations exist
-    in memory at a time regardless of how many chunks there are -- the fix
-    that actually worked, confirmed against the same OOMing jobs.
-
-    The standalone smoke test that validated this module before use only
-    used a tiny synthetic batch (B=2) and never exercised a batch size close
-    to a real training step, which is why none of this was caught until the
-    actual comparison-batch jobs ran on the GPU.
-    """
-
-    def __init__(self, channels, window_size=8, num_heads=4, max_window_batch=4096):
-        super().__init__()
-        if channels % num_heads != 0:
-            raise ValueError(f"channels ({channels}) must be divisible by num_heads ({num_heads}).")
-        self.window_size = window_size
-        self.max_window_batch = max_window_batch
-        self.attn = nn.MultiheadAttention(embed_dim=channels, num_heads=num_heads, batch_first=True)
-        self.norm = nn.LayerNorm(channels)
-
-    def _run_chunk(self, x_chunk):
-        attn_chunk, _ = self.attn(x_chunk, x_chunk, x_chunk)
-        return self.norm(attn_chunk + x_chunk)  # residual, then normalize
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-        ws = self.window_size
-        pad_h = (ws - H % ws) % ws
-        pad_w = (ws - W % ws) % ws
-        x_p = F.pad(x, (0, pad_w, 0, pad_h), mode="reflect") if (pad_h or pad_w) else x
-        Hp, Wp = H + pad_h, W + pad_w
-
-        # (B, C, Hp, Wp) -> non-overlapping ws x ws windows -> (B*nH*nW, ws*ws, C)
-        x_w = x_p.unfold(2, ws, ws).unfold(3, ws, ws)  # (B, C, nH, nW, ws, ws)
-        nH, nW = x_w.shape[2], x_w.shape[3]
-        x_w = x_w.permute(0, 2, 3, 4, 5, 1).reshape(B * nH * nW, ws * ws, C)
-
-        chunks = []
-        for i in range(0, x_w.shape[0], self.max_window_batch):
-            x_chunk = x_w[i:i + self.max_window_batch]
-            if self.training and x_chunk.requires_grad:
-                chunks.append(torch_checkpoint.checkpoint(self._run_chunk, x_chunk, use_reentrant=False))
-            else:
-                chunks.append(self._run_chunk(x_chunk))
-        attn_out = torch.cat(chunks, dim=0)
-
-        attn_out = attn_out.reshape(B, nH, nW, ws, ws, C).permute(0, 5, 1, 3, 2, 4).reshape(B, C, Hp, Wp)
-        return attn_out[:, :, :H, :W]
-
-
 class UNet(nn.Module):
 
     def __init__(self, in_channels, mask_channels=1,
-                 attention_end=False, attn_window_size=8, attn_num_heads=4,
-                 noise_channels=1, noise_kernel_size=5, late_mask_fusion=False, noise_amp_map=False,
-                 noise_kernel_size_final=None):
+                 noise_channels=1, noise_kernel_size=5, late_mask_fusion=False, noise_amp_map=False):
         """
         Note on stochastic ensemble generation (redesigned 2026-09-16): each
         of the four decoder stages (d3, d2, d1, final) has its own
@@ -972,14 +826,6 @@ class UNet(nn.Module):
            batches). It also measurably helped calibration, but that
            tradeoff wasn't worth reintroducing the artifact for.
 
-        attention_end: applies WindowedSelfAttention2d (non-overlapping local
-        self-attention, "sliding window" but at the decoder's end rather than
-        the encoder) to the final 32-channel decoder feature map, after the
-        mask+noise fusion below (see forward()) -- so if ever enabled, it
-        operates on mask-aware features. Default False = unchanged
-        architecture. attn_window_size/attn_num_heads size that attention
-        block; channels (32) must be divisible by attn_num_heads.
-
         The high-res land mask and deep mask-processing capacity (formerly
         the optional deep_mask_head toggle, now unconditional) are folded
         into the *same* fusion step as the final stage's noise, before that
@@ -989,21 +835,25 @@ class UNet(nn.Module):
         cleanup layers downstream of an already-finalized mix -- see
         forward()'s Output section.
 
+        Rejected options removed in the 2026-11 cleanup (code in the pre-cleanup snapshot,
+        scratch downscaling/archive/records/): end-of-decoder windowed self-attention
+        (attention_end), a wider final-stage noise kernel (noise_kernel_size_final),
+        multiplicative / additive feature noise (noise_mode mult/add_feat, bottleneck noise)
+        and MC-dropout.
+
         noise_channels, noise_kernel_size: passed straight through to every
         GaussianNoiseStage (see its docstring). 2026-09-17 sensitivity-test
-        knobs only, both default to the settled values (1, 5) -- not
-        intended as permanent per-run tuning parameters.
+        knobs (appendix ablation), both default to the settled values (1, 5).
 
         late_mask_fusion: 2026-09-17 sensitivity-test toggle, default False
         (= the current architecture described above). When True, reverts
         *only* the mask's timing at the final stage back to how every
         earlier version of this model did it -- concatenated after a
-        noise-only fusion (and after attention_end, if enabled) rather than
+        noise-only fusion rather than
         before -- while keeping the new per-stage noise cascade everywhere,
         including at the final stage, unchanged. Exists to isolate whether
         moving the mask earlier (vs. the noise-cascade redesign itself) is
-        what drives any change in coastal/IIEE behavior; not intended to
-        stay in the codebase once that question is answered.
+        what drives any change in coastal/IIEE behavior (appendix ablation).
 
         Note on the target this network predicts: forward() returns the
         decoder output directly, with no internal bilinear-base residual
@@ -1020,14 +870,11 @@ class UNet(nn.Module):
         """
 
         super().__init__()
-        self.attention_end = attention_end
         self.mask_channels = mask_channels
         self.late_mask_fusion = late_mask_fusion
-        # noise_amp_map (2026-09-29, obs-eval test T2): a 3x3-conv + softplus head per decoder stage turns that
+        # noise_amp_map (2026-09-29, part of the final model): a 3x3-conv + softplus head per decoder stage turns that
         # stage's features into a positive per-pixel noise amplitude. Zero weights and a softplus^-1(1) bias make
         # it start as exactly the scalar-amplitude model. Default False = unchanged architecture/state_dict.
-        # mask_channels may also include extra high-res predictor channels (obs-eval test T3, run_pipeline's
-        # aux/static channels) -- they ride along with the land mask into the final fusion.
         self.noise_amp_map = noise_amp_map
         if noise_amp_map:
             def amp_head(c):
@@ -1067,13 +914,7 @@ class UNet(nn.Module):
         self.noise_proj_d2 = nn.Conv2d(noise_channels, 128, 1)
         self.noise_d1 = GaussianNoiseStage(channels=noise_channels, kernel_size=noise_kernel_size)
         self.noise_proj_d1 = nn.Conv2d(noise_channels, 64, 1)
-        # noise_kernel_size_final (2026-10-07, calibration option 1b): a wider footprint for the 0.1 deg stage only, so its
-        # learnable width can reach the ~50-160 km scales between the 5-tap final stage and the coarse stages (edge-safe
-        # "valid" noise padding). None = unchanged (same kernel as the other stages).
-        if noise_kernel_size_final:
-            self.noise_final = GaussianNoiseStage(channels=noise_channels, kernel_size=noise_kernel_size_final, pad_valid=True)
-        else:
-            self.noise_final = GaussianNoiseStage(channels=noise_channels, kernel_size=noise_kernel_size)
+        self.noise_final = GaussianNoiseStage(channels=noise_channels, kernel_size=noise_kernel_size)
         self.noise_proj_final = nn.Conv2d(noise_channels, 64, 1)
 
         # Decoder
@@ -1100,7 +941,7 @@ class UNet(nn.Module):
             # Ablation-only (see docstring): reconstructs every earlier version's mask
             # timing -- a noise-only fusion down to 32 channels first (2 layers, no
             # activation after the very last conv, matching the old final_conv exactly),
-            # then (after attention_end, if any) the mask concatenates in and gets its
+            # then the mask concatenates in and gets its
             # own 2-layer block (matching the old, now-permanently-folded-in
             # deep_mask_head exactly) before out_conv.
             self.final_conv = nn.Sequential(
@@ -1140,9 +981,6 @@ class UNet(nn.Module):
             )
         self.out_conv = nn.Conv2d(32, 1, 3, padding=1)
 
-        if self.attention_end:
-            # Applied after the mask+noise fusion above -- see class docstring.
-            self.attn_end = WindowedSelfAttention2d(32, window_size=attn_window_size, num_heads=attn_num_heads)
 
     def forward(self, x, up_size, mask=None, deterministic=False):
 
@@ -1203,10 +1041,8 @@ class UNet(nn.Module):
 
         if self.late_mask_fusion:
             # Ablation-only path (see docstring): mask stays out of the fusion until
-            # after attention_end, matching every earlier version of this model.
+            # after the noise-only fusion, matching every earlier version of this model.
             out = self.final_conv(torch.cat([up, nf], dim=1))
-            if self.attention_end:
-                out = self.attn_end(out)
             if self.mask_channels > 0:
                 out = torch.cat([out, mask.to(out.dtype)], dim=1)
                 out = self.mask_head(out)
@@ -1215,11 +1051,6 @@ class UNet(nn.Module):
             if self.mask_channels > 0:
                 fuse_parts.append(mask.to(up.dtype))
             out = self.final_conv(torch.cat(fuse_parts, dim=1))
-
-            if self.attention_end:
-                # Local windowed self-attention on the mask+noise-fused 32-channel
-                # decoder output -- see class docstring.
-                out = self.attn_end(out)
 
         out = self.out_conv(out)
 
@@ -1302,72 +1133,6 @@ def energy_loss_patched(preds, y, weight=None, beta=1.0, patch=30):
     return energy_loss(p, yy, weight=w, beta=beta)
 
 
-def block_crps_loss(phys, ocean, target, block=10):
-    """Fair ensemble CRPS of ocean-mean ~1 deg block values against a gridded observation (2026-09-29, obs-eval test T1).
-    phys: [B, K, H, W] physical thickness (land already 0); ocean: [H, W] 0/1; target: [B, H//block, W//block] with NaN
-    where unobserved. Only blocks with ocean cells and a finite target count."""
-    B, K, H, W = phys.shape
-    nh, nw = H // block, W // block
-    ph = phys[..., :nh * block, :nw * block].reshape(B, K, nh, block, nw, block).sum((3, 5))
-    oc = ocean[:nh * block, :nw * block].reshape(nh, block, nw, block).sum((1, 3))
-    x = ph / oc.clamp(min=1.0)
-    valid = torch.isfinite(target) & (oc > 0)
-    y = torch.nan_to_num(target)
-    t1 = (x - y.unsqueeze(1)).abs().mean(1)
-    xs, _ = torch.sort(x, dim=1)
-    w = (2 * torch.arange(1, K + 1, device=x.device, dtype=x.dtype) - K - 1).view(1, K, 1, 1)
-    crps = t1 - (xs * w).sum(1) / (K * (K - 1))
-    return (crps * valid).sum() / valid.sum().clamp(min=1)
-
-
-def pixel_obs_crps_loss(phys, target):
-    """Fair ensemble CRPS at the 0.1 deg cells that have an observation (2026-10-07, calibration option 2).
-    phys: [B, K, H, W] physical thickness; target: [B, H, W] with NaN where unobserved (e.g. ICESat-2 pass-cell means)."""
-    K = phys.shape[1]
-    valid = torch.isfinite(target)
-    y = torch.nan_to_num(target)
-    t1 = (phys - y.unsqueeze(1)).abs().mean(1)
-    xs, _ = torch.sort(phys, dim=1)
-    w = (2 * torch.arange(1, K + 1, device=phys.device, dtype=phys.dtype) - K - 1).view(1, K, 1, 1)
-    crps = t1 - (xs * w).sum(1) / (K * (K - 1))
-    return (crps * valid).sum() / valid.sum().clamp(min=1)
-
-
-def _obs_step(model, optimizer, obs_ft, oi, K, device):
-    """One optimizer step on observation batch `oi` (T1 block CRPS, or option-2 pixel CRPS when the target is full-res)."""
-    B = len(oi)
-    optimizer.zero_grad()
-    Xo = obs_ft["X"][oi].to(device)
-    mo = _model_mask(obs_ft["mask"][oi].to(device), obs_ft.get("aux"), oi)
-    H_, W_ = obs_ft["hw"]
-    po = model(Xo.repeat_interleave(K, dim=0), up_size=(H_, W_), mask=mo.repeat_interleave(K, dim=0))
-    po = po.reshape(B, K, H_, W_)
-    ocean = obs_ft["ocean"].to(device)
-    phys = (po * obs_ft["inc_scale"] + obs_ft["inc_mean"] + obs_ft["base"][oi].to(device).unsqueeze(1)).clamp(min=0.0) * ocean
-    tgt = obs_ft["target"][oi].to(device)
-    loss_o = obs_ft["weight"] * (pixel_obs_crps_loss(phys, tgt) if obs_ft.get("pixel") else block_crps_loss(phys, ocean, tgt))
-    loss_o.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    optimizer.step()
-    return loss_o.item()
-
-
-def smooth_floor(x, scale):
-    """Smooth non-negative floor for physical thickness (2026-10-08, --output-floor softplus): scale * softplus(x / scale).
-    ~x for x >> scale, -> 0 for x << -scale, scale*ln2 at x = 0; differentiable everywhere, unlike clamp(min=0)."""
-    return scale * F.softplus(x / scale)
-
-
-def _floor_in_increment_space(preds, base, floor):
-    """Apply the smooth physical floor to normalized-increment predictions preds [B, K, C, H, W] (base [B, C, H, W] physical
-    bilinear baseline) and map back to normalized-increment space, so the training loss scores exactly the non-negative members
-    that are evaluated (the clamp at evaluation is otherwise invisible to training)."""
-    sd, mu = floor["inc_std"], floor["inc_mean"]
-    b = base.unsqueeze(1)
-    phys = smooth_floor(preds * sd + mu + b, floor["scale"])
-    return (phys - b - mu) / sd
-
-
 def coarse_zero_mask(base_phys, mask):
     """Ocean cells whose bilinear coarse SIT is exactly 0 (2026-10-23, --coarse-zero). base_phys [N, C, H, W] physical
     bilinear baseline, mask [N, 1, H, W] land mask; returns bool [N, 1, H, W]. The coarse input is the area mean of the
@@ -1375,48 +1140,6 @@ def coarse_zero_mask(base_phys, mask):
     Applied at evaluation only, like the clamp: also applying it in the training loss gave the same open-water rank
     histogram but less spread in every ice regime and a worse CRPS (FOSI, evaluation/corrected_calibration/coarse_zero_compare.txt)."""
     return (base_phys[:, :1] <= 0) & (mask[:, :1].to(base_phys.device) <= 0.5)
-
-
-def _model_mask(mask_batch, aux, idx):
-    """Land mask plus optional high-res predictor channels (obs-eval test T3) for the samples `idx`."""
-    if aux is None:
-        return mask_batch
-    parts = [mask_batch]
-    B = mask_batch.shape[0]
-    if aux.get("dyn") is not None:
-        parts.append(aux["dyn"][idx].to(mask_batch.device, mask_batch.dtype))
-    if aux.get("static") is not None:
-        parts.append(aux["static"].to(mask_batch.device, mask_batch.dtype).unsqueeze(0).expand(B, -1, -1, -1))
-    return torch.cat(parts, dim=1)
-
-
-def pixelwise_crps_loss(preds, y, weight=None):
-    """
-    Fair per-pixel ensemble CRPS, averaged over pixels (optionally weighted like energy_loss).
-
-    The energy score above is a single score of the whole flattened field (~46k values); in that
-    many dimensions it is dominated by the ensemble-mean error and only weakly penalizes a
-    per-pixel spread that is too narrow, which is what the corrected spread-skill ratio (~0.7)
-    measures. Adding this term (train_model's crps_weight) targets per-pixel calibration with a
-    proper score; the energy score term is kept for spatial coherence of each member.
-
-        CRPS_fair = mean_k |x_k - y| - sum_{i,j} |x_i - x_j| / (2K(K-1))
-    with the pairwise term computed from sorted members: sum_{i,j}|x_i-x_j| = 2 sum_k (2k-K-1) x_(k).
-    Sorting is differentiable with respect to the sorted values, so gradients flow to every member.
-
-    Args:
-        preds: [B, K, C, H, W]; y: [B, C, H, W]; weight: None, (H, W) or (B, H, W).
-    """
-    K = preds.shape[1]
-    term1 = (preds - y.unsqueeze(1)).abs().mean(1)
-    xs, _ = torch.sort(preds, dim=1)
-    w = (2 * torch.arange(1, K + 1, device=preds.device, dtype=preds.dtype) - K - 1).view(1, K, 1, 1, 1)
-    term2 = (xs * w).sum(1) / (K * (K - 1))
-    crps = term1 - term2  # [B, C, H, W]
-    if weight is not None:
-        w_map = torch.as_tensor(weight, dtype=preds.dtype, device=preds.device)
-        crps = crps * (w_map.unsqueeze(0).unsqueeze(0) if w_map.dim() == 2 else w_map.unsqueeze(1))
-    return crps.mean()
 
 
 def coastal_band_mask(land_mask, coastal_width=5):
@@ -1485,115 +1208,82 @@ class EmaWeights:
 
 def train_model(model, optimizer, X_train, Y_train, mask_train, device, K, num_epochs, batch_size,
                  coastal_width=5, coastal_boost=2.0, beta=1.0, verbose=True, deterministic_mse=False,
-                 crps_weight=0.0, energy_patch_size=0, aux_train=None, obs_ft=None, floor=None,
-                 mean_mse_weight=0.0, ema=None, lr_schedule="constant", noise_lr_warmup_epochs=0):
+                 energy_patch_size=0, ema=None, grad_accum_steps=1):
     """deterministic_mse=True trains the same backbone as a plain deterministic baseline: every
     noise stage is zeroed (deterministic=True), K is ignored, and the loss is the same
     coastal-weighted per-pixel MSE in normalized-increment space instead of the energy score.
 
-    crps_weight > 0 (2026-09-25, under-dispersion test) adds crps_weight * pixelwise_crps_loss to
-    the energy score, with the same coastal weight map. The energy score is ~235x the mean
-    per-pixel CRPS at the trained MESA solution (normalized units), so crps_weight ~250 makes the
-    two terms comparable. 0 = unchanged energy-score-only training.
+    energy_patch_size > 0 (2026-09-29, part of the final model) scores the energy term per ~N x N tile
+    (energy_loss_patched). ema (an EmaWeights, 2026-10-17) is updated after every optimizer step.
 
-    2026-09-29 obs-eval tests (all default off): energy_patch_size > 0 scores the energy term per tile
-    (energy_loss_patched, T2); aux_train adds high-res predictor channels to the model's mask input (T3);
-    obs_ft (T1) interleaves an extra optimizer step per batch on an observation batch, loss =
-    obs_ft['weight'] * block_crps_loss of the ~1 deg ocean-block means against the gridded observation target.
-
-    2026-10-17 ensemble-mean accuracy tests (default off): mean_mse_weight > 0 adds mean_mse_weight * the coastal-weighted,
-    debiased ensemble-mean MSE, mean[(ens mean - y)^2 - ens var / K]. Subtracting var/K makes it an unbiased estimate of the
-    infinite-ensemble mean's MSE, so it rewards a more accurate mean without rewarding smaller spread (plain finite-K mean MSE
-    would). ema (an EmaWeights) is updated after every optimizer step. lr_schedule="cosine" decays every param group's lr per
-    step as 0.01 + 0.99 * 0.5 * (1 + cos(pi * step / total_steps)) of its initial value (constant = unchanged, the only
-    behaviour before 2026-10-17). noise_lr_warmup_epochs > 0 holds param groups tagged "noise_mult" at initial_lr /
-    noise_mult (i.e. the base lr) for that many epochs, so the mean settles before the noise parameters move at the
-    multiplied rate."""
+    Rejected loss/schedule options removed in the 2026-11 cleanup (pre-cleanup snapshot in scratch
+    downscaling/archive/records/): per-pixel CRPS term, observation fine-tuning steps, softplus output
+    floor, debiased ensemble-mean MSE term, cosine lr schedule and noise-lr warm-up."""
     loss_array = []
-
-    if obs_ft is not None and obs_ft.get("only"):
-        # 2026-10-07 calibration option 2 (--obs-ft-only): no CICE steps at all; each epoch is one shuffled pass over the
-        # observation days (usually with --train-only-noise, so only the spread parameters move).
-        n = obs_ft["X"].shape[0]
-        for epoch in range(num_epochs):
-            model.train()
-            tot = 0.0
-            perm = torch.randperm(n)
-            for i in range(0, n, batch_size):
-                oi = perm[i:i + batch_size]
-                tot += _obs_step(model, optimizer, obs_ft, oi, K, device) * len(oi)
-            loss_array.append(tot / n)
-            if verbose:
-                print(f"Epoch {epoch + 1}/{num_epochs} | obs-only CRPS loss: {tot / n:.6f}", flush=True)
-        return loss_array
-
-    for g in optimizer.param_groups:
-        g.setdefault("initial_lr", g["lr"])
-    steps_per_epoch = -(-X_train.size(0) // batch_size)
-    total_steps = max(1, num_epochs * steps_per_epoch)
-    step = 0
-
-    def _set_lr(epoch, step):
-        f = 1.0
-        if lr_schedule == "cosine":
-            f = 0.01 + 0.99 * 0.5 * (1 + math.cos(math.pi * step / total_steps))
-        for g in optimizer.param_groups:
-            warm = epoch < noise_lr_warmup_epochs and g.get("noise_mult", 1.0) != 1.0
-            g["lr"] = g["initial_lr"] * f / (g["noise_mult"] if warm else 1.0)
+    grad_accum_steps = int(grad_accum_steps or 1)
 
     for epoch in range(num_epochs):
         model.train()
         epoch_loss = 0.0
-        epoch_es = epoch_crps = epoch_obs = epoch_mm = 0.0
         idx = torch.randperm(X_train.size(0))
 
         for i in range(0, X_train.size(0), batch_size):
-            if lr_schedule != "constant" or noise_lr_warmup_epochs > 0:
-                _set_lr(epoch, step)
-            step += 1
             optimizer.zero_grad()
+
+            if grad_accum_steps > 1:
+                # 2026-11 (--grad-accum-steps): the same batch of batch_size samples, forward/backward in grad_accum_steps
+                # equal chunks with each chunk loss weighted by its share of the batch, then one clip + optimizer step +
+                # EMA update. Every loss here is a mean over samples (each sample has the same number of energy tiles /
+                # pixels) and normalisation is per sample (InstanceNorm), so the gradient equals the full-batch gradient up
+                # to float rounding (and different noise draws). Default 1 never enters here.
+                batch_idx = idx[i:i + batch_size]
+                B = len(batch_idx)
+                for chunk in torch.chunk(batch_idx, grad_accum_steps):
+                    Xc, Yc, mc = X_train[chunk].to(device), Y_train[chunk].to(device), mask_train[chunk].to(device)
+                    cw = build_coastal_weight_map(mc[:, 0], coastal_width, coastal_boost)
+                    b = Xc.shape[0]
+                    if deterministic_mse:
+                        pc = model(Xc, up_size=Yc.shape[-2:], mask=mc, deterministic=True)
+                        lc = (cw.unsqueeze(1) * (pc - Yc) ** 2).mean()
+                    else:
+                        pc = model(Xc.repeat_interleave(K, dim=0), up_size=Yc.shape[-2:], mask=mc.repeat_interleave(K, dim=0))
+                        pc = pc.reshape(b, K, pc.shape[1], pc.shape[2], pc.shape[3])
+                        if energy_patch_size and energy_patch_size > 0:
+                            lc = energy_loss_patched(pc, Yc, weight=cw, beta=beta, patch=energy_patch_size)
+                        else:
+                            lc = energy_loss(pc, Yc, weight=cw, beta=beta)
+                    (lc * (b / B)).backward()
+                    epoch_loss += lc.item() * b
+                    del Xc, Yc, mc, pc, lc
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                if ema is not None:
+                    ema.update(model.module)
+                continue
 
             batch_idx = idx[i:i + batch_size]
             X_batch = X_train[batch_idx].to(device)
             Y_batch = Y_train[batch_idx].to(device)
             mask_batch = mask_train[batch_idx].to(device)
-            model_mask = _model_mask(mask_batch, aux_train, batch_idx)
 
             B = X_batch.shape[0]
 
             # Per-sample loss weight: land at baseline weight 1, coastal ocean band
-            # up-weighted -- built fresh per batch since mask_batch can vary across
-            # samples (sliding-window patches each cover a different piece of coastline).
-            # Land is now also hard-masked to exactly 0 in the model's forward() itself
-            # (see UNet.forward), so its weight here mostly just keeps its near-zero loss
-            # contribution from being silently dropped.
+            # up-weighted -- built fresh per batch since mask_batch can vary across samples.
             coastal_weight = build_coastal_weight_map(mask_batch[:, 0], coastal_width, coastal_boost)
 
             if deterministic_mse:
-                preds = model(X_batch, up_size=Y_batch.shape[-2:], mask=model_mask, deterministic=True)
+                preds = model(X_batch, up_size=Y_batch.shape[-2:], mask=mask_batch, deterministic=True)
                 loss = (coastal_weight.unsqueeze(1) * (preds - Y_batch) ** 2).mean()
             else:
                 X_rep = X_batch.repeat_interleave(K, dim=0)
-                mask_rep = model_mask.repeat_interleave(K, dim=0)
+                mask_rep = mask_batch.repeat_interleave(K, dim=0)
                 preds = model(X_rep, up_size=Y_batch.shape[-2:], mask=mask_rep)
                 preds = preds.reshape(B, K, preds.shape[1], preds.shape[2], preds.shape[3])
-                if floor is not None:  # --output-floor softplus: score the floored (non-negative) members
-                    preds = _floor_in_increment_space(preds, floor["base"][batch_idx].to(device), floor)
                 if energy_patch_size and energy_patch_size > 0:
                     loss = energy_loss_patched(preds, Y_batch, weight=coastal_weight, beta=beta, patch=energy_patch_size)
                 else:
                     loss = energy_loss(preds, Y_batch, weight=coastal_weight, beta=beta)
-                if crps_weight > 0:
-                    crps_term = pixelwise_crps_loss(preds, Y_batch, weight=coastal_weight)
-                    epoch_es += loss.item() * B
-                    epoch_crps += crps_term.item() * B
-                    loss = loss + crps_weight * crps_term
-                if mean_mse_weight > 0:
-                    mm = (coastal_weight.unsqueeze(1) * ((preds.mean(1) - Y_batch) ** 2 - preds.var(1) / K)).mean()
-                    if crps_weight <= 0:
-                        epoch_es += loss.item() * B
-                    epoch_mm += mm.item() * B
-                    loss = loss + mean_mse_weight * mm
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -1604,32 +1294,15 @@ def train_model(model, optimizer, X_train, Y_train, mask_train, device, K, num_e
             epoch_loss += loss.item() * B
             del X_batch, Y_batch, mask_batch, preds, loss
 
-            if obs_ft is not None:
-                oi = torch.randint(0, obs_ft["X"].shape[0], (B,))
-                epoch_obs += _obs_step(model, optimizer, obs_ft, oi, K, device) * B
-
         epoch_loss /= X_train.size(0)
         loss_array.append(epoch_loss)
         if verbose:
-            extra = ""
-            if crps_weight > 0 and not deterministic_mse:
-                n = X_train.size(0)
-                extra = (f" | energy: {epoch_es / n:.6f} | pixel CRPS: {epoch_crps / n:.6f}"
-                         f" (x{crps_weight:g} = {crps_weight * epoch_crps / n:.6f})")
-            if mean_mse_weight > 0 and not deterministic_mse:
-                n = X_train.size(0)
-                extra += (f" | energy: {epoch_es / n:.6f} | debiased mean MSE: {epoch_mm / n:.6f}"
-                          f" (x{mean_mse_weight:g} = {mean_mse_weight * epoch_mm / n:.6f})")
-            if obs_ft is not None:
-                extra += f" | obs block CRPS term: {epoch_obs / X_train.size(0):.6f}"
-            if lr_schedule != "constant" or noise_lr_warmup_epochs > 0:
-                extra += " | lr: " + ", ".join(f"{g['lr']:.3g}" for g in optimizer.param_groups)
-            print(f"Epoch {epoch + 1}/{num_epochs} | Loss: {epoch_loss:.6f}{extra}", flush=True)
+            print(f"Epoch {epoch + 1}/{num_epochs} | Loss: {epoch_loss:.6f}", flush=True)
 
     return loss_array
 
 
-def evaluate_model(model, X_test, Y_test, mask_test, device, K_eval, eval_batch_size, deterministic_only=False, aux_test=None):
+def evaluate_model(model, X_test, Y_test, mask_test, device, K_eval, eval_batch_size, deterministic_only=False):
     model.eval()
     preds_all, preds_mean, preds_std, preds_det = [], [], [], []
 
@@ -1637,13 +1310,10 @@ def evaluate_model(model, X_test, Y_test, mask_test, device, K_eval, eval_batch_
         for i in range(0, X_test.shape[0], eval_batch_size):
             X_batch = X_test[i:i + eval_batch_size].to(device)
             Y_batch = Y_test[i:i + eval_batch_size].to(device)
-            mask_batch = _model_mask(mask_test[i:i + eval_batch_size].to(device), aux_test,
-                                     torch.arange(i, min(i + eval_batch_size, X_test.shape[0])))
+            mask_batch = mask_test[i:i + eval_batch_size].to(device)
 
-            # z=None (default) makes forward() sample its own fresh global latent
-            # noise, so each ensemble member gets independent stochastic detail
-            # without duplicating that sampling logic here. deterministic=True
-            # (below) forces z to exact zero instead.
+            # Each forward() call draws fresh noise at every stage, so each ensemble member gets
+            # independent stochastic detail; deterministic=True (below) zeroes every noise stage.
             ensemble_preds = []
             for k in range(K_eval):
                 pred = model(X_batch, Y_batch.shape[-2:], mask=mask_batch, deterministic=deterministic_only)
@@ -2283,101 +1953,6 @@ def plot_error_figure(output_dir, Y_base_phys, Y_pred_det_phys, Y_pred_phys, Y_t
 # Full pipeline
 # ==============================================================
 
-def add_time_context(X, n):
-    """(obs-eval test T4, --time-context) Stack the previous n days' predictors as extra channels:
-    X (N, T, C, H, W) -> (N, T, C * (n + 1), H, W), order [t, t-1, ..., t-n]. The first n days repeat day 0.
-    Applied to the full record before the year split, so a test year's first days see the previous year."""
-    parts = [X]
-    for k in range(1, n + 1):
-        parts.append(np.concatenate([np.repeat(X[:, :1], k, axis=1), X[:, :-k]], axis=1))
-    return np.concatenate(parts, axis=2)
-
-
-def _crop_hr(arr, hlat, hlon, subdomain):
-    hi0, hi1 = crop_indices(hlat, subdomain["lat_min"], subdomain["lat_max"])
-    hj0, hj1 = crop_indices(np.asarray(hlon) % 360, subdomain["lon_min"] % 360, subdomain["lon_max"] % 360)
-    return arr[..., hi0:hi1, hj0:hj1]
-
-
-def build_aux_channels(config, time_train, member_train, time_test, member_test, hlat, hlon):
-    """(obs-eval test T3) High-res predictor channels on the Y grid, cropped to the sub-domain and standardised with
-    training statistics. aux_path / test_aux_path: files with A (ensemble, time, channel, lat, lon), matched to the
-    samples by timestamp, and by ensemble member when the file has more than one (MESA, 2026-10-22; a single-member
-    file is shared by every member); static_path: S (channel, lat, lon). Returns (aux_train, aux_test, n)."""
-    if config.use_patches:
-        raise ValueError("aux/static channels are only implemented for --no-patches.")
-    out_tr, out_te, n = {"dyn": None, "static": None}, {"dyn": None, "static": None}, 0
-
-    def dyn(path, times, members):
-        da = xr.open_dataset(path)["A"]
-        idx = xr.CFTimeIndex(da["time"].values).get_indexer(np.asarray(times)) if not np.issubdtype(np.asarray(times).dtype, np.datetime64) \
-            else pd.DatetimeIndex(da["time"].values).get_indexer(np.asarray(times))
-        if (idx < 0).any():
-            raise ValueError(f"{path}: {int((idx < 0).sum())} sample times not found (e.g. {np.asarray(times)[idx < 0][:3]}).")
-        if da.sizes["ensemble"] == 1:
-            a = da.isel(ensemble=0).isel(time=idx).values  # only the matched days are read
-        else:
-            members = np.asarray(members)
-            if members.max() >= da.sizes["ensemble"]:
-                raise ValueError(f"{path}: has {da.sizes['ensemble']} members, samples need member {members.max()}.")
-            a = np.empty((len(idx),) + da.shape[2:], dtype=np.float32)
-            for m in np.unique(members):  # one read per member
-                rows = np.where(members == m)[0]
-                a[rows] = da.isel(ensemble=int(m)).isel(time=idx[rows]).values
-        return torch.tensor(_crop_hr(a, hlat, hlon, config.subdomain)).float()
-
-    if getattr(config, "aux_path", None):
-        tr = dyn(config.aux_path, time_train, member_train)
-        te = dyn(getattr(config, "test_aux_path", None) or config.aux_path, time_test, member_test)
-        m, s = tr.mean(dim=(0, 2, 3), keepdim=True), tr.std(dim=(0, 2, 3), keepdim=True)
-        out_tr["dyn"], out_te["dyn"] = (tr - m) / (s + 1e-6), (te - m) / (s + 1e-6)
-        n += tr.shape[1]
-        print(f"  aux channels: {tr.shape[1]} dynamic from {config.aux_path} (test: {getattr(config, 'test_aux_path', None) or 'same'})")
-    if getattr(config, "static_path", None):
-        S = torch.tensor(_crop_hr(xr.open_dataset(config.static_path)["S"].values, hlat, hlon, config.subdomain)).float()
-        S = (S - S.mean(dim=(1, 2), keepdim=True)) / (S.std(dim=(1, 2), keepdim=True) + 1e-6)
-        out_tr["static"] = out_te["static"] = S
-        n += S.shape[0]
-        print(f"  aux channels: {S.shape[0]} static from {config.static_path}")
-    return out_tr, out_te, n
-
-
-def build_obs_finetune_set(config, X_mean, X_std, inc_mean, inc_std, land_mask, llon, llat, hlon, hlat, hw, time_context):
-    """(obs-eval test T1) Observation fine-tuning batches: predictors from obs_ft_x_path (e.g. PIOMAS-obs X), normalised
-    with the *training* X statistics, matched by calendar day to obs_ft_target_path's `target` (time, 15, 31) ~1 deg
-    block means of the sub-domain grid (NaN = unobserved). Days without any observed block are dropped."""
-    Xo_da = xr.open_dataset(config.obs_ft_x_path)["X"]
-    Xo = Xo_da.values
-    Xo[:, :, 0] = np.clip(Xo[:, :, 0], None, 6.0)
-    if time_context > 0:
-        Xo = add_time_context(Xo, time_context)
-    xkeys = {(t.year, t.month, t.day): i for i, t in enumerate(Xo_da["time"].values)}
-    tg = xr.open_dataset(config.obs_ft_target_path)["target"]
-    tt = pd.DatetimeIndex(tg["time"].values)
-    pairs = [(k, xkeys[(t.year, t.month, t.day)]) for k, t in enumerate(tt)
-             if (t.year, t.month, t.day) in xkeys and np.isfinite(tg.values[k]).any()]
-    if not pairs:
-        raise ValueError("No overlapping days between obs_ft_x_path and obs_ft_target_path.")
-    ki, xi = map(np.array, zip(*pairs))
-    Xsel = torch.tensor(Xo[0, xi]).float()
-    Xn = (Xsel - X_mean) / (X_std + 1e-6)
-    dummy_Y = torch.zeros(Xn.shape[0], 1, len(hlat), len(hlon))
-    Xc, _, maskc, _, _ = extract_full_domain(Xn, dummy_Y, land_mask, llon, llat, hlon, hlat, config.subdomain)
-    sit = Xc[:, :1] * (X_std[:, :1] + 1e-6) + X_mean[:, :1]
-    base = F.interpolate(sit, size=tuple(hw), mode="bilinear", align_corners=False)[:, 0]
-    ocean = (1.0 - maskc[0, 0]).clamp(0, 1)
-    target = torch.tensor(tg.values[ki]).float()
-    nb = (hw[0] // 10, hw[1] // 10)
-    pixel = tuple(target.shape[-2:]) == tuple(hw)  # option 2: full-res target (e.g. ICESat-2 pass-cells), pixel CRPS
-    if not pixel and tuple(target.shape[-2:]) != nb:
-        raise ValueError(f"obs target {tuple(target.shape[-2:])} matches neither the sub-domain {tuple(hw)} nor its 10x10 blocks {nb}.")
-    print(f"  obs fine-tuning set: {len(ki)} days from {config.obs_ft_x_path} / {config.obs_ft_target_path}, "
-          f"weight {config.obs_ft_weight}")
-    return {"X": Xc, "mask": maskc, "base": base, "ocean": ocean, "target": target, "hw": tuple(hw),
-            "inc_mean": float(inc_mean.flatten()[0]), "inc_scale": float(inc_std.flatten()[0]) + 1e-6,
-            "weight": float(config.obs_ft_weight), "pixel": pixel, "only": bool(getattr(config, "obs_ft_only", False))}
-
-
 def run_pipeline(config):
     """
     End-to-end EngressNet pipeline: load data, build the land-sea mask,
@@ -2387,8 +1962,7 @@ def run_pipeline(config):
 
     `config` is any object with attribute access (argparse.Namespace is
     fine) providing: x_path, y_path, output_dir, weighted_grids_dir, bbox,
-    bbox_regrid, use_patches, subdomain, context_size, target_size, stride,
-    train_years, test_years, train_frac, months, k, num_epochs, batch_size, lr,
+    bbox_regrid, subdomain, train_years, test_years, train_frac, months, k, num_epochs, batch_size, lr,
     k_eval, eval_batch_size, make_figures, seed. Optionally
     test_x_path/test_y_path: when both are set, the model trains on x_path/
     y_path (restricted to train_years) but evaluates on a *different*
@@ -2397,8 +1971,10 @@ def run_pipeline(config):
     set, and the two datasets to share a grid.
 
     Returns a dict with the key results (metrics_df, loss_array, etc.) so
-    callers like hpo_engressnet.py can pull out a metric without re-reading
-    files from disk.
+    callers can pull out a metric without re-reading files from disk.
+
+    Patch mode (sliding-window tiles, use_patches=True) was removed in the 2026-11
+    cleanup; every run trains on one sub-domain.
     """
     torch.manual_seed(config.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -2459,12 +2035,13 @@ def run_pipeline(config):
         plot_domain_diagnostic(config.output_dir, config.bbox, llat, llon, hlat, hlon, land_mask, X, Y, proj, boundary_path, central_lon)
 
     # ------------------------------------------------------------
-    # Sub-domain validation (no-patch mode)
+    # Sub-domain validation
     # ------------------------------------------------------------
-    if not config.use_patches:
-        if config.subdomain is None:
-            raise ValueError("config.subdomain is required when config.use_patches is False.")
-        validate_subdomain(config.subdomain, config.bbox)
+    if getattr(config, "use_patches", False):
+        raise ValueError("Patch mode was removed in the 2026-11 cleanup; give a sub-domain (config.subdomain).")
+    if config.subdomain is None:
+        raise ValueError("config.subdomain is required.")
+    validate_subdomain(config.subdomain, config.bbox)
 
     # ------------------------------------------------------------
     # Train/test split (by year, or random fallback) -- or, if
@@ -2561,28 +2138,44 @@ def run_pipeline(config):
                 "the two datasets' predictor schemas manually."
             )
 
-        if int(getattr(config, "time_context", 0) or 0) > 0:
-            X = add_time_context(X, int(config.time_context))
-            X2 = add_time_context(X2, int(config.time_context))
+        cross_mask = None
+        if int(getattr(config, "train_random_days", 0) or 0) > 0:
+            # 2026-11: same random training dates as the --train-random-days training run (normalization statistics);
+            # the test years only matter for the pool exclusion, so pass the training run's test years via
+            # random_days_exclude_years when they differ from this run's test years.
+            rseed = getattr(config, "random_days_seed", None)
+            rseed = config.seed if rseed is None else int(rseed)
+            excl = getattr(config, "random_days_exclude_years", None) or config.test_years
+            cross_mask = random_train_day_mask(X_time, config.train_years, excl, int(config.train_random_days), rseed)
+            print(f"  random training days (normalization): {int(cross_mask.sum())} dates, seed {rseed}, excluded {sorted(set(excl))[:3]}...")
         X_train_fields, Y_train_fields, time_train, member_train = select_by_years(
-            X, Y, X_time, config.train_years, months=getattr(config, "months", None),
+            X, Y, X_time, config.train_years, months=getattr(config, "months", None), train_mask_override=cross_mask,
         )
         X_test_fields, Y_test_fields, time_test, member_test = select_by_years(
             X2, Y2, X_test_da["time"], config.test_years, months=getattr(config, "months", None),
         )
     else:
-        if int(getattr(config, "time_context", 0) or 0) > 0:
-            X = add_time_context(X, int(config.time_context))
+        train_mask_override = None
+        n_rand = int(getattr(config, "train_random_days", 0) or 0)
+        if n_rand > 0:
+            # 2026-11 (F): n_rand random dates from train_years (the pool), test years excluded
+            rseed = getattr(config, "random_days_seed", None)
+            rseed = config.seed if rseed is None else int(rseed)
+            excl = getattr(config, "random_days_exclude_years", None) or config.test_years
+            train_mask_override = random_train_day_mask(X_time, config.train_years, excl, n_rand, rseed)
+            yrs = pd.DatetimeIndex([str(t)[:10] for t in np.asarray(X_time.values)[train_mask_override]]).year
+            print(f"  random training days: {n_rand} dates from pool {min(config.train_years)}-{max(config.train_years)} "
+                  f"(seed {rseed}); per year: {dict(zip(*np.unique(yrs, return_counts=True)))}")
+            np.save(os.path.join(config.output_dir, "train_day_mask.npy"), train_mask_override)
         (X_train_fields, Y_train_fields, X_test_fields, Y_test_fields,
          time_train, time_test, member_train, member_test) = split_train_test(
             X, Y, X_time, config.train_years, config.test_years, config.train_frac, seed=config.seed,
-            months=getattr(config, "months", None),
+            months=getattr(config, "months", None), train_mask_override=train_mask_override,
         )
 
     # ------------------------------------------------------------
     # Normalize
     # ------------------------------------------------------------
-    time_context = int(getattr(config, "time_context", 0) or 0)
     X_mean = X_train_fields.mean(dim=(0, 2, 3), keepdim=True)
     X_std = X_train_fields.std(dim=(0, 2, 3), keepdim=True)
     Y_mean = Y_train_fields.mean(dim=(0, 2, 3), keepdim=True)
@@ -2594,25 +2187,15 @@ def run_pipeline(config):
     Y_test = (Y_test_fields - Y_mean) / (Y_std + 1e-6)
 
     # ------------------------------------------------------------
-    # Patches, or single full sub-domain
+    # Crop to the sub-domain
     # ------------------------------------------------------------
-    if config.use_patches:
-        print("Extracting patches...")
-        X_train, Y_train, mask_train, _, _ = extract_patches(
-            X_train, Y_train, land_mask, config.context_size, config.target_size, config.stride,
-        )
-        X_test, Y_test, mask_test, test_tile_ids, tile_geometry = extract_patches(
-            X_test, Y_test, land_mask, config.context_size, config.target_size, config.stride,
-            llon=llon, llat=llat, hlon=hlon, hlat=hlat,
-        )
-    else:
-        print("Cropping to sub-domain (no patches)...")
-        X_train, Y_train, mask_train, _, _ = extract_full_domain(
-            X_train, Y_train, land_mask, llon, llat, hlon, hlat, config.subdomain,
-        )
-        X_test, Y_test, mask_test, test_tile_ids, tile_geometry = extract_full_domain(
-            X_test, Y_test, land_mask, llon, llat, hlon, hlat, config.subdomain,
-        )
+    print("Cropping to sub-domain...")
+    X_train, Y_train, mask_train, _, _ = extract_full_domain(
+        X_train, Y_train, land_mask, llon, llat, hlon, hlat, config.subdomain,
+    )
+    X_test, Y_test, mask_test, test_tile_ids, tile_geometry = extract_full_domain(
+        X_test, Y_test, land_mask, llon, llat, hlon, hlat, config.subdomain,
+    )
 
     print("X_train:   ", X_train.shape)
     print("Y_train:   ", Y_train.shape)
@@ -2662,30 +2245,14 @@ def run_pipeline(config):
           f"std={float(inc_std.flatten()[0]):.4f}")
 
     # ------------------------------------------------------------
-    # Optional high-res predictor channels (obs-eval test T3) and observation fine-tuning set (T1)
-    # ------------------------------------------------------------
-    aux_train = aux_test = None
-    n_aux = 0
-    if getattr(config, "aux_path", None) or getattr(config, "static_path", None):
-        aux_train, aux_test, n_aux = build_aux_channels(config, time_train, member_train, time_test, member_test, hlat, hlon)
-    obs_ft = None
-    if getattr(config, "obs_ft_x_path", None):
-        obs_ft = build_obs_finetune_set(config, X_mean, X_std, inc_mean, inc_std, land_mask, llon, llat, hlon, hlat,
-                                        Y_train.shape[-2:], time_context)
-
-    # ------------------------------------------------------------
     # Model
     # ------------------------------------------------------------
     model = UNet(
-        in_channels=X_train.shape[1], mask_channels=mask_train.shape[1] + n_aux,
+        in_channels=X_train.shape[1], mask_channels=mask_train.shape[1],
         noise_amp_map=getattr(config, "noise_amp_map", False),
-        attention_end=getattr(config, "attention_end", False),
-        attn_window_size=getattr(config, "attn_window_size", 8),
-        attn_num_heads=getattr(config, "attn_num_heads", 4),
         noise_channels=getattr(config, "noise_channels", 1),
         noise_kernel_size=getattr(config, "noise_kernel_size", 5),
         late_mask_fusion=getattr(config, "late_mask_fusion", False),
-        noise_kernel_size_final=getattr(config, "noise_kernel_size_final", None),
     )
     model = nn.DataParallel(model).to(device)
 
@@ -2696,33 +2263,19 @@ def run_pipeline(config):
         model.module.load_state_dict(state_dict)  # strict: architecture (incl. in_channels) must match exactly
         print("Pretrained weights loaded.")
 
-    # 2026-10-07 calibration options (default off): the "noise parameters" are the noise stages' width/amplitude scalars
-    # and the T2 amplitude-map heads -- everything that only scales or shapes the injected noise.
+    # --noise-lr-mult (2026-10-07, part of the final model): the "noise parameters" are the noise stages' width/amplitude
+    # scalars and the amplitude-map heads -- everything that only scales or shapes the injected noise.
     def _is_noise(name):
         return name.split(".")[0] in ("noise_d3", "noise_d2", "noise_d1", "noise_final", "amp_d3", "amp_d2", "amp_d1", "amp_final")
-    if getattr(config, "train_only_noise", False):
-        for name, prm in model.module.named_parameters():
-            prm.requires_grad_(_is_noise(name))
-        print(f"  train_only_noise: {sum(p.numel() for p in model.parameters() if p.requires_grad)} trainable parameters "
-              f"(noise scalars + amplitude heads); everything that sets the ensemble mean is frozen")
     mult = float(getattr(config, "noise_lr_mult", 1.0) or 1.0)
     trainable = [(n, p) for n, p in model.module.named_parameters() if p.requires_grad]
     if mult != 1.0:
         groups = [{"params": [p for n, p in trainable if not _is_noise(n)], "lr": config.lr},
-                  {"params": [p for n, p in trainable if _is_noise(n)], "lr": config.lr * mult, "noise_mult": mult}]
+                  {"params": [p for n, p in trainable if _is_noise(n)], "lr": config.lr * mult}]
         optimizer = optim.Adam([g for g in groups if g["params"]], lr=config.lr)
         print(f"  noise parameters at {mult:g}x lr ({config.lr * mult:.3g})")
     else:
         optimizer = optim.Adam([p for _, p in trainable], lr=config.lr)
-    # 2026-10-08 (--output-floor softplus): physical thickness = smooth_floor(raw, scale) in training *and* evaluation instead
-    # of clamp(min=0) at evaluation only, so noise can no longer add "free" ice over open water (negative noise was clamped
-    # away unseen by the loss, leaving members biased above ~0 m truth). Default "clamp" = unchanged.
-    floor = None
-    floor_mode = getattr(config, "output_floor", "clamp") or "clamp"
-    if floor_mode == "softplus":
-        floor = {"base": baseline_train_phys.cpu(), "inc_mean": inc_mean.to(device), "inc_std": (inc_std + 1e-6).to(device),
-                 "scale": float(getattr(config, "output_floor_scale", 0.02))}
-        print(f"  output floor: softplus, scale {floor['scale']} m (training loss + evaluation)")
     print("Model setup complete.")
 
     # ------------------------------------------------------------
@@ -2733,20 +2286,13 @@ def run_pipeline(config):
     ema = EmaWeights(model.module, ema_decay) if ema_decay > 0 and config.num_epochs > 0 else None
     if ema is not None:
         print(f"  EMA of weights, decay {ema_decay:g} (evaluation and model_state_dict.pt use the EMA weights)")
-    mean_mse_weight = float(getattr(config, "mean_mse_weight", 0.0) or 0.0)
-    if mean_mse_weight > 0:
-        print(f"  debiased ensemble-mean MSE term, weight {mean_mse_weight:g}")
     loss_array = train_model(
         model, optimizer, X_train, Y_train, mask_train, device, config.k, config.num_epochs, config.batch_size,
         coastal_width=config.coastal_width, coastal_boost=config.coastal_boost, beta=config.beta,
         deterministic_mse=getattr(config, "deterministic_mse", False),
-        crps_weight=getattr(config, "crps_weight", 0.0),
         energy_patch_size=int(getattr(config, "energy_patch_size", 0) or 0),
-        aux_train=aux_train, obs_ft=obs_ft,
-        floor=floor,
-        mean_mse_weight=mean_mse_weight, ema=ema,
-        lr_schedule=getattr(config, "lr_schedule", "constant") or "constant",
-        noise_lr_warmup_epochs=int(getattr(config, "noise_lr_warmup_epochs", 0) or 0),
+        ema=ema,
+        grad_accum_steps=int(getattr(config, "grad_accum_steps", 1) or 1),
     )
 
     if ema is not None:
@@ -2764,9 +2310,18 @@ def run_pipeline(config):
     # Evaluate
     # ------------------------------------------------------------
     print("Running evaluation...")
+    # 2026-11 (H.1, --noise-ablate): switch individual stages' noise off at inference only. Empty = unchanged.
+    ablate = [s for s in (getattr(config, "noise_ablate", None) or []) if s]
+    for s in ablate:
+        stage = getattr(model.module, f"noise_{s}", None)
+        if not isinstance(stage, GaussianNoiseStage):
+            raise ValueError(f"--noise-ablate: unknown stage {s!r} (use d3, d2, d1, final)")
+        stage.disabled = True
+    if ablate:
+        print(f"  noise ablated at inference: {ablate}")
     preds_all, Y_pred, Y_spread, Y_pred_det = evaluate_model(
         model, X_test, Y_test, mask_test, device, config.k_eval, config.eval_batch_size,
-        deterministic_only=getattr(config, "deterministic_mse", False), aux_test=aux_test,
+        deterministic_only=getattr(config, "deterministic_mse", False),
     )
 
     # De-normalize using the *increment's* own stats (not Y_mean/Y_std, which describe the
@@ -2783,12 +2338,6 @@ def run_pipeline(config):
     Y_spread_phys = Y_spread * (inc_std + 1e-6)
     Y_pred_det_phys = (Y_pred_det * (inc_std + 1e-6) + inc_mean + baseline_test_phys).clamp(min=0.0)
     preds_all_phys = (preds_all * (inc_std + 1e-6) + inc_mean + baseline_test_phys.unsqueeze(1)).clamp(min=0.0)
-    if floor is not None:
-        # same smooth floor as in training; the ensemble mean is the mean of the floored members
-        bt = baseline_test_phys.to(preds_all.device)
-        preds_all_phys = smooth_floor(preds_all * (inc_std + 1e-6).to(preds_all.device) + inc_mean.to(preds_all.device) + bt.unsqueeze(1), floor["scale"])
-        Y_pred_phys = preds_all_phys.mean(dim=1)
-        Y_pred_det_phys = smooth_floor(Y_pred_det * (inc_std + 1e-6).to(Y_pred_det.device) + inc_mean.to(Y_pred_det.device) + bt, floor["scale"])
     if getattr(config, "coarse_zero", False):
         # 2026-10-23 (--coarse-zero): members exactly 0 on ocean cells whose bilinear coarse SIT is exactly 0 (evaluation only,
         # see coarse_zero_mask); the ensemble mean is the mean of the constrained members, spread 0 on those cells
@@ -2834,12 +2383,8 @@ def run_pipeline(config):
     else:
         mesaclip_run = is_mesaclip_run(config.output_dir)
     # `hlat` here is still the full pre-crop grid Y_da.lat came from -- Y_test_phys etc. are
-    # cropped (patches or sub-domain, see extract_patches/extract_full_domain), so IIEE's
-    # cos(lat) weighting needs the matching cropped lat, which only tile_geometry carries.
-    # With patches, different tiles (and therefore different N samples) can sit at different
-    # latitudes, so a single (H,) lat array isn't valid across the whole batch -- same
-    # limitation already noted elsewhere for domain-mean metrics (patches mode skips those
-    # entirely). Only apply area weighting in the single-tile (no-patches) case.
+    # cropped to the sub-domain (extract_full_domain), so IIEE's cos(lat) weighting needs the
+    # matching cropped lat, which tile_geometry carries.
     metrics_hlat = tile_geometry[0]["target_lat"] if len(tile_geometry) == 1 else None
     metrics_df = compute_metrics_table(
         Y_base_phys, Y_pred_det_phys, Y_pred_phys, Y_spread_phys, Y_test_phys,
@@ -2862,16 +2407,13 @@ def run_pipeline(config):
     }
 
     # ------------------------------------------------------------
-    # SIT time series (no-patch mode only -- a single coherent domain
-    # makes a domain-mean time series meaningful; with tiled patches each
-    # test sample only covers a small, arbitrarily-placed window)
+    # Domain SIT time series
     # ------------------------------------------------------------
-    if not config.use_patches:
-        print("Computing domain SIT time series...")
-        timeseries_df = compute_domain_timeseries(
-            Y_pred_phys, Y_pred_det_phys, Y_base_phys, Y_test_phys, mask_test[0:1], time_test, config.output_dir,
-        )
-        result["timeseries_df"] = timeseries_df
+    print("Computing domain SIT time series...")
+    timeseries_df = compute_domain_timeseries(
+        Y_pred_phys, Y_pred_det_phys, Y_base_phys, Y_test_phys, mask_test[0:1], time_test, config.output_dir,
+    )
+    result["timeseries_df"] = timeseries_df
 
     # ------------------------------------------------------------
     # Save raw evaluation data for later, customizable notebook plotting
@@ -2884,7 +2426,7 @@ def run_pipeline(config):
         eval_dir = save_evaluation_data(
             config.output_dir, X_test_sit_phys, Y_base_phys, Y_pred_det_phys, preds_all_phys,
             Y_pred_phys, Y_test_phys, mask_test, test_tile_ids, tile_geometry,
-            time_test, land_mask, hlat, hlon, llat, llon, config.bbox, config.use_patches,
+            time_test, land_mask, hlat, hlon, llat, llon, config.bbox, False,
         )
         result["eval_data_dir"] = eval_dir
 

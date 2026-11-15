@@ -26,7 +26,7 @@ import sys
 import numpy as np
 import pandas as pd
 
-BACKUP = os.environ.get("CZ_BACKUP", "/glade/derecho/scratch/skygale/downscaling/coarse_zero_originals")
+BACKUP = os.environ.get("CZ_BACKUP", "/glade/derecho/scratch/skygale/downscaling/outputs/backups/coarse_zero_originals")
 
 
 def update_point_rows(csv, ed, d, methods):

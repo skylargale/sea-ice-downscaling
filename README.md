@@ -1,135 +1,64 @@
-# SeaIceDownscaling (Version 6)
+# SeaIceDownscaling
 
-> Final model: `recommended_config.md` (FINAL section; 2026-10-24: the 2026-10-07 configuration trained with an exponential moving average of the weights, with members set to zero at inference where the coarse input has no ice, evaluated with 20 members against the original, un-normalized truth). Rejected approaches, fixed bugs, kept limitations and the 2026-10-09 cleanup: the "What didn't work" subsection of the same file.
+Stochastic downscaling of Arctic sea ice thickness (SIT) from a 1° CESM-like input to a 0.1° regional grid (lat 60-75,
+lon -182 to -151, 150 x 310 cells) with **EngressNet**: a U-Net whose four decoder stages each add their own spatially
+correlated Gaussian noise, trained with an energy score so that each forward pass is one realistic ensemble member. The network
+predicts the standardized increment over the bilinear upsampling of the coarse SIT.
 
-## Purpose
-
-Version6 started as a deliberately narrow fork of `Version5/`'s code: same recommended-config
-toggles as Version5 initially (`STOCHASTIC_REFINE=true`, `NOISE_SIGMA=1.0`, `NOISE_SHARED_BIAS=true`,
-`DATA_VARIANT=avg`), but `functions_engressnet.py` unconditionally trains against a standardized
-*physical increment* (`Y_phys - baseline_phys`, normalized by the increment's own train-set
-mean/std, no internal bilinear-base residual add inside the model) instead of the standardized raw
-value — matching Brajard et al. 2026 (EGUsphere, Arctic SIT super-resolution via conditional
-diffusion)'s Eq. 4 / NVIDIA CorrDiff's residual construction. There is no toggle for this; it's
-simply how the model trains now. This part is unchanged and still true.
-
-Only the code and scripts needed for that one comparison were kept — Version6 was cloned from
-Version5's full script history (data-prep variants, a finished HPO study, CryoSat2/PIOMAS
-observing-system-design research, validation notebooks), and everything not load-bearing for
-this specific retrain-and-evaluate task was deleted (2026-09-15) to keep the fork legible. If you
-need any of that other material, it still exists unchanged in `Version5/`.
-
-**`LocallyConnected2d`/`stochastic_refine`/`enscale_net` permanently removed (2026-09-16).** The
-initial `STOCHASTIC_REFINE=true` retrain (`results/MESA_stochastic_refine_sweep_avg_sharedbias/`)
-showed the same patchy, unrealistic per-pixel texture in individual ensemble members that
-`Version5/recommended_config.md` had already root-caused to `LocallyConnected2d`'s per-location
-noise-mixing weights. Rather than keep sweeping around that known-bad mechanism, it — along with
-`enscale_net`, `noise_sigma`, `noise_shared_bias`, `noise_mix_kernel`, `noise_bias_smooth_weight`,
-and the `--freeze-backbone`/`set_noise_only_trainable` calibration path built around it — was
-deleted outright. `Version5/recommended_config.md`'s `STOCHASTIC_REFINE=true` recommendation no
-longer applies to this fork and should not be resurrected here.
-
-**The global latent `z` pathway that replaced it was itself replaced again (2026-09-16), same
-day.** Two comparison batches (`results/MESA_no_stochastic_refine_avg/`, z at 3 of 4 decoder
-stages; `results/MESA_z_inject_final_avg/`, z at all 4) confirmed a single shared/resized `z`
-was patchiness-free but over-dispersed (Spread/Error ~1.87 vs. the removed refiner's ~0.97).
-Root cause: `z` was drawn once at the bottleneck and merely bilinearly *resized* into every
-stage — resizing a coarse field can't add genuinely new high-frequency content, and reusing the
-identical field at every stage let its effects reinforce rather than average down, plausibly
-inflating the spread. **Current architecture**: each of the 4 decoder stages
-(`d3`/`d2`/`d1`/`final`) now has its own independent `GaussianNoiseStage` — a fresh noise draw at
-that stage's *own* resolution, correlated by a shared (translation-invariant, not per-location)
-5x5 Gaussian kernel with a learnable width, renormalized to undo the blur's own variance
-shrinkage, then scaled by a learnable per-stage amplitude. No `z`, no `z_proj_*`, no
-`--noise-smooth-kernel-size`, no `--latent-channels` (nothing left to size). Trained end-to-end
-via the plain (coastal-weighted) energy loss — no post-hoc calibration step (won't be available
-against real observations with no matching high-res truth) and no separate calibration loss term
-(deliberate choice). The high-res land mask and the former `--deep-mask-head` toggle's extra
-depth are now permanently folded into the final stage's noise/feature fusion, *before* that
-fusion runs (and before `attention_end`, if ever enabled) — not concatenated afterward as a
-separate late step the way every earlier version of this model did. See
-`training/functions_engressnet.py`'s `GaussianNoiseStage`/`UNet` docstrings for the full
-mechanism and reasoning. **Not yet retrained or evaluated under this exact architecture** — the
-two comparison batches above still reflect the single-global-`z` design, not this one.
+- Training data: two perfect-model pairs (coarse X and 0.1° truth Y from the same simulation): **FOSI** (CESM high-res,
+  JRA55-forced, 1 member) and **MESACLIP** (CESM high-res, 6 members). Daily, test year 2021. The final model (FINAL2) is one
+  model per dataset trained on 1,825 days drawn at random from 2000-2020; the submitted paper's model (FINAL1) used four
+  consecutive 5-year windows (2000-05, 05-10, 10-15, 15-20).
+- Observational application: PIOMAS as the coarse input (2010-2023), scored against ICESat-2 pass-cells (2018-2022).
+- **Final model and everything that was tried:** `recommended_config.md`. Superseded configurations and older write-ups:
+  `/glade/derecho/scratch/skygale/downscaling/archive/records/config_history.md`.
 
 ## Layout
 
-**Reorganized 2026-09-18 (two passes, same day)**: the old `submit/` folder (a separate tree of
-`qsub`-able scripts with symlinks back to the real code) was retired — every submit script now
-lives directly alongside the code/data it drives, and `results/`-style sensitivity-sweep output
-was split out into its own `sensitivity/` stage. PBS log files are kept in a dotted (hidden)
-`.logs/` folder so they don't clutter a plain `ls` of any stage. In a second pass the same day,
-`saved_figs/` moved under `evaluation/` (it's evaluation output, not its own top-level stage), and
-`paper_appendix/` was retired entirely — its figure-generating code moved into a new `figures/`
-stage, and everything else in it moved to whichever stage actually produces/uses it
-(`evaluation/` or `training/`). No content was deleted in either pass, only relocated.
+| Folder | What |
+|---|---|
+| `training/` | `functions_engressnet.py` (all pipeline logic: data, model, loss, training, evaluation, metrics), `train_engressnet.py` (CLI), the PBS templates `submit_engressnet_daily.sh` (FOSI) and `submit_engressnet_daily_mesa.sh` (MESACLIP), `submit_final2_training.sh` (every FINAL2 training run). |
+| `processing/` | Builders for the training pairs (`build_X_Y_from_{FOSI,MESA}-HR_daily.py`), the PIOMAS application inputs (3-step chain: `build_X_Y_PIOMAS_obs_2021_daily.py` -> `..._v2_landfixed.py` -> `build_X_PIOMAS_obs_2021_daily_v3_avg.py`; the "2021" names are historical, `FILE_TAG`/`CDR_*` env vars select years), `convert_PIOMAS_hiday_raw.py`, `build_input_swap.py` (other products as the coarse input). Each has a `submit_*.sh`. |
+| `evaluation/` | Core evaluation of saved runs: `run_daily_eval_batch.py` (per-run figures/tables), `build_4window_aggregate_figures.py` (pools the 4 windows), `recompute_{ocean_metrics,spread_skill}.py` (ocean-only corrected metrics -> `corrected_calibration/`), `regime_table.py` and `rank_hist_breakdown.py` (per-regime tables), `apply_coarse_zero_fields.py` and `restore_raw_truth.py` (the 2026-10-24 output rule and truth fix), `summarize_ensmean_sweep.py`, `member_metrics.py`. `submit_cz_metrics.sh` reruns the whole final metrics chain. |
+| `evaluation/diagnostics/` | One-off analyses whose results are quoted in the paper or in `recommended_config.md`: open-water/far-field breakdowns, open-water spread-skill split, analog baseline, inference timing. |
+| `evaluation/revisions/` | 2026-11 co-author revision analyses and the FINAL2 evaluation chain (`submit_final2_{eval_chain,metrics}.sh`). `final_set.py` picks the model: `FINAL_SET=final2` (default since 2026-11-15) or `final1` (submitted paper); outputs written with final2 carry a `_final2` suffix. Numbers in `results/revisions_2026-11/summary.md`. |
+| `evaluation/corrected_calibration/` | Metric records for the final batches. Records for deleted/rejected batches are in scratch `downscaling/archive/records/corrected_calibration/old_experiments/`. |
+| `evaluation/saved_figs/` | Figures/tables generated from `results/`, mirroring its `<batch>/<run>/` layout. |
+| `observations/` | Observed-SIT intercomparison and ICESat-2 scoring (own `README.md`). Notebooks are built from `notebook_src/*_src.py` (the source of truth) with `py2nb.py`. `inference/` holds the PIOMAS-input inference drivers. |
+| `figures/` | Paper figures: `v2/` (revised paper figures for FINAL2: all their code is `v2/make_v2_figures.py`, `# %%` cells, with the generated notebook `make_v2_figures.ipynb` and `submit_make_v2_figures.sh` to run it on a compute node; `v2/superseded_final1/` = the same figures for FINAL1), `final_figures/` (the submitted set), `all_figures_by_run.ipynb` (set `RUN`; run it on a PBS node, not the login node), `build_*.py` for the other figures, `final_chain/` (the two job chains that regenerate the FINAL1 figures, plus `final_results_summary.py`). |
+| `sensitivity/` | Appendix ablations (seed variance, late mask fusion, 2 noise channels, kernel 3/9): `analysis/` (figure/heatmap scripts + the CSVs and `.tex` they produce). The raw runs were deleted; the CSVs are the record; the sweep drivers are in scratch `downscaling/archive/records/sensitivity/submit/`. |
+| `results/` | FINAL2: `FINAL2_{MESA,FOSI}_{random1825,detmse_random1825,detmse_seedens}`, `PIOMAS_2018-2022_FINAL2_FOSI{,_detmse}`, `PIOMAS_2010-2023_cdrv6_FINAL2_FOSI`. FINAL1 (`FINAL_SET=final1`): `{FOSI,MESA}_{final,detmse}_ema`, `PIOMAS_2018-2022_FOSI_{final,detmse}_ema`, `PIOMAS_2010-2023_cdrv6_emaFOSI_4win`. Revision sweeps: `REV_{E1,E2,F,G,H}_*`. Revision numbers and tables: `revisions_2026-11/`. |
+| `weighted_grids/` | Cached xESMF regridding weights (a cache; names can be built at run time, e.g. the land-mask file). |
+| `logs/` | PBS output. Every stage's `.logs` is a symlink into it (`processing/`, `observations/`, `sensitivity/` use subfolders). |
+| `archive/` | Text-only copies of what was moved to scratch `downscaling/archive/records/` (insurance against scratch purges): `records_text_2026-11-13.tar.gz` (pre-cleanup code and records), `records_text_2026-11-15.tar.gz` (pre-pruning training code, retired revision drivers). |
 
-- `training/` — core library/CLI *and* its job-submission scripts, together:
-  `functions_engressnet.py` (all pipeline logic, including the increment/residual formulation
-  above), `train_engressnet.py` (CLI entry point), `submit_engressnet_daily.sh`/
-  `submit_engressnet_daily_mesa.sh` (the general-purpose, per-run PBS templates for FOSI/MESA
-  respectively — override any env var per-submission, e.g.
-  `qsub -v TRAIN_YEARS="2000-2005",TEST_YEARS="2021" submit_engressnet_daily_mesa.sh`, run from
-  inside `training/`), `submit_noise_cascade_sweep_{mesa,fosi}.sh` and
-  `submit_pretrain_mesa_then_fosi.sh` (self-relocating "sweep driver" scripts — run directly as
-  `./submit_....sh [--submit]`, not via `qsub`; they `cd` to their own directory, then `qsub` a
-  sibling template above by bare filename), `methods_reconstruction_addition.tex` (the paper's
-  reconstruction-equation snippet, describing `functions_engressnet.py`'s de-normalize +
-  bilinear-baseline-add step). `training/.logs` and `training/results` are symlinks back to the
-  real `.logs/`/`results/` one level up, needed because the templates above `cd` to wherever
-  they were `qsub`'d from and reference `results/`/`.logs/` by bare relative name.
-- `processing/` — the two production data-build pipelines this project trains against:
-  `build_X_Y_from_FOSI-HR_daily.{py,ipynb}` and `build_X_Y_from_MESA-HR_daily.{py,ipynb}`, each
-  with its own `submit_build_*.sh` and its own separate `.logs/` (distinct from the main
-  `Version6/.logs/` used by `training/`/`evaluation/`).
-- `evaluation/` — evaluation notebooks/scripts, their job-submission scripts, and their output:
-  `run_daily_eval_batch.py` (sections 00-16, including CRPS by SIT regime and per-member PSD
-  spread) with `submit_daily_eval_batch.sh`, `member_metrics.py`,
-  `build_4window_aggregate_figures.py` (pools the 4 train-window runs into one set of
-  rank-histogram/reliability/spread-skill/CRPS/PSD figures) with
-  `submit_4window_aggregate_figures.sh`, `build_analog_baseline.py` (nearest-neighbor
-  distributional baseline) with `submit_analog_baseline.sh`, `compare_all_batches.ipynb` with
-  `submit_compare_all_batches.sh`, `time_inference.py` (one-off GPU inference-cost timing for
-  the paper's computational-cost appendix, `computational_cost_appendix.tex`) with
-  `submit_time_inference.sh`. **`saved_figs/`** — evaluation figures/tables generated from
-  `results/`, mirroring its `<batch>/<run>/` structure, lives here too (moved from the `Version6/`
-  root 2026-09-18: it's this stage's output, not its own stage). The plain-template `submit_*.sh`
-  scripts here hardcode an absolute `cd` to `Version6/` (not `$PBS_O_WORKDIR`/`BASH_SOURCE`, both
-  of which were found to resolve incorrectly once PBS spools/copies the script at submission
-  time) — safe to `qsub` from anywhere; `evaluation/.logs` is still a symlink back to the real
-  `.logs/` since PBS's own `-o .logs/` output-file directive is resolved relative to wherever
-  `qsub` was invoked from, not the script's `cd` target. Anything that reads/writes `saved_figs`
-  by a bare relative path (e.g. `run_daily_eval_batch.py --save-root`, default now
-  `"evaluation/saved_figs"`) is still relative to the `Version6/` root, not to `evaluation/`
-  itself, since every submit script's `cd` target didn't change.
-- `figures/` — everything whose main job is producing a plot, pulled out of the old
-  `paper_appendix/` (retired 2026-09-18) plus the per-run figure notebook (moved from
-  `evaluation/`, since it's a figure tool, not an eval-pipeline one):
-  `all_figures_by_run.ipynb` (the "generate every figure for one run" notebook — set `RUN`/
-  `WINDOW` and run top to bottom), `build_fig7_piomas_application.py` /
-  `fig7_piomas_application_2020.png` (the observational-application figure),
-  `build_piomas_fosi_mesa_seasonal_cycle.py` / its `.csv`/`.png` output (the seasonal-cycle
-  consistency figure), and `paper_figures_export/` (the already-exported, submission-ready final
-  figure set). All three scripts use hardcoded absolute paths, so they don't care what directory
-  they're run from.
-- `sensitivity/` — everything for the per-stage noise-cascade sensitivity/ablation battery (seed
-  variance, mask-fusion timing, noise-channel count, kernel size 3/9), kept separate from the
-  flagship default-config runs in `results/`/`evaluation/saved_figs/`:
-  - `submit/` — the 5 sweep-driver scripts (`submit_noise_cascade_{k3,k9,latemask,nc2}_sweep_mesa.sh`,
-    `submit_noise_cascade_seedvar_mesa.sh`); run directly (`./submit_....sh --submit`), same
-    self-relocating convention as `training/`'s drivers, but `qsub`ing
-    `../../training/submit_engressnet_daily_mesa.sh` explicitly since the plain template they
-    drive lives in a different stage folder now.
-  - `results/`, `saved_figs/` — the 5 sensitivity batches' training output and generated figures.
-  - `analysis/` — `make_sensitivity_figure.py`/`make_sensitivity_heatmap.py` (regenerate
-    `sensitivity_tests.{png,pdf}`/`sensitivity_heatmap*.{png,pdf}` from hand-verified numbers, not
-    read live from `results/`) plus their `.tex`/`.csv` outputs, used by the paper's appendix.
-- `results/` — the flagship/default-config and retired-comparison runs' output (`metrics.csv`,
-  `eval_data/`, checkpoints), one subfolder per batch, one run-folder per split inside each.
-- `logs/` — all PBS stdout/stderr (reorganized 2026-10-09). `training/` and `evaluation/` jobs
-  write to `logs/` itself; `observations/`, `sensitivity/` and `processing/` jobs write to
-  `logs/observation_logs/`, `logs/sensitivity_logs/` and `logs/processing_logs/`. Each stage's
-  `.logs` is a symlink into this folder, so scripts that use a relative `-o .logs/` still work.
-- `recommended_config.md` — currently an unmodified copy of `Version5/recommended_config.md`
-  (the findings doc that established the recommended config this fork trains with); not yet
-  updated with Version6-specific results, since no training run has been submitted here yet.
+## Running
+
+Environment: `module load conda && conda activate seaice-downscaling` (Jupyter kernel of the same name). Account `P93300065`, Casper.
+
+```bash
+# train the final model (FINAL2): EngressNet, deterministic U-Net and seed ensemble; prints the qsub commands, --submit sends them
+training/submit_final2_training.sh FOSI --submit
+
+# evaluate (qsub from evaluation/ so the relative .logs/ resolves)
+cd evaluation
+qsub -v DS=FOSI revisions/submit_final2_eval_chain.sh     # truth fix, per-run tables, corrected metrics
+qsub -v BATCH_DIR=results/FOSI_final_ema submit_daily_eval_batch.sh      # any single batch
+qsub submit_cz_metrics.sh          # FINAL1: corrected metrics + regime / rank tables for the 4 final batches
+```
+
+Inference on new inputs is a training run with `NUM_EPOCHS=0`, `INIT_CHECKPOINT=...`, `TEST_X_PATH`/`TEST_Y_PATH`; see
+`observations/inference/submit_ema_obs_inference.py` and `submit_piomas_2010-2023_inference.py`.
+
+Data live on scratch (purged when left unused; don't keep the only copy of anything there).
+`/glade/derecho/scratch/skygale/downscaling` (details in its own `README.md`):
+
+| Path | What |
+|---|---|
+| `training_data/` | Perfect-model pairs: `{X,Y}_FOSI_HR_JRA55_daily*.nc`, `{X,Y}_MESA_HR_daily*.nc`, monthly FOSI (library defaults), the 2021 U10-conservative revision input; `mesa_hist_1920-2005/` (MESACLIP build intermediates), `conservative_targets/`. |
+| `application_inputs/` | `piomas_2010-2023/` (per-year PIOMAS inputs, CDR v6), `obs_inputs_2017-2022/` (PIOMAS / CS2SMOS / TOPAZ4-ML / Petty GPSat inputs for the ICESat-2 scoring, FOSI 25 km aux, static fields). |
+| `ancillary/` | `maps/` (etopo2), `observed_products/` (Landy, CDR, ERA5, NSIDC regions). |
+| `outputs/` | `pooled_obs_product/`, `revisions_2026-11/`, `backups/`. |
+| `archive/` | `records/` (moved out of this project: config history, old metric records, code snapshot, retired drivers, old test figures), `retired/` (~1.3 TB nobody reads, with a move manifest), `versions/` (Version1-5). |
+
+`/glade/derecho/scratch/skygale/observations` holds raw products and ICESat-2 pass-cells. The git mirror is `/glade/work/skygale/repos/sea-ice-downscaling`.

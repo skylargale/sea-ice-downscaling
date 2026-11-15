@@ -10,7 +10,7 @@
 # 15-25GB were observed interactively, so 128GB leaves ample headroom across a whole batch's
 # runs processed serially (each run's arrays are freed before the next one loads).
 #
-# Submit with:  qsub -v BATCH_DIR="results/FOSI_daily_combo_avg" submit_daily_eval_batch.sh
+# Submit with:  qsub -v BATCH_DIR="results/FOSI_final_ema" submit_daily_eval_batch.sh
 # Check status: qstat -u $USER
 # (normally invoked via submit_daily_eval_sweep.sh, which loops over every batch directory)
 # ==============================================================
@@ -27,7 +27,7 @@
 
 set -euo pipefail
 
-BATCH_DIR="${BATCH_DIR:?Must set BATCH_DIR, e.g. -v BATCH_DIR=results/FOSI_daily_combo_avg}"
+BATCH_DIR="${BATCH_DIR:?Must set BATCH_DIR, e.g. -v BATCH_DIR=results/FOSI_final_ema}"
 
 module load conda
 conda activate seaice-downscaling

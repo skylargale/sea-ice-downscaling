@@ -24,7 +24,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-BACKUP = os.environ.get("RT_BACKUP", "/glade/derecho/scratch/skygale/downscaling/coarse_zero_originals/pre_rawtruth")
+BACKUP = os.environ.get("RT_BACKUP", "/glade/derecho/scratch/skygale/downscaling/outputs/backups/coarse_zero_originals/pre_rawtruth")
 TOL = 1e-5
 
 

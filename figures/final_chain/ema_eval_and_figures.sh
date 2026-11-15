@@ -1,7 +1,7 @@
 #!/bin/bash
 # 2026-10-18 EMA model: daily evaluation outputs + 4-window aggregate figures (rank histograms, spread-skill and CRPS by regime,
 # PSD, community time series) for the adopted EngressNet + EMA batches and the matched det-MSE + EMA baseline.
-# Same steps as final_mesa_eval_and_figures.sh (2026-10-07), without the paper-figure notebook (re-run that once RUN is switched).
+# Same steps as the retired 2026-10-07 chain, without the paper-figure notebook (re-run that once RUN is switched).
 #PBS -N ema_eval_figs
 #PBS -l select=1:ncpus=4:mem=200GB
 #PBS -l walltime=10:00:00
