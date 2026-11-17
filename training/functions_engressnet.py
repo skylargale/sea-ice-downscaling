@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import torch.utils.checkpoint as torch_checkpoint
 import xarray as xr
 import xesmf as xe
 import pop_tools
@@ -214,11 +215,13 @@ def months_mask(time_coord, months):
     return np.array([int(m) in months_set for m in time_months])
 
 
-def random_train_day_mask(time_coord, pool_years, test_years, n_days, seed):
+def random_train_day_mask(time_coord, pool_years, test_years, n_days, seed, months=None):
     """2026-11 revisions, F (randomized-in-time training): boolean mask over time_coord selecting n_days distinct dates
     drawn uniformly without replacement from pool_years, never from test_years. All ensemble members of a chosen date
     are used (as in the contiguous windows). The draw depends only on (seed, pool, n_days)."""
     pool = years_mask(time_coord, pool_years) & ~years_mask(time_coord, test_years)
+    if months is not None:  # final-round sensitivity (season-only): draw the n_days from these calendar months only
+        pool = pool & months_mask(time_coord, months)
     idx = np.flatnonzero(pool)
     if n_days > idx.size:
         raise ValueError(f"train_random_days={n_days} exceeds the {idx.size} pool dates")
@@ -406,7 +409,7 @@ def collapse_wind_vector_channel(X, channel_names):
 # Land-sea mask
 # ==============================================================
 
-def build_land_sea_mask(hlat, hlon, bbox, bbox_regrid, weighted_grids_dir):
+def build_land_sea_mask(hlat, hlon, bbox, bbox_regrid, weighted_grids_dir, land_threshold=0.1):
     """
     Regrid the native POP ocean/land mask onto the high-res (Y) target grid
     and clip it to bbox. Regridding weights are cached in
@@ -468,7 +471,7 @@ def build_land_sea_mask(hlat, hlon, bbox, bbox_regrid, weighted_grids_dir):
     )
 
     ocean_frac_reg = regridder_ice_to_0p1deg(ocean_frac_src)
-    land_mask = (ocean_frac_reg < 0.1).astype(np.float32)  # 1 = land, 0 = ocean
+    land_mask = (ocean_frac_reg < land_threshold).astype(np.float32)  # 1 = land, 0 = ocean (threshold 0.1 = final model)
 
     land_mask = land_mask.sel(
         lat=slice(bbox["lat_min"], bbox["lat_max"]),
@@ -771,13 +774,14 @@ class GaussianNoiseStage(nn.Module):
         kernel2d = g[:, None] * g[None, :]
         return kernel2d.view(1, 1, self.kernel_size, self.kernel_size)
 
-    def forward(self, batch_size, height, width, device, dtype, deterministic=False, amp=None):
+    def forward(self, batch_size, height, width, device, dtype, deterministic=False, amp=None, eps=None):
         # `disabled` (2026-11 revisions, H.1 --noise-ablate): a plain attribute, not a parameter or buffer, set only at
         # inference to switch this one stage's noise off. Absent / False = unchanged.
         if deterministic or getattr(self, "disabled", False):
             return torch.zeros(batch_size, self.channels, height, width, device=device, dtype=dtype)
         kernel = self._kernel(device, dtype)
-        eps = torch.randn(batch_size, self.channels, height, width, device=device, dtype=dtype)
+        if eps is None:  # eps given only by the --global-noise sensitivity test (one field shared by all stages)
+            eps = torch.randn(batch_size, self.channels, height, width, device=device, dtype=dtype)
         blurred = F.conv2d(eps, kernel.expand(self.channels, 1, -1, -1), padding=self.kernel_size // 2, groups=self.channels)
         # Undo exactly the variance the blur itself introduced (Var(output) =
         # Var(input) * Sum(kernel_weight^2) for unit-variance input), so
@@ -794,10 +798,98 @@ class GaussianNoiseStage(nn.Module):
         return renormed * sigma
 
 
+class WindowedSelfAttention2d(nn.Module):
+    """
+    (Restored 2026-11-15 from the pre-pruning library for the final-round sensitivity test --attention-end.)
+    Non-overlapping windowed multi-head self-attention over a 2D feature
+    map (Swin-style W-MSA, not shifted), applied once at the very end of the
+    decoder -- a "sliding window" attention mechanism placed at the decoder
+    end rather than the encoder, a deliberate design choice (2026-08-06):
+    full quadratic self-attention over the whole up-sampled
+    field is too expensive at these domain sizes (e.g. ~150x310 for the
+    medium no-patch domain), and encoder-side attention operates several
+    layers upstream of where the model's coastal smoothing is actually
+    introduced (the bilinear decoder). Restricting attention to small local
+    windows keeps cost linear in H*W (O(H*W*window_size^2) instead of
+    O((H*W)^2)) while still letting each output pixel incorporate its local
+    neighborhood right before out_conv.
+
+    Pads H, W up to a multiple of window_size (reflect padding) before
+    windowing and crops back after, so this works for any domain crop size,
+    not just ones divisible by window_size -- no new constraint on top of
+    the existing divisor-8/16 sub-domain sizing rule.
+
+    max_window_batch chunks the flattened (B*nH*nW, ws*ws, C) call to
+    nn.MultiheadAttention instead of running it in one shot, AND each chunk
+    runs under torch.utils.checkpoint so its intermediate activations aren't
+    retained for backward (recomputed on demand instead). Both pieces turned
+    out necessary the hard way (2026-08-06): at the medium no-patch domain
+    (~150x310 up-sampled) with window_size=8 and a real training batch
+    (batch_size=16, K=20), B*nH*nW reaches ~237k. An un-chunked call tries
+    to materialize a (237k*num_heads, 64, 64) attention-score tensor and
+    OOMs outright (tried to allocate 14.47 GiB). Chunking alone (bounding
+    each individual attention call's peak to ~256 MiB) still OOM'd on the
+    resubmitted jobs -- turns out standard autograd retains *every* chunk's
+    saved activations simultaneously across the whole sequential loop, so
+    the *total* memory across ~58 chunks accumulated to more than the GPU
+    had left after the rest of the model's own activations (the medium-
+    domain baseline already runs close to the 32GB ceiling at K=20/batch=16
+    without any attention module at all). Per-chunk checkpointing discards
+    each chunk's activations immediately after producing its output and
+    recomputes them during backward, so only one chunk's activations exist
+    in memory at a time regardless of how many chunks there are -- the fix
+    that actually worked, confirmed against the same OOMing jobs.
+
+    The standalone smoke test that validated this module before use only
+    used a tiny synthetic batch (B=2) and never exercised a batch size close
+    to a real training step, which is why none of this was caught until the
+    actual comparison-batch jobs ran on the GPU.
+    """
+
+    def __init__(self, channels, window_size=8, num_heads=4, max_window_batch=4096):
+        super().__init__()
+        if channels % num_heads != 0:
+            raise ValueError(f"channels ({channels}) must be divisible by num_heads ({num_heads}).")
+        self.window_size = window_size
+        self.max_window_batch = max_window_batch
+        self.attn = nn.MultiheadAttention(embed_dim=channels, num_heads=num_heads, batch_first=True)
+        self.norm = nn.LayerNorm(channels)
+
+    def _run_chunk(self, x_chunk):
+        attn_chunk, _ = self.attn(x_chunk, x_chunk, x_chunk)
+        return self.norm(attn_chunk + x_chunk)  # residual, then normalize
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        ws = self.window_size
+        pad_h = (ws - H % ws) % ws
+        pad_w = (ws - W % ws) % ws
+        x_p = F.pad(x, (0, pad_w, 0, pad_h), mode="reflect") if (pad_h or pad_w) else x
+        Hp, Wp = H + pad_h, W + pad_w
+
+        # (B, C, Hp, Wp) -> non-overlapping ws x ws windows -> (B*nH*nW, ws*ws, C)
+        x_w = x_p.unfold(2, ws, ws).unfold(3, ws, ws)  # (B, C, nH, nW, ws, ws)
+        nH, nW = x_w.shape[2], x_w.shape[3]
+        x_w = x_w.permute(0, 2, 3, 4, 5, 1).reshape(B * nH * nW, ws * ws, C)
+
+        chunks = []
+        for i in range(0, x_w.shape[0], self.max_window_batch):
+            x_chunk = x_w[i:i + self.max_window_batch]
+            if self.training and x_chunk.requires_grad:
+                chunks.append(torch_checkpoint.checkpoint(self._run_chunk, x_chunk, use_reentrant=False))
+            else:
+                chunks.append(self._run_chunk(x_chunk))
+        attn_out = torch.cat(chunks, dim=0)
+
+        attn_out = attn_out.reshape(B, nH, nW, ws, ws, C).permute(0, 5, 1, 3, 2, 4).reshape(B, C, Hp, Wp)
+        return attn_out[:, :, :H, :W]
+
+
 class UNet(nn.Module):
 
     def __init__(self, in_channels, mask_channels=1,
-                 noise_channels=1, noise_kernel_size=5, late_mask_fusion=False, noise_amp_map=False):
+                 noise_channels=1, noise_kernel_size=5, late_mask_fusion=False, noise_amp_map=False,
+                 global_noise=False, encoder_depth=4, attention_end=False, attn_window_size=8, attn_num_heads=4):
         """
         Note on stochastic ensemble generation (redesigned 2026-09-16): each
         of the four decoder stages (d3, d2, d1, final) has its own
@@ -981,6 +1073,21 @@ class UNet(nn.Module):
             )
         self.out_conv = nn.Conv2d(32, 1, 3, padding=1)
 
+        # ---- final-round sensitivity tests (2026-11-15), all off for the final model. New modules are created after every
+        # existing one and only when enabled, so the default model's parameter initialisation is unchanged. ----
+        self.global_noise = bool(global_noise)  # one white-noise field drawn at the output grid, resized to every stage
+        if encoder_depth not in (4, 5):
+            raise ValueError(f"encoder_depth must be 4 or 5, got {encoder_depth}")
+        self.encoder_depth = int(encoder_depth)
+        if self.encoder_depth == 5:  # +1 encoder block (4th max-pool) and the matching decoder block; no extra noise stage
+            self.pool4 = nn.MaxPool2d(2)
+            self.enc5 = conv_block(512, 512)
+            self.up4 = nn.Sequential(nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False), nn.Conv2d(512, 512, 3, padding=1))
+            self.dec4 = conv_block(1024, 512)
+        self.attention_end = bool(attention_end)
+        if self.attention_end:  # windowed self-attention on the fused 32-channel output features (as before 2026-11-15)
+            self.attn_end = WindowedSelfAttention2d(32, window_size=attn_window_size, num_heads=attn_num_heads)
+
 
     def forward(self, x, up_size, mask=None, deterministic=False):
 
@@ -1003,28 +1110,39 @@ class UNet(nn.Module):
         e4 = self.enc4(self.pool3(e3))
 
         # Bottleneck
-        b = self.bottleneck(e4)
+        if getattr(self, "encoder_depth", 4) == 5:
+            b = self.bottleneck(self.enc5(self.pool4(e4)))
+            b = self.dec4(torch.cat([self.up4(b), e4], dim=1))
+        else:
+            b = self.bottleneck(e4)
+
+        # --global-noise: one white-noise field at the output grid; every stage gets it bilinearly resized (None = each
+        # stage draws its own, the final model)
+        zg = None
+        if getattr(self, "global_noise", False) and not deterministic:
+            zg = torch.randn(B, self.noise_final.channels, *up_size, device=x.device, dtype=x.dtype)
+        gz = (lambda t: None) if zg is None else (lambda t: F.interpolate(zg, size=t.shape[-2:], mode="bilinear", align_corners=False))
 
         amp = (lambda head, feat: F.softplus(head(feat))) if self.noise_amp_map else (lambda head, feat: None)
 
         # Decoder
         d3 = self.up3(b)
         n3 = self.noise_proj_d3(self.noise_d3(B, *d3.shape[-2:], d3.device, d3.dtype, deterministic,
-                                              amp=amp(getattr(self, "amp_d3", None), d3)))
+                                              amp=amp(getattr(self, "amp_d3", None), d3), eps=gz(d3)))
         d3 = self.concat_d3(torch.cat([d3, n3], dim=1))
         d3 = torch.cat([d3, e3], dim=1)
         d3 = self.dec3(d3)
 
         d2 = self.up2(d3)
         n2 = self.noise_proj_d2(self.noise_d2(B, *d2.shape[-2:], d2.device, d2.dtype, deterministic,
-                                              amp=amp(getattr(self, "amp_d2", None), d2)))
+                                              amp=amp(getattr(self, "amp_d2", None), d2), eps=gz(d2)))
         d2 = self.concat_d2(torch.cat([d2, n2], dim=1))
         d2 = torch.cat([d2, e2], dim=1)
         d2 = self.dec2(d2)
 
         d1 = self.up1(d2)
         n1 = self.noise_proj_d1(self.noise_d1(B, *d1.shape[-2:], d1.device, d1.dtype, deterministic,
-                                              amp=amp(getattr(self, "amp_d1", None), d1)))
+                                              amp=amp(getattr(self, "amp_d1", None), d1), eps=gz(d1)))
         d1 = self.concat_d1(torch.cat([d1, n1], dim=1))
         d1 = torch.cat([d1, e1], dim=1)
         d1 = self.dec1(d1)
@@ -1037,12 +1155,14 @@ class UNet(nn.Module):
         amp_f = amp(getattr(self, "amp_final", None), d1)
         if amp_f is not None:
             amp_f = F.interpolate(amp_f, size=up.shape[-2:], mode="bilinear", align_corners=False)
-        nf = self.noise_proj_final(self.noise_final(B, *up.shape[-2:], up.device, up.dtype, deterministic, amp=amp_f))
+        nf = self.noise_proj_final(self.noise_final(B, *up.shape[-2:], up.device, up.dtype, deterministic, amp=amp_f, eps=gz(up)))
 
         if self.late_mask_fusion:
             # Ablation-only path (see docstring): mask stays out of the fusion until
             # after the noise-only fusion, matching every earlier version of this model.
             out = self.final_conv(torch.cat([up, nf], dim=1))
+            if getattr(self, "attention_end", False):
+                out = self.attn_end(out)
             if self.mask_channels > 0:
                 out = torch.cat([out, mask.to(out.dtype)], dim=1)
                 out = self.mask_head(out)
@@ -1051,6 +1171,8 @@ class UNet(nn.Module):
             if self.mask_channels > 0:
                 fuse_parts.append(mask.to(up.dtype))
             out = self.final_conv(torch.cat(fuse_parts, dim=1))
+            if getattr(self, "attention_end", False):
+                out = self.attn_end(out)
 
         out = self.out_conv(out)
 
@@ -2025,7 +2147,8 @@ def run_pipeline(config):
     # Land-sea mask
     # ------------------------------------------------------------
     print("Building land-sea mask...")
-    land_mask = build_land_sea_mask(hlat, hlon, config.bbox, config.bbox_regrid, config.weighted_grids_dir)
+    land_mask = build_land_sea_mask(hlat, hlon, config.bbox, config.bbox_regrid, config.weighted_grids_dir,
+                                    land_threshold=getattr(config, "land_threshold", 0.1))
     print(X.shape, Y.shape, land_mask.shape)
 
     proj, boundary_path, central_lon = make_polar_proj(config.bbox)
@@ -2146,7 +2269,8 @@ def run_pipeline(config):
             rseed = getattr(config, "random_days_seed", None)
             rseed = config.seed if rseed is None else int(rseed)
             excl = getattr(config, "random_days_exclude_years", None) or config.test_years
-            cross_mask = random_train_day_mask(X_time, config.train_years, excl, int(config.train_random_days), rseed)
+            cross_mask = random_train_day_mask(X_time, config.train_years, excl, int(config.train_random_days), rseed,
+                                              months=getattr(config, "months", None))
             print(f"  random training days (normalization): {int(cross_mask.sum())} dates, seed {rseed}, excluded {sorted(set(excl))[:3]}...")
         X_train_fields, Y_train_fields, time_train, member_train = select_by_years(
             X, Y, X_time, config.train_years, months=getattr(config, "months", None), train_mask_override=cross_mask,
@@ -2162,7 +2286,8 @@ def run_pipeline(config):
             rseed = getattr(config, "random_days_seed", None)
             rseed = config.seed if rseed is None else int(rseed)
             excl = getattr(config, "random_days_exclude_years", None) or config.test_years
-            train_mask_override = random_train_day_mask(X_time, config.train_years, excl, n_rand, rseed)
+            train_mask_override = random_train_day_mask(X_time, config.train_years, excl, n_rand, rseed,
+                                                   months=getattr(config, "months", None))
             yrs = pd.DatetimeIndex([str(t)[:10] for t in np.asarray(X_time.values)[train_mask_override]]).year
             print(f"  random training days: {n_rand} dates from pool {min(config.train_years)}-{max(config.train_years)} "
                   f"(seed {rseed}); per year: {dict(zip(*np.unique(yrs, return_counts=True)))}")
@@ -2190,11 +2315,12 @@ def run_pipeline(config):
     # Crop to the sub-domain
     # ------------------------------------------------------------
     print("Cropping to sub-domain...")
+    crop_div = 16 if getattr(config, "encoder_depth", 4) == 5 else 8  # one more max-pool needs a 16-divisible crop
     X_train, Y_train, mask_train, _, _ = extract_full_domain(
-        X_train, Y_train, land_mask, llon, llat, hlon, hlat, config.subdomain,
+        X_train, Y_train, land_mask, llon, llat, hlon, hlat, config.subdomain, divisor=crop_div,
     )
     X_test, Y_test, mask_test, test_tile_ids, tile_geometry = extract_full_domain(
-        X_test, Y_test, land_mask, llon, llat, hlon, hlat, config.subdomain,
+        X_test, Y_test, land_mask, llon, llat, hlon, hlat, config.subdomain, divisor=crop_div,
     )
 
     print("X_train:   ", X_train.shape)
@@ -2253,6 +2379,9 @@ def run_pipeline(config):
         noise_channels=getattr(config, "noise_channels", 1),
         noise_kernel_size=getattr(config, "noise_kernel_size", 5),
         late_mask_fusion=getattr(config, "late_mask_fusion", False),
+        global_noise=getattr(config, "global_noise", False),
+        encoder_depth=getattr(config, "encoder_depth", 4),
+        attention_end=getattr(config, "attention_end", False),
     )
     model = nn.DataParallel(model).to(device)
 

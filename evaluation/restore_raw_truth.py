@@ -59,6 +59,8 @@ def raw_truth(cfg):
     da = xr.open_dataset(path)["Y"]
     years = set(int(y) for y in cfg["test_years"])
     tsel = np.array([t.year in years for t in da["time"].values])
+    if cfg.get("months"):  # runs restricted to some calendar months (--months): the test set is too
+        tsel &= np.array([t.month in set(int(m) for m in cfg["months"]) for t in da["time"].values])
     sd = cfg["subdomain"]
     la = crop(da.lat.values, sd["lat_min"], sd["lat_max"])
     lo = crop(da.lon.values % 360, sd["lon_min"] % 360, sd["lon_max"] % 360)

@@ -145,6 +145,15 @@ def parse_args():
     p.add_argument("--random-days-exclude-years", default=None,
                    help="With --train-random-days: years excluded from the date pool (default: --test-years). Inference of a "
                         "random-days model on other test years must pass the training run's test years here (e.g. 2021).")
+    # final-round sensitivity tests (2026-11-15); defaults = final model
+    p.add_argument("--land-threshold", type=float, default=0.1,
+                   help="Ocean-fraction cutoff below which a 0.1 deg cell is land (final model 0.1).")
+    p.add_argument("--global-noise", dest="global_noise", action="store_true",
+                   help="One white-noise field at the output grid, resized to every decoder stage (sensitivity test).")
+    p.add_argument("--encoder-depth", type=int, default=4, choices=(4, 5),
+                   help="Encoder blocks; 5 adds a 4th max-pool and its decoder block (needs a 16-divisible crop).")
+    p.add_argument("--attention-end", dest="attention_end", action="store_true",
+                   help="Windowed self-attention on the fused output features (sensitivity test).")
     p.add_argument("--noise-ablate", default="",
                    help="H.1: comma-separated noise stages to switch off at inference only (d3,d2,d1,final). Empty = none.")
 
@@ -228,6 +237,10 @@ def main():
         grad_accum_steps=args.grad_accum_steps,
         random_days_exclude_years=fe.parse_years(args.random_days_exclude_years) if args.random_days_exclude_years else None,
     )
+    # final-round sensitivity options: recorded only when set, so final-model run configs are unchanged
+    for key, default in (("land_threshold", 0.1), ("global_noise", False), ("encoder_depth", 4), ("attention_end", False)):
+        if getattr(args, key) != default:
+            setattr(config, key, getattr(args, key))
 
     fe.run_pipeline(config)
 

@@ -304,6 +304,21 @@ spread/error: 1 = calibrated. Lower CRPS is better.
   `results/revisions_2026-11/mult_clip_check.csv`). New: `training/submit_final2_training.sh`.
 - Pre-pruning training code: in `records/revisions_2026-11/training_preprune_2026-11-15/`.
 
+#### Appendix A sensitivity tests on the final design (final round, 2026-11-15..17; numbers in `results/revisions_2026-11/summary.md` item 3)
+
+- Flags added, all default-off: `--land-threshold` (ocean-fraction cutoff, final 0.1), `--global-noise` (one noise field for all
+  stages), `--encoder-depth` (final 4), `--attention-end` (end-of-decoder windowed self-attention, restored from the pruned code for
+  this test only; needs `--grad-accum-steps 4` on a 32 GB V100), random days drawn within `--months`. Template env vars
+  LAND_THRESHOLD, GLOBAL_NOISE, ENCODER_DEPTH, ATTENTION_END. Final-model flags checked bit-identical to the pre-change library
+  (`training/check_sensitivity_flags.sh`).
+- Driver `training/submit_sensitivity_final2.sh` (phases phase1 / topup / only:<config>), scorer
+  `evaluation/revisions/sensitivity_final2_metrics.py` (+ `submit_sensitivity_final2_eval.sh`), heatmaps = Figs. A1/A2 cells of
+  `figures/v2/make_v2_figures.py`. 2021 conservative truth: `processing/build_conservative_2021.py`.
+- Outcome: the final design stands. Average coarsening (vs interp, +23-27% RMSE) and EMA (+2-3%) matter; land threshold, conservative
+  truth, Mar-Jul training, domain size, encoder depth, noise kernel/channels/global/uncorrelated and late fusion change RMSE/CRPS by
+  <~1.5% like-for-like. Noise lr x10, the amplitude map and energy tile 10 cost ~2% FOSI RMSE/CRPS for more spread (spread-skill
+  1.00 vs 0.92-0.96; MESA RMSE/CRPS unchanged); kept because the model is still under-dispersed against ICESat-2 (spread/error 0.44).
+
 #### Records and unused data moved to scratch (2026-11-13, second pass)
 
 - Project -> `/glade/derecho/scratch/skygale/downscaling/archive/records/`: `code_snapshot_2026-11-13.tar.gz`, `config_history.md`,

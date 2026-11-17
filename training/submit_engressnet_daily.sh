@@ -79,6 +79,10 @@ RANDOM_DAYS_SEED="${RANDOM_DAYS_SEED:-}"               # seed of the date draw (
 RANDOM_DAYS_EXCLUDE_YEARS="${RANDOM_DAYS_EXCLUDE_YEARS:-}"   # inference of a random-days model on other years: the training run's test years
 NOISE_ABLATE="${NOISE_ABLATE:-}"                       # stages to switch off at inference, e.g. "d3" or "d2,d1"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"              # same gradient in N chunks (less GPU memory); 1 = off
+LAND_THRESHOLD="${LAND_THRESHOLD:-}"                   # final-round sensitivity: ocean-fraction land cutoff (empty = 0.1)
+GLOBAL_NOISE="${GLOBAL_NOISE:-false}"                  # final-round sensitivity: one noise field shared by all stages
+ENCODER_DEPTH="${ENCODER_DEPTH:-}"                     # final-round sensitivity: 5 = one more encoder block (empty = 4)
+ATTENTION_END="${ATTENTION_END:-false}"                # final-round sensitivity: end-of-decoder windowed attention
 
 # Optional batch folder: output goes to results/<BATCH_NAME>/<jobname>_<train>_<test>_<jobid> instead of flat results/.
 BATCH_NAME="${BATCH_NAME:-}"
@@ -123,6 +127,10 @@ ARGS=(--x-path "$X_PATH" --y-path "$Y_PATH" --num-epochs "$NUM_EPOCHS" --k "$K" 
 [ -n "$TEST_X_PATH" ] && ARGS+=(--test-x-path "$TEST_X_PATH" --test-y-path "$TEST_Y_PATH")
 [ -n "$LR" ] && ARGS+=(--lr "$LR")
 [ "$LATE_MASK_FUSION" = true ] && ARGS+=(--late-mask-fusion)
+[ -n "$LAND_THRESHOLD" ] && ARGS+=(--land-threshold "$LAND_THRESHOLD")
+[ "$GLOBAL_NOISE" = true ] && ARGS+=(--global-noise)
+[ -n "$ENCODER_DEPTH" ] && ARGS+=(--encoder-depth "$ENCODER_DEPTH")
+[ "$ATTENTION_END" = true ] && ARGS+=(--attention-end)
 [ "$DETERMINISTIC_MSE" = true ] && ARGS+=(--deterministic-mse)
 [ "$NOISE_AMP_MAP" = true ] && ARGS+=(--noise-amp-map)
 [ "$ENERGY_PATCH_SIZE" != 0 ] && ARGS+=(--energy-patch-size "$ENERGY_PATCH_SIZE")
