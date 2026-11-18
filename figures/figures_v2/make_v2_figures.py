@@ -626,7 +626,59 @@ plt.close(fig)
 show("fig03_domain_resolution.png")
 
 # %% [markdown]
-# ### Figure 5: Example fields with difference rows
+# ### Figure 5: Accuracy metrics (perfect model)
+
+# %%
+# --- style ---
+rc = {"font.size": 12, "axes.spines.top": False, "axes.spines.right": False, "axes.edgecolor": MUTED,
+      "axes.grid": True, "grid.color": "#e6e5e0", "grid.linewidth": 0.6, "axes.axisbelow": True, "legend.frameon": False}
+figsize = (16, 7.5)
+panels = [  # (metric column, y label, value format, y limits or None)
+    ("RMSE", "RMSE (m)", "{:.3f}", None),
+    ("MAE", "MAE (m)", "{:.3f}", None),
+    ("Pattern Corr", "Pattern Correlation (r)", "{:.2f}", (0.8, 1.0)),
+    ("Grad MAE", "Gradient MAE (m)", "{:.3f}", None),
+    ("SSIM", "SSIM", "{:.2f}", (0.8, 1.0)),
+    ("IIEE (1e-4 m)", "IIEE", "{:.3f}", None),
+    ("ACC", "Anomaly Correlation", "{:.2f}", (0.6, 1.0)),
+    # ("IIEE (0.15 m)", "IIEE, 0.15 m threshold", "{:.3f}", None),
+]
+methods = ["Bilinear", "Deterministic U-Net", "EngressNet"]
+LEGEND_LABELS = {"EngressNet": "EngressNet Ensemble Mean"}
+bar_span, bar_fill = 0.8, 0.92
+value_fontsize, value_rotation, legend_fontsize = 10, 0, 12
+headroom = 1.22   # y-axis room above the tallest bar for the labels
+
+# --- data ---
+A = pd.read_csv(f"{BASE}/results/revisions_2026-11/accuracy_metrics{SFX}.csv").set_index(["dataset", "method"])
+datasets = ["MESACLIP", "FOSI"]
+
+# --- plot ---
+with matplotlib.rc_context(rc):
+    fig = plt.figure(figsize=figsize, constrained_layout=True)
+    axs = fig.subplots(2, 4).ravel()
+    for ax, (metric, ylabel, fmt, ylim) in zip(axs, panels):
+        x = np.arange(len(datasets)); w = bar_span / len(methods)
+        for i, m in enumerate(methods):
+            v = [A.loc[(ds, m), metric] for ds in datasets]
+            xs = x + (i - (len(methods) - 1) / 2) * w
+            ax.bar(xs, v, w * bar_fill, color=METHOD_COLORS[m], label=LEGEND_LABELS.get(m, m), edgecolor="white", linewidth=1)
+            for xi, vi in zip(xs, v):
+                ax.text(xi, vi, " " + fmt.format(vi), ha="center", va="bottom", fontsize=value_fontsize, color=INK, rotation=value_rotation)
+        ax.set_xticks(x); ax.set_xticklabels(datasets)
+        ax.set_ylabel(ylabel); ax.grid(axis="x", visible=False)
+        lo, hi = ylim if ylim else (0, ax.get_ylim()[1])
+        ax.set_ylim(lo, lo + (hi - lo) * headroom)
+    for ax in axs[len(panels):]:   # remove axes the panels don't use
+        ax.remove()
+    handles, labels = axs[0].get_legend_handles_labels()
+    fig.legend(handles, labels, fontsize=legend_fontsize, frameon=False, loc="outside lower center", ncols=len(methods))
+    fig.savefig(out("fig05_accuracy_metrics.png"), dpi=300)
+    plt.close(fig)
+show("fig05_accuracy_metrics.png")
+
+# %% [markdown]
+# ### Figure 6: Example fields with difference rows
 
 # %%
 # --- dates ---
@@ -717,34 +769,110 @@ cb.set_ticks([-0.5, -0.25, 0, 0.25, 0.5])
 cb.set_ticklabels(["-0.5", "-0.25", "0", "0.25", "0.5"])
 cb.ax.tick_params(labelsize=16)
 
-fig.savefig(out("fig05_example_fields.png"), dpi=300, bbox_inches="tight")
+fig.savefig(out("fig06_example_fields.png"), dpi=300, bbox_inches="tight")
 plt.close(fig)
-show("fig05_example_fields.png")
+show("fig06_example_fields.png")
 
 # %% [markdown]
-# ### Figure 6: Rank histogram
+# ### Figure 7: Probabilistic metrics (perfect model)
 
 # %%
+# --- style ---
+rc = {"font.size": 12, "axes.spines.top": False, "axes.spines.right": False, "axes.edgecolor": MUTED,
+      "axes.grid": True, "grid.color": "#e6e5e0", "grid.linewidth": 0.6, "axes.axisbelow": True, "legend.frameon": False}
+figsize = (13, 7.5)
+panels = [  # (D_metrics row, y label, value format, scale, y limits or None)
+    ("CRPS (point mass: MAE)", "CRPS (m)", "{:.3f}", 1, None),
+    ("ES whole field / sqrt(n_ocean) (beta=1)", "Energy Score / √n (m)", "{:.2f}", 1, None),
+    ("Variogram score (p=0.5, 1000 cells)", "Variogram Score", "{:.2f}", 1, None),
+    ("FSS thr=0.5 m n=1", "Fraction Skill Score", "{:.2f}", 1, (0.9, 1.0)),
+    ("Spread-skill (corrected)", "Spread-Skill (calibrated = 1)", "{:.2f}", 1, None),
+    ("Rank: fraction outside ensemble", "Truths Outside Ensemble (%)", "{:.1f}", 100, None),
+]
+methods = ["Bilinear", "Deterministic U-Net", "EngressNet", "Seed/window ensemble (det.)"]
+LEGEND_LABELS = {"EngressNet": "EngressNet (K = 20)", "Seed/window ensemble (det.)": "Seed ensemble (K = 10 det. U-Nets)"}
+SINGLE = ["Bilinear", "Deterministic U-Net"]   # single predictions: CRPS = MAE (†), no spread-skill / % outside
+ENSEMBLE_ONLY = ["Spread-skill (corrected)", "Rank: fraction outside ensemble"]
+bar_span, bar_fill = 0.8, 0.92
+value_fontsize, value_rotation, legend_fontsize = 10, 0, 12
+headroom = 1.22
+ideal_line = dict(color=INK, lw=2)          # ideal fraction outside, per bar
+ssr_line = dict(color=INK, lw=1, ls="--")   # spread-skill = 1
+footnote = ("† single prediction: CRPS = MAE. FSS of a single prediction uses its 0/1 exceedance field."
+            " Spread-skill and % outside: ensembles only.")
+outfile = "fig07_probabilistic_metrics.png"
+
+# --- data ---
+D = {ds: pd.read_csv(f"{BASE}/results/revisions_2026-11/D_metrics{SFX}/{pre}_{FS[pre]['windows'][0]}.csv", index_col=0)
+         .apply(pd.to_numeric, errors="coerce") for ds, pre in (("MESACLIP", "MESA"), ("FOSI", "FOSI"))}
+datasets = list(D)
+
+# --- plot ---
+with matplotlib.rc_context(rc):
+    fig = plt.figure(figsize=figsize, constrained_layout=True)
+    axs = fig.subplots(2, 3).ravel()
+    for ax, (row, ylabel, fmt, scale, ylim) in zip(axs, panels):
+        x = np.arange(len(datasets)); w = bar_span / len(methods)
+        x = np.arange(len(datasets)); w = bar_span / len(methods)   # same bar width in every panel
+        shown = [m for m in methods if not (row in ENSEMBLE_ONLY and m in SINGLE)]   # spread-skill / % outside: ensembles only
+        for i, m in enumerate(shown):
+            xs = x + (i - (len(shown) - 1) / 2) * w   # centred on each dataset tick
+            v = [scale * D[ds].loc[row, m] for ds in datasets]
+            ax.bar(xs, v, w * bar_fill, color=METHOD_COLORS[m], label=LEGEND_LABELS.get(m, m), edgecolor="white", linewidth=1)
+            for xi, vi, ds in zip(xs, v, datasets):
+                dagger = "†" if row.startswith("CRPS") and m in SINGLE else ""
+                rot = 45 if row.startswith("CRPS") else value_rotation   # tilt only the upper-left (CRPS) panel's values
+                ax.text(xi, vi, " " + fmt.format(vi) + dagger, ha="left" if rot else "center", va="bottom",
+                        fontsize=value_fontsize, color=INK, rotation=rot, rotation_mode="anchor")
+                if row.startswith("Rank"):
+                    ideal = scale * D[ds].loc["Rank: ideal outside fraction", m]
+                    ax.plot([xi - w * bar_fill / 2, xi + w * bar_fill / 2], [ideal, ideal], **ideal_line, zorder=4)
+        if row.startswith("Spread"):
+            ax.axhline(1.0, **ssr_line)
+        ax.set_xticks(x); ax.set_xticklabels(datasets)
+        ax.set_ylabel(ylabel); ax.grid(axis="x", visible=False)
+        lo, hi = ylim if ylim else (0, ax.get_ylim()[1])
+        ax.set_ylim(lo, lo + (hi - lo) * headroom)
+    handles, labels = axs[0].get_legend_handles_labels()
+    handles.append(plt.Line2D([], [], **ideal_line)); labels.append("Ideal 2/(K+1)")
+    fig.legend(handles, labels, fontsize=legend_fontsize, frameon=False, loc="outside upper center", ncols=len(handles))
+    fig.text(0.5, -0.01, footnote, ha="center", va="top", fontsize=10, color=MUTED)
+    fig.savefig(out(outfile), dpi=300, bbox_inches="tight")
+    plt.close(fig)
+show(outfile)
+
+# %% [markdown]
+# ### Figure 8: Rank histogram, spread-skill by ice type
+
+# %%
+# --- data ---
 rank_hist_df = pd.read_csv(os.path.join(FIG_DATA, "rank_histogram.csv"), index_col=0)
 rank_regime_df = pd.read_csv(os.path.join(FIG_DATA, "rank_histogram_by_regime.csv"), index_col=0)
+ss = pd.read_csv(os.path.join(FIG_DATA, "spread_skill_by_regime.csv"), index_col=0)
+ss = ss[ss["SIT regime"] != "All ocean cells"]
 K = len(rank_hist_df) - 1
 expected_freq = rank_hist_df["expected_frequency"].iloc[0]
 regime_colors = [SODIUM[0], SODIUM[3], SODIUM[5], SODIUM[6]]   # open water, thin, moderate, thick
 regime_short = {"Open water/frazil (0-0.15 m)": "Open Water/Frazil", "Thin ice (0.15-0.5 m)": "Thin Ice",
                 "Moderate ice (0.5-1.0 m)": "Moderate Ice", "Thick ice (>1.0 m)": "Thick Ice"}
+bins = [b.replace(" (", "\n").replace(")", "") for b in ss["SIT regime"].tolist()]
+x = np.arange(len(bins))
 
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 5))
+fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 10))
+
+# (A) rank histogram, all ocean cells
 ax1.bar(rank_hist_df["rank"], rank_hist_df["frequency"], width=0.85, color=SODIUM[3], alpha=0.85, label="Observed Frequency")
 ax1.axhline(expected_freq, color="black", linestyle="--", linewidth=2, label="Ideal Uniform Frequency")
 ax1.set_xlabel(f"Number of ensemble members below the truth (of {K})", fontsize=14)
 ax1.set_ylabel("Frequency", fontsize=14)
-ax1.set_title("(A) Rank Histogram (All Ocean Cells)", fontsize=16, loc='left')
+ax1.set_title("(A) Rank Histogram (All Ocean Cells)", fontsize=16, loc="left")
 ax1.tick_params(axis="both", labelsize=14)
-ax1.legend(fontsize=14, frameon=True, loc='lower left')
+ax1.legend(fontsize=14, frameon=True, loc="lower left")
 ax1.set_xlim(-0.5, 20.5)
 ax1.set_ylim(0, 0.059)
 ax1.set_xticks([0, 5, 10, 15, 20])
 
+# (B) rank curves by SIT type
 total = rank_regime_df["count"].sum()
 ax2.axhline(1.0, color="black", linestyle="--", linewidth=2)
 for (label, grp), color in zip(rank_regime_df.groupby("SIT regime", sort=False), regime_colors):
@@ -752,61 +880,102 @@ for (label, grp), color in zip(rank_regime_df.groupby("SIT regime", sort=False),
     ax2.plot(grp["rank"], grp["relative_frequency"], linewidth=4, color=color, label=f"{regime_short.get(label, label)} ({share:.0%} of cells)")
 ax2.set_xlabel(f"Number of ensemble members below the truth (of {K})", fontsize=14)
 ax2.set_ylabel("Relative to ideal (calibrated = 1)", fontsize=14)
-ax2.set_title("(B) Rank Curves by SIT Type", fontsize=16, loc='left')
+ax2.set_title("(B) Rank Curves by SIT Type", fontsize=16, loc="left")
 ax2.tick_params(axis="both", labelsize=14)
-ax2.legend(fontsize=14, frameon=False, loc='upper center')
+ax2.legend(fontsize=14, frameon=False, loc="upper center")
 ax2.set_xlim(0, 20)
 ax2.set_ylim(0.75, 1.25)
 ax2.set_xticks([0, 5, 10, 15, 20])
 
+# (C) spread vs error by SIT type
+width = 0.35
+ax3.bar(x - width / 2, ss["RMS spread, (K+1)/K-corrected (m)"], width, color=SODIUM[3], label=r"Ensemble Spread ($\sqrt{\frac{K+1}{K}\,\overline{s^2}}$)")
+ax3.bar(x + width / 2, ss["RMSE (m)"], width, color=SODIUM[0], label="Ensemble-Mean RMSE")
+ax3.set_xticks(x)
+ax3.set_xticklabels(bins)
+ax3.tick_params(axis="both", labelsize=14)
+ax3.set_ylabel("Sea ice thickness (m)", fontsize=14)
+ax3.set_title("(C) Spread vs. Error by SIT Type", fontsize=16, loc="left")
+ax3.legend(fontsize=14, frameon=False, loc="upper left")
+ax3.set_yticks([0, 0.05, 0.1, 0.15, 0.2])
+ax3.set_yticklabels(["0", "0.05", "0.1", "0.15", "0.2"])
+
+# (D) spread-skill ratio by SIT type
+ax4.bar(x, ss["Spread-skill ratio (1.0 = calibrated)"], color=SODIUM[5], alpha=0.85)
+ax4.axhline(1.0, color="black", linestyle="--", linewidth=2, label="Perfect Calibration")
+ax4.set_xticks(x)
+ax4.set_xticklabels(bins)
+ax4.tick_params(axis="both", labelsize=14)
+ax4.set_ylabel("Spread-Skill Ratio", fontsize=14)
+ax4.set_title("(D) Spread-Skill Ratio by SIT Type", fontsize=16, loc="left")
+ax4.legend(fontsize=14, frameon=False, loc="upper right")
+ax4.set_yticks([0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0])
+ax4.set_yticklabels(["0", "0.25", "0.5", "0.75", "1.0", "1.25", "1.5", "1.75", "2.0"])
+
 fig.tight_layout()
-fig.savefig(out("fig06_rank_histogram.png"), dpi=300, bbox_inches="tight")
+fig.savefig(out("fig08_rank_spread_skill.png"), dpi=300, bbox_inches="tight")
 plt.close(fig)
-show("fig06_rank_histogram.png")
+show("fig08_rank_spread_skill.png")
+
 
 # %% [markdown]
-# ### Figure 7: Spread vs error by SIT type
+# ### Figure 9: Community bias vs. actual values
+#
+# Left: nearest-cell bias at each community (FOSI hatched). Right: yearly mean SIT at the nearest cell (open = truth).
 
 # %%
-ss = pd.read_csv(os.path.join(FIG_DATA, "spread_skill_by_regime.csv"), index_col=0)
-ss = ss[ss["SIT regime"] != "All ocean cells"]
-bins = [
-    b.replace(" (", "\n").replace(")", "")
-    for b in ss["SIT regime"].tolist()
-]
-x = np.arange(len(bins))
+# --- style ---
+rc = {"font.size": 10, "axes.spines.top": False, "axes.spines.right": False, "axes.edgecolor": MUTED,
+      "axes.grid": True, "grid.color": "#e6e5e0", "grid.linewidth": 0.6, "axes.axisbelow": True, "legend.frameon": False}
+figsize = (8, 4)
+communities = ["Point Hope", "Kivalina", "Kotzebue", "Shishmaref", "Nome"]
+tick_rotation = 0
+value_markers = {"MESACLIP": "o", "FOSI": "s"}
+truth_size, model_size, dataset_offset = 60, 28, 0.3
+values_ylabel, values_title, values_ylim = "Mean SIT at nearest cell, 2021 (m)", "", (0, 0.95)
+# legend text per series; {dset} becomes MESACLIP / FOSI
+legend_text = {
+    "truth": "Truth, {dset}",
+    "EngressNet": "EngressNet, {dset}",
+    "det": "Deterministic, {dset}",
+}
+values_legend = dict(ncol=2, loc="upper center", frameon=True)
+# font sizes
+label_fontsize = 12    # axis labels (y label)
+tick_fontsize = 12     # tick labels (community names, y values)
+title_fontsize = 12
+legend_fontsize = 12
 
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 5))
-width = 0.35
-ax1.bar(x - width / 2, ss["RMS spread, (K+1)/K-corrected (m)"], width, color=SODIUM[3], label=r"Ensemble Spread ($\sqrt{\frac{K+1}{K}\,\overline{s^2}}$)")
-ax1.bar(x + width / 2, ss["RMSE (m)"], width, color=SODIUM[0], label="Ensemble-Mean RMSE")
-ax1.set_xticks(x)
-ax1.set_xticklabels(bins)
-ax1.tick_params(axis="both", labelsize=14)
-ax1.set_ylabel("Sea ice thickness (m)", fontsize=14)
-ax1.set_title("(A) Spread vs. Error by SIT Type", fontsize=16, loc='left')
-ax1.legend(fontsize=14, frameon=False, loc="upper left")
-ax1.set_yticks([0, 0.05, 0.1, 0.15, 0.2])
-ax1.set_yticklabels(["0", "0.05", "0.1", "0.15", "0.2"])
+# --- data ---
+t = pd.read_csv(f"{BASE}/results/revisions_2026-11/table4_community{SFX}.csv")
 
-ax2.bar(x, ss["Spread-skill ratio (1.0 = calibrated)"], color=SODIUM[5], alpha=0.85)
-ax2.axhline(1.0, color="black", linestyle="--", linewidth=2, label="Perfect Calibration")
-ax2.set_xticks(x)
-ax2.set_xticklabels(bins)
-ax2.tick_params(axis="both", labelsize=14)
-ax2.set_ylabel("Spread-Skill Ratio", fontsize=14)
-ax2.set_title("(B) Spread-Skill Ratio by SIT Type", fontsize=16, loc='left')
-ax2.legend(fontsize=14, frameon=False, loc="upper right")
-ax2.set_yticks([0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0])
-ax2.set_yticklabels(["0", "0.25", "0.5", "0.75", "1.0", "1.25", "1.5", "1.75", "2.0"])
+# --- plot ---
+with matplotlib.rc_context(rc):
+    fig = plt.figure(figsize=figsize, constrained_layout=True)
+    ax_vals = fig.subplots()
+    x = np.arange(len(communities))
 
-fig.tight_layout()
-fig.savefig(out("fig07_spread_skill_regime.png"), dpi=300, bbox_inches="tight")
-plt.close(fig)
-show("fig07_spread_skill_regime.png")
+    for i, (dset, mk) in enumerate(value_markers.items()):
+        sub = t[t.Dataset == dset].set_index("Community").loc[communities]
+        off = (i - 0.5) * dataset_offset
+        ax_vals.scatter(x + off, sub["Truth mean yr"], marker=mk, s=truth_size, facecolor="white", edgecolor=INK, lw=1.5, zorder=3,
+                        label=legend_text["truth"].format(dset=dset))
+        ax_vals.scatter(x + off, sub["EngressNet mean yr"], marker=mk, s=model_size, color=METHOD_COLORS["EngressNet"], zorder=4,
+                        label=legend_text["EngressNet"].format(dset=dset))
+        ax_vals.scatter(x + off, sub["Det mean yr"], marker=mk, s=model_size, color=METHOD_COLORS["Deterministic U-Net"], zorder=4,
+                        label=legend_text["det"].format(dset=dset))
+    ax_vals.set_xticks(x); ax_vals.set_xticklabels(communities, rotation=tick_rotation, ha="center")
+    ax_vals.set_ylabel(values_ylabel, fontsize=label_fontsize)
+    ax_vals.tick_params(axis="both", labelsize=tick_fontsize)
+    ax_vals.legend(fontsize=legend_fontsize, **values_legend)
+    ax_vals.set_ylim(*values_ylim); ax_vals.grid(axis="x", visible=False)
+
+    fig.savefig(out("fig09_community_bias.png"), dpi=300)
+    plt.close(fig)
+show("fig09_community_bias.png")
 
 # %% [markdown]
-# ### Figure 8: Observed seasonal cycle
+# ### Figure 10: Observed seasonal cycle
 
 # %%
 seasonal_df = pd.read_csv(os.path.join(BASE, "figures", "piomas_fosi_mesa_seasonal_cycle_2021.csv"), index_col=0)
@@ -830,9 +999,9 @@ ax.grid(alpha=0.2)
 ax.legend(fontsize=12, loc="upper right")
 
 fig.tight_layout()
-fig.savefig(out("fig08_obs_seasonal_cycle.png"), dpi=300, bbox_inches="tight")
+fig.savefig(out("fig10_obs_seasonal_cycle.png"), dpi=300, bbox_inches="tight")
 plt.close(fig)
-show("fig08_obs_seasonal_cycle.png")
+show("fig10_obs_seasonal_cycle.png")
 
 # %%
 sc = pd.read_csv(os.path.join(FIG_DATA, "seasonal_cycle_2021.csv"), index_col=0)
@@ -876,12 +1045,12 @@ ax.set_xlim(1, 12)
 ax.grid(alpha=0.2)
 
 fig.tight_layout()
-fig.savefig(out("supp/simulated_seasonal_cycle.png"), dpi=300, bbox_inches="tight")
+fig.savefig(out("supplementary/simulated_seasonal_cycle.png"), dpi=300, bbox_inches="tight")
 plt.close(fig)
-show("supp/simulated_seasonal_cycle.png")
+show("supplementary/simulated_seasonal_cycle.png")
 
 # %% [markdown]
-# ### Figure 9: PIOMAS application
+# ### Figure 11: PIOMAS application
 
 # %%
 import matplotlib.dates as mdates
@@ -936,12 +1105,12 @@ for j, name in enumerate(["Kivalina", "Point Hope"]):   # bottom row: point seri
     ax.set_yticks(np.arange(0, 2.51, 0.5))
     ax.set_yticklabels(["0", "0.5", "1", "1.5", "2", "2.5"])
 
-fig.savefig(out("fig09_piomas_application.png"), dpi=300, bbox_inches="tight")
+fig.savefig(out("fig11_piomas_application.png"), dpi=300, bbox_inches="tight")
 plt.close(fig)
-show("fig09_piomas_application.png")
+show("fig11_piomas_application.png")
 
 # %% [markdown]
-# #### Figure 9 supplement: ICESat-2 vs downscaled SIT
+# #### Figure 11 supplement: ICESat-2 vs downscaled SIT
 
 # %%
 D = fig09_data()
@@ -980,9 +1149,9 @@ ax.legend(fontsize=10, frameon=False, loc="upper left")
 ax.set_title(f"ICESat-2 vs downscaled PIOMAS\n(N = {ok.sum():,} pass-cells)", fontsize=12)
 
 fig.tight_layout()
-fig.savefig(out("fig09b_supp_is2_scatter.png"), dpi=300, bbox_inches="tight")
+fig.savefig(out("supplementary/fig11_is2_scatter.png"), dpi=300, bbox_inches="tight")
 plt.close(fig)
-show("fig09b_supp_is2_scatter.png")
+show("supplementary/fig11_is2_scatter.png")
 
 # %% [markdown]
 # ### Figure A1: MESACLIP sensitivity tests
@@ -1055,14 +1224,7 @@ if res:
     show("figA2_fosi_sensitivity.png")
 
 # %% [markdown]
-# ## Tables -> Figures
-
-# %% [markdown]
-# #### Accuracy figure (Section 4.1): ensemble mean / single prediction, perfect model
-#
-# Bilinear, deterministic U-Net and the EngressNet ensemble mean (2021, ocean cells, MESACLIP and FOSI), from
-# `results/revisions_2026-11/accuracy_metrics_<FINAL_SET>.csv` (`evaluation/revisions/accuracy_metrics.py`; same definitions as the
-# tables). The Appendix version below adds the seed-ensemble mean. Output: `fig_accuracy.png`
+# ### Figure A3: Accuracy metrics with the seed-ensemble mean
 
 # %%
 # --- style ---
@@ -1079,12 +1241,12 @@ panels = [  # (metric column, y label, value format, y limits or None)
     ("IIEE (0.15 m)", "IIEE, 0.15 m threshold", "{:.3f}", None),
     ("ACC", "Anomaly correlation", "{:.3f}", (0.6, 1.0)),
 ]
-methods = ["Bilinear", "Deterministic U-Net", "EngressNet"]
-LEGEND_LABELS = {"EngressNet": "EngressNet ensemble mean"}
+methods = ["Bilinear", "Deterministic U-Net", "EngressNet", "Seed/window ensemble (det.)"]
+LEGEND_LABELS = {"EngressNet": "EngressNet Ensemble Mean", "Seed/window ensemble (det.)": "Seed-Ensemble Mean (10 det. U-Nets)"}
 bar_span, bar_fill = 0.8, 0.92
-value_fontsize, value_rotation, legend_fontsize = 9, 90, 12
-headroom = 1.22   # y-axis room above the tallest bar for the labels
-outfile = "fig_accuracy.png"
+value_fontsize, value_rotation, legend_fontsize = 10, 60, 12
+headroom = 1.22
+outfile = "figA3_accuracy_seed_ensemble.png"
 
 # --- data ---
 A = pd.read_csv(f"{BASE}/results/revisions_2026-11/accuracy_metrics{SFX}.csv").set_index(["dataset", "method"])
@@ -1113,204 +1275,349 @@ with matplotlib.rc_context(rc):
 show(outfile)
 
 # %% [markdown]
-# #### Appendix accuracy figure: as above, with the seed-ensemble mean
-#
-# Adds the mean of the 10 det-MSE U-Nets trained on the same 1,825 days (seeds 0-9). Output: `figA_accuracy_seed_ensemble.png`
-
-# %%
-# --- style ---
-rc = {"font.size": 12, "axes.spines.top": False, "axes.spines.right": False, "axes.edgecolor": MUTED,
-      "axes.grid": True, "grid.color": "#e6e5e0", "grid.linewidth": 0.6, "axes.axisbelow": True, "legend.frameon": False}
-figsize = (16, 7.5)
-panels = [  # (metric column, y label, value format, y limits or None)
-    ("RMSE", "RMSE (m)", "{:.3f}", None),
-    ("MAE", "MAE (m)", "{:.3f}", None),
-    ("Pattern Corr", "Pattern correlation (r)", "{:.3f}", (0.8, 1.0)),
-    ("Grad MAE", "Gradient MAE (m)", "{:.4f}", None),
-    ("SSIM", "SSIM", "{:.3f}", (0.8, 1.0)),
-    ("IIEE (1e-4 m)", "IIEE, 1e-4 m threshold", "{:.3f}", None),
-    ("IIEE (0.15 m)", "IIEE, 0.15 m threshold", "{:.3f}", None),
-    ("ACC", "Anomaly correlation", "{:.3f}", (0.6, 1.0)),
-]
-methods = ["Bilinear", "Deterministic U-Net", "EngressNet", "Seed/window ensemble (det.)"]
-LEGEND_LABELS = {"EngressNet": "EngressNet ensemble mean", "Seed/window ensemble (det.)": "Seed-ensemble mean (10 det. U-Nets)"}
-bar_span, bar_fill = 0.8, 0.92
-value_fontsize, value_rotation, legend_fontsize = 9, 90, 12
-headroom = 1.22
-outfile = "figA_accuracy_seed_ensemble.png"
-
-# --- data ---
-A = pd.read_csv(f"{BASE}/results/revisions_2026-11/accuracy_metrics{SFX}.csv").set_index(["dataset", "method"])
-datasets = ["MESACLIP", "FOSI"]
-
-# --- plot ---
-with matplotlib.rc_context(rc):
-    fig = plt.figure(figsize=figsize, constrained_layout=True)
-    axs = fig.subplots(2, 4).ravel()
-    for ax, (metric, ylabel, fmt, ylim) in zip(axs, panels):
-        x = np.arange(len(datasets)); w = bar_span / len(methods)
-        for i, m in enumerate(methods):
-            v = [A.loc[(ds, m), metric] for ds in datasets]
-            xs = x + (i - (len(methods) - 1) / 2) * w
-            ax.bar(xs, v, w * bar_fill, color=METHOD_COLORS[m], label=LEGEND_LABELS.get(m, m), edgecolor="white", linewidth=1)
-            for xi, vi in zip(xs, v):
-                ax.text(xi, vi, " " + fmt.format(vi), ha="center", va="bottom", fontsize=value_fontsize, color=INK, rotation=value_rotation)
-        ax.set_xticks(x); ax.set_xticklabels(datasets)
-        ax.set_ylabel(ylabel); ax.grid(axis="x", visible=False)
-        lo, hi = ylim if ylim else (0, ax.get_ylim()[1])
-        ax.set_ylim(lo, lo + (hi - lo) * headroom)
-    handles, labels = axs[0].get_legend_handles_labels()
-    fig.legend(handles, labels, fontsize=legend_fontsize, frameon=False, loc="outside lower center", ncols=len(methods))
-    fig.savefig(out(outfile), dpi=300)
-    plt.close(fig)
-show(outfile)
+# ## Supplementary figures
 
 # %% [markdown]
-# #### Probabilistic figure (Section 4.3): perfect model
-#
-# Bilinear, deterministic U-Net, EngressNet (20 members) and the seed ensemble (10 det-MSE U-Nets), from
-# `results/revisions_2026-11/D_metrics_<FINAL_SET>/` (`spatial_prob_metrics.py`). CRPS: K^2 estimator as the tables; a single
-# prediction's CRPS is its MAE (marked †). FSS (0.5 m, 1 px) uses the ensemble exceedance probability, the 0/1 exceedance field for
-# a single prediction. Spread-skill and % of truths outside the ensemble are left blank for the single predictions; black ticks:
-# ideal fraction outside, 2/(K+1). Output: `fig_probabilistic.png`
+# ### Figure S1: Domain-mean SIT time series
 
 # %%
-# --- style ---
-rc = {"font.size": 12, "axes.spines.top": False, "axes.spines.right": False, "axes.edgecolor": MUTED,
-      "axes.grid": True, "grid.color": "#e6e5e0", "grid.linewidth": 0.6, "axes.axisbelow": True, "legend.frameon": False}
-figsize = (13, 7.5)
-panels = [  # (D_metrics row, y label, value format, scale, y limits or None)
-    ("CRPS (point mass: MAE)", "CRPS (m)", "{:.4f}", 1, None),
-    ("ES whole field / sqrt(n_ocean) (beta=1)", "Energy score / √n (m)", "{:.3f}", 1, None),
-    ("Variogram score (p=0.5, 1000 cells)", "Variogram score", "{:.4f}", 1, None),
-    ("FSS thr=0.5 m n=1", "FSS (0.5 m, 1 px)", "{:.3f}", 1, (0.9, 1.0)),
-    ("Spread-skill (corrected)", "Spread-skill (1 = calibrated)", "{:.2f}", 1, None),
-    ("Rank: fraction outside ensemble", "Truths outside ensemble (%)", "{:.1f}", 100, None),
-]
-methods = ["Bilinear", "Deterministic U-Net", "EngressNet", "Seed/window ensemble (det.)"]
-LEGEND_LABELS = {"EngressNet": "EngressNet (20 members)", "Seed/window ensemble (det.)": "Seed ensemble (10 det. U-Nets)"}
-SINGLE = ["Bilinear", "Deterministic U-Net"]   # single predictions: CRPS = MAE (†), no spread-skill / % outside
-ENSEMBLE_ONLY = ["Spread-skill (corrected)", "Rank: fraction outside ensemble"]
-bar_span, bar_fill = 0.8, 0.92
-value_fontsize, value_rotation, legend_fontsize = 9, 90, 12
-headroom = 1.22
-ideal_line = dict(color=INK, lw=2)          # ideal fraction outside, per bar
-ssr_line = dict(color=INK, lw=1, ls="--")   # spread-skill = 1
-footnote = ("† single prediction: CRPS = MAE.  FSS of a single prediction uses its 0/1 exceedance field.  "
-            "Spread-skill and % outside: ensembles only; black ticks = ideal 2/(K+1).")
-outfile = "fig_probabilistic.png"
-
-# --- data ---
-D = {ds: pd.read_csv(f"{BASE}/results/revisions_2026-11/D_metrics{SFX}/{pre}_{FS[pre]['windows'][0]}.csv", index_col=0)
-         .apply(pd.to_numeric, errors="coerce") for ds, pre in (("MESACLIP", "MESA"), ("FOSI", "FOSI"))}
-datasets = list(D)
-
-# --- plot ---
-with matplotlib.rc_context(rc):
-    fig = plt.figure(figsize=figsize, constrained_layout=True)
-    axs = fig.subplots(2, 3).ravel()
-    for ax, (row, ylabel, fmt, scale, ylim) in zip(axs, panels):
-        x = np.arange(len(datasets)); w = bar_span / len(methods)
-        for i, m in enumerate(methods):
-            xs = x + (i - (len(methods) - 1) / 2) * w
-            if row in ENSEMBLE_ONLY and m in SINGLE:   # blank slot, keeps the method positions aligned across panels
-                ax.bar(xs, [0, 0], w * bar_fill, color=METHOD_COLORS[m], label=LEGEND_LABELS.get(m, m))
-                continue
-            v = [scale * D[ds].loc[row, m] for ds in datasets]
-            ax.bar(xs, v, w * bar_fill, color=METHOD_COLORS[m], label=LEGEND_LABELS.get(m, m), edgecolor="white", linewidth=1)
-            for xi, vi, ds in zip(xs, v, datasets):
-                dagger = "†" if row.startswith("CRPS") and m in SINGLE else ""
-                ax.text(xi, vi, " " + fmt.format(vi) + dagger, ha="center", va="bottom", fontsize=value_fontsize, color=INK,
-                        rotation=value_rotation)
-                if row.startswith("Rank"):
-                    ideal = scale * D[ds].loc["Rank: ideal outside fraction", m]
-                    ax.plot([xi - w * bar_fill / 2, xi + w * bar_fill / 2], [ideal, ideal], **ideal_line, zorder=4)
-        if row.startswith("Spread"):
-            ax.axhline(1.0, **ssr_line)
-        ax.set_xticks(x); ax.set_xticklabels(datasets)
-        ax.set_ylabel(ylabel); ax.grid(axis="x", visible=False)
-        lo, hi = ylim if ylim else (0, ax.get_ylim()[1])
-        ax.set_ylim(lo, lo + (hi - lo) * headroom)
-    handles, labels = axs[0].get_legend_handles_labels()
-    handles.append(plt.Line2D([], [], **ideal_line)); labels.append("ideal outside, 2/(K+1)")
-    fig.legend(handles, labels, fontsize=legend_fontsize, frameon=False, loc="outside upper center", ncols=len(handles))
-    fig.text(0.5, -0.01, footnote, ha="center", va="top", fontsize=10, color=MUTED)
-    fig.savefig(out(outfile), dpi=300, bbox_inches="tight")
-    plt.close(fig)
-show(outfile)
+ts = pd.read_csv(os.path.join(FIG_DATA, "domain_mean_sit_timeseries.csv"), index_col=0, parse_dates=["time"])
+ts = rolled(ts, ["truth", "stochastic_unet_mean", "deterministic_unet", "bilinear", "piomas"], rdeb.ROLLING_DAYS_TIMESERIES)
+fig, ax = plt.subplots(figsize=(10, 4))
+for label, col, color, ls, lw in [("Truth", "truth", "k", "-", 2),
+                                  ("EngressNet Ensemble Mean", "stochastic_unet_mean", METHOD_COLORS["EngressNet"], "-", 1.5),
+                                  ("Deterministic", "deterministic_unet", METHOD_COLORS["Deterministic U-Net"], "-", 1.5),
+                                  ("Bilinear", "bilinear", METHOD_COLORS["Bilinear"], "-", 1.5),
+                                  ("PIOMAS", "piomas", MUTED, "--", 1.5)]:
+    if ts[col].notna().sum():
+        ax.plot(ts["time"], ts[col], label=label, color=color, ls=ls, lw=lw)
+ax.set_ylabel("Domain-mean SIT (m)")
+ax.legend(frameon=True, fontsize=10, ncols=2)
+fig.autofmt_xdate()
+ax.set_xlim(ts["time"].min(), ts["time"].max())
+fig.tight_layout()
+ax.grid(alpha=0.2)
+fig.savefig(out("supplementary/domain_mean_timeseries.png"), dpi=300, bbox_inches="tight")
+plt.close(fig)
+show("supplementary/domain_mean_timeseries.png")
 
 # %% [markdown]
-# #### Table 7: Community bias vs. actual values
-#
-# Left: nearest-cell bias at each community (FOSI hatched). Right: yearly mean SIT at the nearest cell (open = truth).
+# ### Figure S2: Domain-mean pattern correlation time series
 
 # %%
-# --- style ---
-rc = {"font.size": 10, "axes.spines.top": False, "axes.spines.right": False, "axes.edgecolor": MUTED,
-      "axes.grid": True, "grid.color": "#e6e5e0", "grid.linewidth": 0.6, "axes.axisbelow": True, "legend.frameon": False}
-figsize = (13, 4)
-communities = ["Point Hope", "Kivalina", "Kotzebue", "Shishmaref", "Nome"]
-tick_rotation = 20
-# left panel (bias)
-bias_bars = [  # (dataset, method, column), drawn left to right in each group; FOSI hatched
-    ("MESACLIP", "EngressNet", "EngressNet bias yr"), ("MESACLIP", "Deterministic U-Net", "Det bias yr"),
-    ("FOSI", "EngressNet", "EngressNet bias yr"), ("FOSI", "Deterministic U-Net", "Det bias yr"),
-]
-bias_bar_width, fosi_hatch = 0.2, "///"
-domain_line_styles = {"MESACLIP": "--", "FOSI": ":"}   # domain-mean EngressNet bias lines
-bias_ylabel, bias_title, bias_ylim = "Nearest-cell bias, 2021 (m)", "Table 4: community bias (hatched = FOSI)", (-0.1, 0.04)
-bias_legend = dict(fontsize=7, ncol=2, loc="lower left")
-# right panel (values)
-value_markers = {"MESACLIP": "o", "FOSI": "s"}
-truth_size, model_size, dataset_offset = 60, 28, 0.3
-values_ylabel, values_title, values_ylim = "Mean SIT at nearest cell, 2021 (m)", "Table 4: actual values (open = truth)", (0, 0.95)
-values_legend = dict(fontsize=7, ncol=3, loc="upper center")
-
-# --- data ---
-P = table_values()[0]
-t = pd.read_csv(f"{BASE}/results/revisions_2026-11/table4_community{SFX}.csv")
-
-# --- plot ---
-with matplotlib.rc_context(rc):
-    fig = plt.figure(figsize=figsize, constrained_layout=True)
-    ax_bias, ax_vals = fig.subplots(1, 2)
-
-    x = np.arange(len(communities)); w = bias_bar_width
-    for i, (dset, m, col) in enumerate(bias_bars):
-        v = [t[(t.Dataset == dset) & (t.Community == c)][col].item() for c in communities]
-        ax_bias.bar(x + (i - 1.5) * w, v, w * 0.92, color=METHOD_COLORS[m], edgecolor="white", linewidth=1,
-                    hatch="" if dset == "MESACLIP" else fosi_hatch, label=f"{m}, {dset}")
-    for dset, ls in domain_line_styles.items():
-        ax_bias.axhline(P[dset].loc["EngressNet", "Bias"], color=INK, ls=ls, lw=1.2,
-                        label=f"domain-mean EngressNet bias, {dset} ({P[dset].loc['EngressNet', 'Bias']:+.4f} m)")
-    ax_bias.axhline(0, color=MUTED, lw=0.8)
-    ax_bias.set_xticks(x); ax_bias.set_xticklabels(communities, rotation=tick_rotation, ha="right"); ax_bias.set_ylabel(bias_ylabel)
-    ax_bias.set_title(bias_title, loc="left"); ax_bias.set_ylim(*bias_ylim)
-    ax_bias.legend(**bias_legend)
-    ax_bias.grid(axis="x", visible=False)
-
-    for i, (dset, mk) in enumerate(value_markers.items()):
-        sub = t[t.Dataset == dset].set_index("Community").loc[communities]
-        off = (i - 0.5) * dataset_offset
-        ax_vals.scatter(x + off, sub["Truth mean yr"], marker=mk, s=truth_size, facecolor="white", edgecolor=INK, lw=1.5, zorder=3,
-                        label=f"truth, {dset}")
-        ax_vals.scatter(x + off, sub["EngressNet mean yr"], marker=mk, s=model_size, color=METHOD_COLORS["EngressNet"], zorder=4,
-                        label=f"EngressNet, {dset}")
-        ax_vals.scatter(x + off, sub["Det mean yr"], marker=mk, s=model_size, color=METHOD_COLORS["Deterministic U-Net"], zorder=4,
-                        label=f"deterministic, {dset}")
-    ax_vals.set_xticks(x); ax_vals.set_xticklabels(communities, rotation=tick_rotation, ha="right"); ax_vals.set_ylabel(values_ylabel)
-    ax_vals.set_title(values_title, loc="left"); ax_vals.legend(**values_legend)
-    ax_vals.set_ylim(*values_ylim); ax_vals.grid(axis="x", visible=False)
-
-    fig.savefig(out("tab04_community.png"), dpi=250)
-    plt.close(fig)
-show("tab04_community.png")
+pc = pd.read_csv(os.path.join(FIG_DATA, "domain_mean_pattern_corr_timeseries.csv"), index_col=0, parse_dates=["time"])
+pc = rolled(pc, ["bilinear", "piomas", "deterministic_unet", "stochastic_unet_mean"], rdeb.ROLLING_DAYS_TIMESERIES)
+fig, ax = plt.subplots(figsize=(10, 4))
+for label, col, color, ls in [("EngressNet Ensemble Mean", "stochastic_unet_mean", METHOD_COLORS["EngressNet"], "-"),
+                              ("Deterministic", "deterministic_unet", METHOD_COLORS["Deterministic U-Net"], "-"),
+                              ("Bilinear", "bilinear", METHOD_COLORS["Bilinear"], "-"),
+                              ("PIOMAS", "piomas", MUTED, "--")]:
+    if pc[col].notna().sum():
+        ax.plot(pc["time"], pc[col], label=label, color=color, ls=ls, linewidth=1.5)
+ax.set_ylabel("Domain-mean Pattern Correlation to Truth")
+ax.set_xlim(pc["time"].min(), pc["time"].max())
+ax.set_ylim(top=1)
+ax.legend(frameon=True, fontsize=10, ncols=2)
+ax.grid(alpha=0.2)
+fig.autofmt_xdate()
+fig.tight_layout()
+fig.savefig(out("supplementary/domain_mean_pattern_corr.png"), dpi=300, bbox_inches="tight")
+plt.close(fig)
+show("supplementary/domain_mean_pattern_corr.png")
 
 # %% [markdown]
-# #### Table 8: ICESat-2 CRPS and sub-grid variability
+# ### Figure S3: Community nearest-cell time series
+
+# %%
+point_df = pd.read_csv(os.path.join(FIG_DATA, "community_point_timeseries.csv"), index_col=0, parse_dates=["time"])
+points_to_plot = ["Point Hope", "Kivalina", "Kotzebue", "Shishmaref", "Nome"]
+fig, axs = plt.subplots(len(points_to_plot), 1, figsize=(10, 2.5 * len(points_to_plot)), sharex=True)
+for ax, name in zip(np.atleast_1d(axs), points_to_plot):
+    sub = point_df[point_df["point"] == name]
+    dist_km = sub["dist_km"].iloc[0] if len(sub) else np.nan
+    piv = sub.pivot_table(index="time", columns="method", values="value").sort_index()
+    ax.axhline(0, color="black", linewidth=1, linestyle=":")
+    for label, col, color, ls in [("EngressNet Ensemble Mean", "stochastic_unet_mean", METHOD_COLORS["EngressNet"], "-"),
+                                  ("Deterministic", "deterministic_unet", METHOD_COLORS["Deterministic U-Net"], "-"),
+                                  ("Bilinear", "bilinear", METHOD_COLORS["Bilinear"], "-"),
+                                  ("PIOMAS", "piomas", MUTED, "--")]:
+        if col not in piv.columns or "truth" not in piv.columns:
+            continue
+        y = (piv[col] - piv["truth"]).dropna()
+        if y.empty:
+            continue
+        if rdeb.ROLLING_DAYS_TIMESERIES:
+            y = y.rolling(rdeb.rolling_window_samples(y.index.to_series(), rdeb.ROLLING_DAYS_TIMESERIES), center=True, min_periods=1).mean()
+        ax.plot(y.index, y, label=label, color=color, linestyle=ls, linewidth=1.2)
+    ax.set_title(f"{name} (nearest valid ocean grid cell ~{dist_km:.0f} km)", fontsize=12)
+    ax.set_xlim(sub["time"].min(), sub["time"].max())
+    ax.set_ylim(-0.3, 1.3)
+    ax.grid(alpha=0.2)
+    ax.set_yticks([-0.2, 0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2], labels=["-0.2", "0.0", "0.2", "0.4", "0.6", "0.8", "1.0", "1.2"])
+    ax.set_ylabel("Pred - Truth SIT (m)")
+    if name == "Point Hope":
+        ax.legend(fontsize=10, loc="upper right", ncols=2, frameon=True)
+fig.autofmt_xdate()
+fig.tight_layout()
+fig.savefig(out("supplementary/candidate_point_timeseries.png"), dpi=300, bbox_inches="tight")
+plt.close(fig)
+show("supplementary/candidate_point_timeseries.png")
+
+# %% [markdown]
+# ### Figure S4: Temporal pattern-correlation maps
 #
-# Left: CRPS against ICESat-2 pass-cell means (deterministic and bilinear: MAE). Right: sub-grid variability (within-1° std)
-# relative to ICESat-2, with the CICE truths.
+# Per-cell temporal correlation with truth over the days of one month.
+
+# %%
+M = map_inputs()
+MONTH = 3
+month_idx = np.where(M.months == MONTH)[0]
+fig, axs = plt.subplots(1, 3, figsize=(15, 5), constrained_layout=True, dpi=150, subplot_kw={"projection": M.proj})
+for ax, (title, field) in zip(axs, (("Bilinear", M.bilinear), ("Deterministic", M.det), ("EngressNet Ensemble Mean", M.ens))):
+    corr = np.where(M.land, np.nan, rdeb.temporal_pixel_corr(field, M.truth, month_idx))
+    im = ax.pcolormesh(M.lon, M.lat, corr, transform=ccrs.PlateCarree(), cmap="RdBu_r", vmin=0, vmax=1, shading="auto")
+    polar_frame(M, ax, M.lon, M.lat)
+    ax.set_title(title, fontsize=18)
+cbar = fig.colorbar(im, ax=axs, aspect=20, shrink=0.9, pad=0.02)
+cbar.set_label("Temporal Correlation to Truth (March)", fontsize=14)
+cbar.ax.tick_params(labelsize=14)
+fig.savefig(out("supplementary/temporal_pattern_corr.png"), dpi=300, bbox_inches="tight")
+plt.close(fig)
+show("supplementary/temporal_pattern_corr.png")
+
+# %% [markdown]
+# ### Figure S5: Bias and std-ratio maps
+#
+# Time-mean bias (top) and the ratio of temporal std to truth's (bottom).
+
+# %%
+M = map_inputs()
+t_mean, t_std = M.truth[:, 0].mean(axis=0), M.truth[:, 0].std(axis=0)
+safe_std = np.where(t_std > 1e-8, t_std, np.nan)
+fig, axs = plt.subplots(2, 3, figsize=(15, 9), constrained_layout=True, dpi=150, subplot_kw={"projection": M.proj})
+for col, (title, field) in enumerate((("Bilinear", M.bilinear), ("Deterministic", M.det), ("EngressNet Ensemble Mean", M.ens))):
+    f = field[:, 0]
+    im0 = axs[0, col].pcolormesh(M.lon, M.lat, np.where(M.land, np.nan, f.mean(axis=0) - t_mean), transform=ccrs.PlateCarree(),
+                                 cmap="RdBu_r", vmin=-0.5, vmax=0.5, shading="auto")
+    polar_frame(M, axs[0, col], M.lon, M.lat)
+    axs[0, col].set_title(title, fontsize=18)
+    im1 = axs[1, col].pcolormesh(M.lon, M.lat, np.where(M.land, np.nan, f.std(axis=0) / safe_std), transform=ccrs.PlateCarree(),
+                                 cmap="RdBu_r", norm=TwoSlopeNorm(vcenter=1, vmin=0, vmax=2), shading="auto")
+    polar_frame(M, axs[1, col], M.lon, M.lat)
+cbar1 = fig.colorbar(im0, ax=axs[0, :], aspect=20, shrink=0.8, pad=0.02)
+cbar1.set_label("Time-mean Bias (m)", fontsize=14)
+cbar1.ax.tick_params(labelsize=14)
+cbar2 = fig.colorbar(im1, ax=axs[1, :], aspect=20, shrink=0.8, pad=0.02)
+cbar2.set_label("Pred/Truth", fontsize=14)
+cbar2.ax.tick_params(labelsize=14)
+fig.savefig(out("supplementary/bias_std_ratio_maps.png"), dpi=300, bbox_inches="tight")
+plt.close(fig)
+show("supplementary/bias_std_ratio_maps.png")
+
+# %% [markdown]
+# ### Figure S6: Domain-mean bias time series
+
+# %%
+ts = pd.read_csv(os.path.join(FIG_DATA, "domain_mean_sit_timeseries.csv"), index_col=0, parse_dates=["time"])
+for col in ("stochastic_unet_mean", "deterministic_unet", "bilinear", "piomas"):
+    ts[col] = ts[col] - ts["truth"]
+ts = rolled(ts, ["stochastic_unet_mean", "deterministic_unet", "bilinear", "piomas"], rdeb.ROLLING_DAYS_BATCH)
+fig, ax = plt.subplots(figsize=(10, 4))
+ax.axhline(0, color="black", linewidth=1, linestyle=":")
+for label, col, ls, color in [("EngressNet Ensemble Mean", "stochastic_unet_mean", "-", METHOD_COLORS["EngressNet"]),
+                              ("Deterministic", "deterministic_unet", "-", METHOD_COLORS["Deterministic U-Net"]),
+                              ("Bilinear", "bilinear", "-", METHOD_COLORS["Bilinear"]),
+                              ("PIOMAS", "piomas", "--", MUTED)]:
+    if ts[col].notna().sum():
+        ax.plot(ts["time"], ts[col], label=label, color=color, linewidth=1.5, linestyle=ls)
+ax.set_ylabel("Domain-mean Pred - Truth SIT (m)")
+ax.legend(fontsize=12, ncols=2, loc="upper right")
+ax.set_xlim(ts["time"].min(), ts["time"].max())
+ax.grid(alpha=0.2)
+fig.autofmt_xdate()
+fig.tight_layout()
+fig.savefig(out("supplementary/domain_mean_bias_timeseries.png"), dpi=300, bbox_inches="tight")
+plt.close(fig)
+show("supplementary/domain_mean_bias_timeseries.png")
+
+# %% [markdown]
+# ### Figure S7: Anomaly-correlation maps
+#
+# Per-cell correlation with truth after removing each one's monthly climatology.
+
+# %%
+M = map_inputs()
+truth_anom = rdeb.remove_monthly_climatology(M.truth, M.months)
+all_idx = np.arange(len(M.months))
+fig, axs = plt.subplots(1, 3, figsize=(15, 5), constrained_layout=True, dpi=150, subplot_kw={"projection": M.proj})
+for ax, (title, field) in zip(axs, (("Bilinear", M.bilinear), ("Deterministic", M.det), ("EngressNet Ensemble Mean", M.ens))):
+    acc = np.where(M.land, np.nan, rdeb.temporal_pixel_corr(rdeb.remove_monthly_climatology(field, M.months), truth_anom, all_idx))
+    im = ax.pcolormesh(M.lon, M.lat, acc, transform=ccrs.PlateCarree(), cmap="RdBu_r", vmin=-1, vmax=1, shading="auto")
+    polar_frame(M, ax, M.lon, M.lat)
+    ax.set_title(title, fontsize=18)
+cbar = fig.colorbar(im, ax=axs, aspect=20, shrink=0.9, pad=0.02)
+cbar.set_label("Anomaly Correlation", fontsize=14)
+cbar.ax.tick_params(labelsize=14)
+fig.savefig(out("supplementary/anomaly_correlation.png"), dpi=300, bbox_inches="tight")
+plt.close(fig)
+show("supplementary/anomaly_correlation.png")
+
+# %% [markdown]
+# ### Figure S8: Taylor diagram
+
+# %%
+taylor_df = pd.read_csv(os.path.join(FIG_DATA, "taylor_stats.csv"), index_col=0)
+stats = {row["Method"]: (row["Correlation (R)"], row["Std Ratio"]) for _, row in taylor_df.iterrows()}
+colors = {"Bilinear": METHOD_COLORS["Bilinear"], "Deterministic UNet": METHOD_COLORS["Deterministic U-Net"], "Stochastic UNet Mean": METHOD_COLORS["EngressNet"]}
+names = {"Bilinear": "Bilinear", "Deterministic UNet": "Deterministic", "Stochastic UNet Mean": "EngressNet Ensemble Mean"}
+r_lim = max(1.3, max(sr for _, sr in stats.values()) * 1.2)
+
+fig = plt.figure(figsize=(5, 5))
+ax = fig.add_subplot(111, polar=True)
+ax.set_thetamin(0); ax.set_thetamax(90); ax.set_theta_zero_location("E"); ax.set_theta_direction(1)
+ax.set_ylim(0, r_lim)
+corr_ticks = np.array([0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 0.99, 1.0])
+ax.set_xticks(np.arccos(corr_ticks))
+ax.set_xticklabels([str(c) for c in corr_ticks])
+ax.set_xlabel("Correlation", labelpad=15)
+ax.set_ylabel("Normalized Standard Deviation", labelpad=10)
+for rms in np.arange(0.5, r_lim, 0.5):   # dotted arcs: centred RMSE
+    t = np.linspace(0, 2 * np.pi, 200)
+    xc, yc = 1 + rms * np.cos(t), rms * np.sin(t)
+    th, rr = np.arctan2(yc, xc), np.sqrt(xc ** 2 + yc ** 2)
+    keep = (th >= 0) & (th <= np.pi / 2)
+    ax.plot(th[keep], rr[keep], color="gray", linestyle=":", linewidth=0.8)
+th = np.linspace(0, np.pi / 2, 100)
+ax.plot(th, np.ones_like(th), color="black", linestyle="--", linewidth=0.8)
+ax.plot([0], [1], marker="*", color="k", markersize=16, linestyle="none", label="Truth")
+for method, (R, std_ratio) in stats.items():
+    ax.plot([np.arccos(np.clip(R, -1, 1))], [std_ratio], marker="o", markersize=10, color=colors.get(method, method),
+            label=names.get(method, method), linestyle="none")
+ax.legend(loc="upper right", bbox_to_anchor=(1.2, 1.25), fontsize=11, ncols=2, frameon=False)
+fig.tight_layout()
+fig.savefig(out("supplementary/taylor_diagram.png"), dpi=300, bbox_inches="tight")
+plt.close(fig)
+show("supplementary/taylor_diagram.png")
+
+# %% [markdown]
+# ### Figure S9: Domain-mean power spectra
+
+# %%
+psd = pd.read_csv(os.path.join(FIG_DATA, "psd.csv"), index_col=0)
+k = psd["wavenumber_cycles_per_km"].values
+fig, ax = plt.subplots(figsize=(6, 4))
+for label, col, color, ls, lw in [("Truth", "Truth", "k", "-", 2),
+                                  ("EngressNet Ensemble Mean", "Stochastic UNet Mean", METHOD_COLORS["EngressNet"], "-", 1.5),
+                                  ("Deterministic", "Deterministic UNet", METHOD_COLORS["Deterministic U-Net"], "-", 1.5),
+                                  ("Bilinear", "Bilinear", METHOD_COLORS["Bilinear"], "-", 1.5),
+                                  ("PIOMAS", "PIOMAS (obs)", MUTED, "--", 1.5)]:
+    valid = (k > 0) & (psd[col] > 0)
+    ax.plot(1 / k[valid], 1 / psd[col][valid], label=label, color=color, ls=ls, lw=lw)
+ax.set_xscale("log")
+ax.set_yscale("log")
+ax.set_xlabel("Wavelength (km)")
+ax.set_ylabel("PSD")
+ax.legend(fontsize=10, ncols=2, loc="upper right")
+ax.grid(True, which="both", alpha=0.2)
+fig.tight_layout()
+ax.set_title("2021 Annual-Mean")
+fig.savefig(out("supplementary/domain_mean_psd.png"), dpi=300, bbox_inches="tight")
+plt.close(fig)
+show("supplementary/domain_mean_psd.png")
+
+# %% [markdown]
+# ### Figure S10: Per-member power-spectrum spread
+
+# %%
+psdb = pd.read_csv(os.path.join(FIG_DATA, "psd_member_spread.csv"), index_col=0)
+k = psdb["wavenumber_cycles_per_km"].values
+valid = (k > 0) & (psdb["Truth"] > 0)
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
+ax1.plot(1 / k[valid], 1 / psdb["Truth"][valid], label="Truth", color="k", linewidth=2)
+ax1.fill_between(1 / k[valid], 1 / psdb["Member p10"][valid], 1 / psdb["Member p90"][valid], color=METHOD_COLORS["EngressNet"], alpha=0.25,
+                 label="EngressNet Members (10th–90th pct.)")
+ax1.plot(1 / k[valid], 1 / psdb["Member mean"][valid], color=METHOD_COLORS["EngressNet"], linewidth=1.5, label="EngressNet Ensemble Mean")
+ax1.set_xscale("log")
+ax1.set_yscale("log")
+ax1.set_xlabel("Wavelength (km)")
+ax1.set_ylabel("PSD")
+ax1.set_title("Per-member PSD Spread")
+ax1.legend(fontsize=10)
+ax1.grid(True, which="both", alpha=0.2)
+ax2.plot(1 / k[valid], psdb["Relative member spread pct"][valid], color=METHOD_COLORS["EngressNet"], linewidth=1.5)
+ax2.set_xscale("log")
+ax2.set_xlabel("Wavelength (km)")
+ax2.set_ylabel("Relative member spread (%)")
+ax2.set_title("Inter-member Spectral-Texture Spread")
+ax2.grid(True, which="both", alpha=0.2)
+fig.tight_layout()
+fig.savefig(out("supplementary/per_member_psd_spread.png"), dpi=300, bbox_inches="tight")
+plt.close(fig)
+show("supplementary/per_member_psd_spread.png")
+
+# %% [markdown]
+# ### Figure S11: CRPS by SIT regime
+
+# %%
+crps_df = pd.read_csv(os.path.join(FIG_DATA, "crps_by_regime.csv"), index_col=0)
+rows = crps_df.iloc[1:]
+fig, ax = plt.subplots(figsize=(8, 6))
+ax.bar(np.arange(len(rows)), rows["CRPS (m)"], color=SODIUM[3], alpha=0.85)
+ax.axhline(crps_df.iloc[0]["CRPS (m)"], color="black", linestyle="--", linewidth=2,
+           label=f"Domain-mean CRPS ({crps_df.iloc[0]['CRPS (m)']:.2f} m)")
+ax.set_xticks(np.arange(len(rows)))
+ax.set_xticklabels(rows["SIT regime"], fontsize=12, rotation=45, ha="right")
+ax.set_ylabel("CRPS (m)", fontsize=14)
+ax.set_title("CRPS by SIT Regime (test=2021)", fontsize=14)
+ax.legend(fontsize=12, frameon=False)
+ax.tick_params(axis="both", labelsize=12)
+fig.tight_layout()
+fig.savefig(out("supplementary/crps_regime.png"), dpi=300, bbox_inches="tight")
+plt.close(fig)
+show("supplementary/crps_regime.png")
+
+# %% [markdown]
+# ### Figure S12: Sub-grid variability bar (ICESat-2 vs CICE truths vs downscaled PIOMAS)
+
+# %%
+vals = subgrid_values(nmin=6)
+ref = vals["ICESat-2\n(observed)"]
+ink, muted = "#14202b", "#57667a"
+colors = {"ICESat-2\n(observed)": ink, "CICE (FOSI)\ntruth": "#8f8f8f", "CICE (MESACLIP)\ntruth": "#bdbdbd",   # truths: neutral greys
+          "EngressNet (final)\non PIOMAS": METHOD_COLORS["EngressNet"], "Deterministic U-Net\n(det-MSE) on PIOMAS": METHOD_COLORS["Deterministic U-Net"],
+          "PIOMAS\n(bilinear)": METHOD_COLORS["Bilinear"]}
+
+fig, ax = plt.subplots(figsize=(9.6, 4.8))
+for i, (k, v) in enumerate(vals.items()):
+    ax.bar(i, v, width=0.62, color=colors[k])
+    ax.text(i, v + ref * 0.025, f"{v:.2f} m" if i == 0 else f"{v:.2f} m\n{v / ref:.0%} of ICESat-2", ha="center", va="bottom",
+            fontsize=9, color=ink, zorder=4, bbox=dict(facecolor="white", edgecolor="none", pad=1.0))
+fosi = vals["CICE (FOSI)\ntruth"]
+ax.axhline(fosi, color=muted, ls="--", lw=1, zorder=1)
+ax.text(len(vals) - 0.5, fosi + ref * 0.012, "FOSI CICE: EngressNet's training target", ha="right", va="bottom", fontsize=8.5, color=muted)
+ax.set_xticks(range(len(vals))); ax.set_xticklabels(vals.keys(), fontsize=9)
+ax.set_ylabel("sub-grid variability (m)\nstd of 0.1° thickness within a 1° input cell", fontsize=9.5)
+ax.set_ylim(0, ref * 1.28)
+for s in ("top", "right"):
+    ax.spines[s].set_visible(False)
+ax.set_title("Sea ice thickness variability inside EngressNet's 1° input cells, at ICESat-2 tracks (2018–2021)", loc="left", fontsize=10)
+fig.text(0.01, -0.03, "Pooled within-cell standard deviation, every source sampled at the same ICESat-2 pass-cells on the same "
+         "day. ICESat-2: measurement noise removed.\n"
+         + ("EngressNet: average over its 80 ensemble members; det-MSE: over its 4 training windows; "
+            if FINAL_SET == "final1" else "EngressNet: average over its 20 ensemble members; det-MSE: one model; ")
+         + "MESACLIP: over its 6 members.", fontsize=8, color=muted)
+fig.tight_layout()
+outpath = f"{BASE}/figures/figures_v1/cice_ceiling_bar.png" if FINAL_SET == "final1" else f"{BASE}/figures/figures_v2/supplementary/cice_ceiling_bar.png"
+fig.savefig(outpath, dpi=250, bbox_inches="tight")
+plt.close(fig)
+if FINAL_SET == "final1":
+    shutil.copy(outpath, f"{BASE}/observations/figures/15b_cice_ceiling_bar.png")
+show(outpath)
+
+# %% [markdown]
+# ### Figure S13: ICESat-2 CRPS and sub-grid variability
+#
+# Left: CRPS against ICESat-2 pass-cell means (deterministic and bilinear: MAE). Right: sub-grid variability (within-1° std) relative to ICESat-2, with the CICE truths.
 
 # %%
 # --- style ---
@@ -1365,357 +1672,10 @@ with matplotlib.rc_context(rc):
     ax_var.set_ylabel(var_ylabel); ax_var.set_ylim(*var_ylim)
     ax_var.set_title(var_title, loc="left"); ax_var.legend(**var_legend); ax_var.grid(axis="x", visible=False)
 
-    fig.savefig(out("tab05_icesat2.png"), dpi=250)
+    fig.savefig(out("supplementary/icesat2_crps_var.png"), dpi=250)
     plt.close(fig)
 print("Table 5 CRPS", {k: round(v, 4) for k, v in crps.items()}, "| sub-grid ratio", {k: round(v, 3) for k, v in var.items()})
-show("tab05_icesat2.png")
-
-# %% [markdown]
-# #### Table values
+show("supplementary/icesat2_crps_var.png")
 
 # %%
-P, _ = table_values()
-for ds in P:
-    print(ds); print(P[ds][["RMSE", "Pattern Corr", "CRPS", "IIEE", "SSIM", "Grad MAE", "Bias"]].round(4).to_string())
 
-# %% [markdown]
-# ## Supplementary figures
-#
-# Saved into `supp/`.
-
-# %% [markdown]
-# ### Figure S1: Domain-mean SIT time series
-
-# %%
-ts = pd.read_csv(os.path.join(FIG_DATA, "domain_mean_sit_timeseries.csv"), index_col=0, parse_dates=["time"])
-ts = rolled(ts, ["truth", "stochastic_unet_mean", "deterministic_unet", "bilinear", "piomas"], rdeb.ROLLING_DAYS_TIMESERIES)
-fig, ax = plt.subplots(figsize=(10, 4))
-for label, col, color, ls, lw in [("Truth", "truth", "k", "-", 2),
-                                  ("EngressNet Ensemble Mean", "stochastic_unet_mean", METHOD_COLORS["EngressNet"], "-", 1.5),
-                                  ("Deterministic", "deterministic_unet", METHOD_COLORS["Deterministic U-Net"], "-", 1.5),
-                                  ("Bilinear", "bilinear", METHOD_COLORS["Bilinear"], "-", 1.5),
-                                  ("PIOMAS", "piomas", MUTED, "--", 1.5)]:
-    if ts[col].notna().sum():
-        ax.plot(ts["time"], ts[col], label=label, color=color, ls=ls, lw=lw)
-ax.set_ylabel("Domain-mean SIT (m)")
-ax.legend(frameon=True, fontsize=10, ncols=2)
-fig.autofmt_xdate()
-ax.set_xlim(ts["time"].min(), ts["time"].max())
-fig.tight_layout()
-ax.grid(alpha=0.2)
-fig.savefig(out("supp/domain_mean_timeseries.png"), dpi=300, bbox_inches="tight")
-plt.close(fig)
-show("supp/domain_mean_timeseries.png")
-
-# %% [markdown]
-# ### Figure S2: Domain-mean pattern correlation time series
-
-# %%
-pc = pd.read_csv(os.path.join(FIG_DATA, "domain_mean_pattern_corr_timeseries.csv"), index_col=0, parse_dates=["time"])
-pc = rolled(pc, ["bilinear", "piomas", "deterministic_unet", "stochastic_unet_mean"], rdeb.ROLLING_DAYS_TIMESERIES)
-fig, ax = plt.subplots(figsize=(10, 4))
-for label, col, color, ls in [("EngressNet Ensemble Mean", "stochastic_unet_mean", METHOD_COLORS["EngressNet"], "-"),
-                              ("Deterministic", "deterministic_unet", METHOD_COLORS["Deterministic U-Net"], "-"),
-                              ("Bilinear", "bilinear", METHOD_COLORS["Bilinear"], "-"),
-                              ("PIOMAS", "piomas", MUTED, "--")]:
-    if pc[col].notna().sum():
-        ax.plot(pc["time"], pc[col], label=label, color=color, ls=ls, linewidth=1.5)
-ax.set_ylabel("Domain-mean Pattern Correlation to Truth")
-ax.set_xlim(pc["time"].min(), pc["time"].max())
-ax.set_ylim(top=1)
-ax.legend(frameon=True, fontsize=10, ncols=2)
-ax.grid(alpha=0.2)
-fig.autofmt_xdate()
-fig.tight_layout()
-fig.savefig(out("supp/domain_mean_pattern_corr.png"), dpi=300, bbox_inches="tight")
-plt.close(fig)
-show("supp/domain_mean_pattern_corr.png")
-
-# %% [markdown]
-# ### Figure S3: Community nearest-cell time series
-
-# %%
-point_df = pd.read_csv(os.path.join(FIG_DATA, "community_point_timeseries.csv"), index_col=0, parse_dates=["time"])
-points_to_plot = ["Point Hope", "Kivalina", "Kotzebue", "Shishmaref", "Nome"]
-fig, axs = plt.subplots(len(points_to_plot), 1, figsize=(10, 2.5 * len(points_to_plot)), sharex=True)
-for ax, name in zip(np.atleast_1d(axs), points_to_plot):
-    sub = point_df[point_df["point"] == name]
-    dist_km = sub["dist_km"].iloc[0] if len(sub) else np.nan
-    piv = sub.pivot_table(index="time", columns="method", values="value").sort_index()
-    ax.axhline(0, color="black", linewidth=1, linestyle=":")
-    for label, col, color, ls in [("EngressNet Ensemble Mean", "stochastic_unet_mean", METHOD_COLORS["EngressNet"], "-"),
-                                  ("Deterministic", "deterministic_unet", METHOD_COLORS["Deterministic U-Net"], "-"),
-                                  ("Bilinear", "bilinear", METHOD_COLORS["Bilinear"], "-"),
-                                  ("PIOMAS", "piomas", MUTED, "--")]:
-        if col not in piv.columns or "truth" not in piv.columns:
-            continue
-        y = (piv[col] - piv["truth"]).dropna()
-        if y.empty:
-            continue
-        if rdeb.ROLLING_DAYS_TIMESERIES:
-            y = y.rolling(rdeb.rolling_window_samples(y.index.to_series(), rdeb.ROLLING_DAYS_TIMESERIES), center=True, min_periods=1).mean()
-        ax.plot(y.index, y, label=label, color=color, linestyle=ls, linewidth=1.2)
-    ax.set_title(f"{name} (nearest valid ocean grid cell ~{dist_km:.0f} km)", fontsize=12)
-    ax.set_xlim(sub["time"].min(), sub["time"].max())
-    ax.set_ylim(-0.3, 1.3)
-    ax.grid(alpha=0.2)
-    ax.set_yticks([-0.2, 0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2], labels=["-0.2", "0.0", "0.2", "0.4", "0.6", "0.8", "1.0", "1.2"])
-    ax.set_ylabel("Pred - Truth SIT (m)")
-    if name == "Point Hope":
-        ax.legend(fontsize=10, loc="upper right", ncols=2, frameon=True)
-fig.autofmt_xdate()
-fig.tight_layout()
-fig.savefig(out("supp/candidate_point_timeseries.png"), dpi=300, bbox_inches="tight")
-plt.close(fig)
-show("supp/candidate_point_timeseries.png")
-
-# %% [markdown]
-# ### Figure S4: Temporal pattern-correlation maps
-#
-# Per-cell temporal correlation with truth over the days of one month.
-
-# %%
-M = map_inputs()
-MONTH = 3
-month_idx = np.where(M.months == MONTH)[0]
-fig, axs = plt.subplots(1, 3, figsize=(15, 5), constrained_layout=True, dpi=150, subplot_kw={"projection": M.proj})
-for ax, (title, field) in zip(axs, (("Bilinear", M.bilinear), ("Deterministic", M.det), ("EngressNet Ensemble Mean", M.ens))):
-    corr = np.where(M.land, np.nan, rdeb.temporal_pixel_corr(field, M.truth, month_idx))
-    im = ax.pcolormesh(M.lon, M.lat, corr, transform=ccrs.PlateCarree(), cmap="RdBu_r", vmin=0, vmax=1, shading="auto")
-    polar_frame(M, ax, M.lon, M.lat)
-    ax.set_title(title, fontsize=18)
-cbar = fig.colorbar(im, ax=axs, aspect=20, shrink=0.9, pad=0.02)
-cbar.set_label("Temporal Correlation to Truth (March)", fontsize=14)
-cbar.ax.tick_params(labelsize=14)
-fig.savefig(out("supp/temporal_pattern_corr.png"), dpi=300, bbox_inches="tight")
-plt.close(fig)
-show("supp/temporal_pattern_corr.png")
-
-# %% [markdown]
-# ### Figure S5: Bias and std-ratio maps
-#
-# Time-mean bias (top) and the ratio of temporal std to truth's (bottom).
-
-# %%
-M = map_inputs()
-t_mean, t_std = M.truth[:, 0].mean(axis=0), M.truth[:, 0].std(axis=0)
-safe_std = np.where(t_std > 1e-8, t_std, np.nan)
-fig, axs = plt.subplots(2, 3, figsize=(15, 9), constrained_layout=True, dpi=150, subplot_kw={"projection": M.proj})
-for col, (title, field) in enumerate((("Bilinear", M.bilinear), ("Deterministic", M.det), ("EngressNet Ensemble Mean", M.ens))):
-    f = field[:, 0]
-    im0 = axs[0, col].pcolormesh(M.lon, M.lat, np.where(M.land, np.nan, f.mean(axis=0) - t_mean), transform=ccrs.PlateCarree(),
-                                 cmap="RdBu_r", vmin=-0.5, vmax=0.5, shading="auto")
-    polar_frame(M, axs[0, col], M.lon, M.lat)
-    axs[0, col].set_title(title, fontsize=18)
-    im1 = axs[1, col].pcolormesh(M.lon, M.lat, np.where(M.land, np.nan, f.std(axis=0) / safe_std), transform=ccrs.PlateCarree(),
-                                 cmap="RdBu_r", norm=TwoSlopeNorm(vcenter=1, vmin=0, vmax=2), shading="auto")
-    polar_frame(M, axs[1, col], M.lon, M.lat)
-cbar1 = fig.colorbar(im0, ax=axs[0, :], aspect=20, shrink=0.8, pad=0.02)
-cbar1.set_label("Time-mean Bias (m)", fontsize=14)
-cbar1.ax.tick_params(labelsize=14)
-cbar2 = fig.colorbar(im1, ax=axs[1, :], aspect=20, shrink=0.8, pad=0.02)
-cbar2.set_label("Pred/Truth", fontsize=14)
-cbar2.ax.tick_params(labelsize=14)
-fig.savefig(out("supp/bias_std_ratio_maps.png"), dpi=300, bbox_inches="tight")
-plt.close(fig)
-show("supp/bias_std_ratio_maps.png")
-
-# %% [markdown]
-# ### Figure S6: Domain-mean bias time series
-
-# %%
-ts = pd.read_csv(os.path.join(FIG_DATA, "domain_mean_sit_timeseries.csv"), index_col=0, parse_dates=["time"])
-for col in ("stochastic_unet_mean", "deterministic_unet", "bilinear", "piomas"):
-    ts[col] = ts[col] - ts["truth"]
-ts = rolled(ts, ["stochastic_unet_mean", "deterministic_unet", "bilinear", "piomas"], rdeb.ROLLING_DAYS_BATCH)
-fig, ax = plt.subplots(figsize=(10, 4))
-ax.axhline(0, color="black", linewidth=1, linestyle=":")
-for label, col, ls, color in [("EngressNet Ensemble Mean", "stochastic_unet_mean", "-", METHOD_COLORS["EngressNet"]),
-                              ("Deterministic", "deterministic_unet", "-", METHOD_COLORS["Deterministic U-Net"]),
-                              ("Bilinear", "bilinear", "-", METHOD_COLORS["Bilinear"]),
-                              ("PIOMAS", "piomas", "--", MUTED)]:
-    if ts[col].notna().sum():
-        ax.plot(ts["time"], ts[col], label=label, color=color, linewidth=1.5, linestyle=ls)
-ax.set_ylabel("Domain-mean Pred - Truth SIT (m)")
-ax.legend(fontsize=12, ncols=2, loc="upper right")
-ax.set_xlim(ts["time"].min(), ts["time"].max())
-ax.grid(alpha=0.2)
-fig.autofmt_xdate()
-fig.tight_layout()
-fig.savefig(out("supp/domain_mean_bias_timseries.png"), dpi=300, bbox_inches="tight")
-plt.close(fig)
-show("supp/domain_mean_bias_timseries.png")
-
-# %% [markdown]
-# ### Figure S7: Anomaly-correlation maps
-#
-# Per-cell correlation with truth after removing each one's monthly climatology.
-
-# %%
-M = map_inputs()
-truth_anom = rdeb.remove_monthly_climatology(M.truth, M.months)
-all_idx = np.arange(len(M.months))
-fig, axs = plt.subplots(1, 3, figsize=(15, 5), constrained_layout=True, dpi=150, subplot_kw={"projection": M.proj})
-for ax, (title, field) in zip(axs, (("Bilinear", M.bilinear), ("Deterministic", M.det), ("EngressNet Ensemble Mean", M.ens))):
-    acc = np.where(M.land, np.nan, rdeb.temporal_pixel_corr(rdeb.remove_monthly_climatology(field, M.months), truth_anom, all_idx))
-    im = ax.pcolormesh(M.lon, M.lat, acc, transform=ccrs.PlateCarree(), cmap="RdBu_r", vmin=-1, vmax=1, shading="auto")
-    polar_frame(M, ax, M.lon, M.lat)
-    ax.set_title(title, fontsize=18)
-cbar = fig.colorbar(im, ax=axs, aspect=20, shrink=0.9, pad=0.02)
-cbar.set_label("Anomaly Correlation", fontsize=14)
-cbar.ax.tick_params(labelsize=14)
-fig.savefig(out("supp/anomaly_correlation.png"), dpi=300, bbox_inches="tight")
-plt.close(fig)
-show("supp/anomaly_correlation.png")
-
-# %% [markdown]
-# ### Figure S8: Taylor diagram
-
-# %%
-taylor_df = pd.read_csv(os.path.join(FIG_DATA, "taylor_stats.csv"), index_col=0)
-stats = {row["Method"]: (row["Correlation (R)"], row["Std Ratio"]) for _, row in taylor_df.iterrows()}
-colors = {"Bilinear": METHOD_COLORS["Bilinear"], "Deterministic UNet": METHOD_COLORS["Deterministic U-Net"], "Stochastic UNet Mean": METHOD_COLORS["EngressNet"]}
-names = {"Bilinear": "Bilinear", "Deterministic UNet": "Deterministic", "Stochastic UNet Mean": "EngressNet Ensemble Mean"}
-r_lim = max(1.3, max(sr for _, sr in stats.values()) * 1.2)
-
-fig = plt.figure(figsize=(5, 5))
-ax = fig.add_subplot(111, polar=True)
-ax.set_thetamin(0); ax.set_thetamax(90); ax.set_theta_zero_location("E"); ax.set_theta_direction(1)
-ax.set_ylim(0, r_lim)
-corr_ticks = np.array([0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 0.99, 1.0])
-ax.set_xticks(np.arccos(corr_ticks))
-ax.set_xticklabels([str(c) for c in corr_ticks])
-ax.set_xlabel("Correlation", labelpad=15)
-ax.set_ylabel("Normalized Standard Deviation", labelpad=10)
-for rms in np.arange(0.5, r_lim, 0.5):   # dotted arcs: centred RMSE
-    t = np.linspace(0, 2 * np.pi, 200)
-    xc, yc = 1 + rms * np.cos(t), rms * np.sin(t)
-    th, rr = np.arctan2(yc, xc), np.sqrt(xc ** 2 + yc ** 2)
-    keep = (th >= 0) & (th <= np.pi / 2)
-    ax.plot(th[keep], rr[keep], color="gray", linestyle=":", linewidth=0.8)
-th = np.linspace(0, np.pi / 2, 100)
-ax.plot(th, np.ones_like(th), color="black", linestyle="--", linewidth=0.8)
-ax.plot([0], [1], marker="*", color="k", markersize=16, linestyle="none", label="Truth")
-for method, (R, std_ratio) in stats.items():
-    ax.plot([np.arccos(np.clip(R, -1, 1))], [std_ratio], marker="o", markersize=10, color=colors.get(method, method),
-            label=names.get(method, method), linestyle="none")
-ax.legend(loc="upper right", bbox_to_anchor=(1.2, 1.25), fontsize=11, ncols=2, frameon=False)
-fig.tight_layout()
-fig.savefig(out("supp/taylor_diagram.png"), dpi=300, bbox_inches="tight")
-plt.close(fig)
-show("supp/taylor_diagram.png")
-
-# %% [markdown]
-# ### Figure S9: Domain-mean power spectra
-
-# %%
-psd = pd.read_csv(os.path.join(FIG_DATA, "psd.csv"), index_col=0)
-k = psd["wavenumber_cycles_per_km"].values
-fig, ax = plt.subplots(figsize=(6, 4))
-for label, col, color, ls, lw in [("Truth", "Truth", "k", "-", 2),
-                                  ("EngressNet Ensemble Mean", "Stochastic UNet Mean", METHOD_COLORS["EngressNet"], "-", 1.5),
-                                  ("Deterministic", "Deterministic UNet", METHOD_COLORS["Deterministic U-Net"], "-", 1.5),
-                                  ("Bilinear", "Bilinear", METHOD_COLORS["Bilinear"], "-", 1.5),
-                                  ("PIOMAS", "PIOMAS (obs)", MUTED, "--", 1.5)]:
-    valid = (k > 0) & (psd[col] > 0)
-    ax.plot(1 / k[valid], 1 / psd[col][valid], label=label, color=color, ls=ls, lw=lw)
-ax.set_xscale("log")
-ax.set_yscale("log")
-ax.set_xlabel("Wavelength (km)")
-ax.set_ylabel("PSD")
-ax.legend(fontsize=10, ncols=2, loc="upper right")
-ax.grid(True, which="both", alpha=0.2)
-fig.tight_layout()
-ax.set_title("2021 Annual-Mean")
-fig.savefig(out("supp/domain_mean_psd.png"), dpi=300, bbox_inches="tight")
-plt.close(fig)
-show("supp/domain_mean_psd.png")
-
-# %% [markdown]
-# ### Figure S10: Per-member power-spectrum spread
-
-# %%
-psdb = pd.read_csv(os.path.join(FIG_DATA, "psd_member_spread.csv"), index_col=0)
-k = psdb["wavenumber_cycles_per_km"].values
-valid = (k > 0) & (psdb["Truth"] > 0)
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
-ax1.plot(1 / k[valid], 1 / psdb["Truth"][valid], label="Truth", color="k", linewidth=2)
-ax1.fill_between(1 / k[valid], 1 / psdb["Member p10"][valid], 1 / psdb["Member p90"][valid], color=METHOD_COLORS["EngressNet"], alpha=0.25,
-                 label="EngressNet Members (10th–90th pct.)")
-ax1.plot(1 / k[valid], 1 / psdb["Member mean"][valid], color=METHOD_COLORS["EngressNet"], linewidth=1.5, label="EngressNet Ensemble Mean")
-ax1.set_xscale("log")
-ax1.set_yscale("log")
-ax1.set_xlabel("Wavelength (km)")
-ax1.set_ylabel("PSD")
-ax1.set_title("Per-member PSD Spread")
-ax1.legend(fontsize=10)
-ax1.grid(True, which="both", alpha=0.2)
-ax2.plot(1 / k[valid], psdb["Relative member spread pct"][valid], color=METHOD_COLORS["EngressNet"], linewidth=1.5)
-ax2.set_xscale("log")
-ax2.set_xlabel("Wavelength (km)")
-ax2.set_ylabel("Relative member spread (%)")
-ax2.set_title("Inter-member Spectral-Texture Spread")
-ax2.grid(True, which="both", alpha=0.2)
-fig.tight_layout()
-fig.savefig(out("supp/per_member_psd_spread.png"), dpi=300, bbox_inches="tight")
-plt.close(fig)
-show("supp/per_member_psd_spread.png")
-
-# %% [markdown]
-# ### Figure S11: CRPS by SIT regime
-
-# %%
-crps_df = pd.read_csv(os.path.join(FIG_DATA, "crps_by_regime.csv"), index_col=0)
-rows = crps_df.iloc[1:]
-fig, ax = plt.subplots(figsize=(8, 6))
-ax.bar(np.arange(len(rows)), rows["CRPS (m)"], color=SODIUM[3], alpha=0.85)
-ax.axhline(crps_df.iloc[0]["CRPS (m)"], color="black", linestyle="--", linewidth=2,
-           label=f"Domain-mean CRPS ({crps_df.iloc[0]['CRPS (m)']:.2f} m)")
-ax.set_xticks(np.arange(len(rows)))
-ax.set_xticklabels(rows["SIT regime"], fontsize=12, rotation=45, ha="right")
-ax.set_ylabel("CRPS (m)", fontsize=14)
-ax.set_title("CRPS by SIT Regime (test=2021)", fontsize=14)
-ax.legend(fontsize=12, frameon=False)
-ax.tick_params(axis="both", labelsize=12)
-fig.tight_layout()
-fig.savefig(out("supp/crps_regime.png"), dpi=300, bbox_inches="tight")
-plt.close(fig)
-show("supp/crps_regime.png")
-
-# %% [markdown]
-# ### Figure S12: Sub-grid variability bar (ICESat-2 vs CICE truths vs downscaled PIOMAS)
-
-# %%
-vals = subgrid_values(nmin=6)
-ref = vals["ICESat-2\n(observed)"]
-ink, muted = "#14202b", "#57667a"
-colors = {"ICESat-2\n(observed)": ink, "CICE (FOSI)\ntruth": "#8f8f8f", "CICE (MESACLIP)\ntruth": "#bdbdbd",   # truths: neutral greys
-          "EngressNet (final)\non PIOMAS": METHOD_COLORS["EngressNet"], "Deterministic U-Net\n(det-MSE) on PIOMAS": METHOD_COLORS["Deterministic U-Net"],
-          "PIOMAS\n(bilinear)": METHOD_COLORS["Bilinear"]}
-
-fig, ax = plt.subplots(figsize=(9.6, 4.8))
-for i, (k, v) in enumerate(vals.items()):
-    ax.bar(i, v, width=0.62, color=colors[k])
-    ax.text(i, v + ref * 0.025, f"{v:.2f} m" if i == 0 else f"{v:.2f} m\n{v / ref:.0%} of ICESat-2", ha="center", va="bottom",
-            fontsize=9, color=ink, zorder=4, bbox=dict(facecolor="white", edgecolor="none", pad=1.0))
-fosi = vals["CICE (FOSI)\ntruth"]
-ax.axhline(fosi, color=muted, ls="--", lw=1, zorder=1)
-ax.text(len(vals) - 0.5, fosi + ref * 0.012, "FOSI CICE: EngressNet's training target", ha="right", va="bottom", fontsize=8.5, color=muted)
-ax.set_xticks(range(len(vals))); ax.set_xticklabels(vals.keys(), fontsize=9)
-ax.set_ylabel("sub-grid variability (m)\nstd of 0.1° thickness within a 1° input cell", fontsize=9.5)
-ax.set_ylim(0, ref * 1.28)
-for s in ("top", "right"):
-    ax.spines[s].set_visible(False)
-ax.set_title("Sea ice thickness variability inside EngressNet's 1° input cells, at ICESat-2 tracks (2018–2021)", loc="left", fontsize=10)
-fig.text(0.01, -0.03, "Pooled within-cell standard deviation, every source sampled at the same ICESat-2 pass-cells on the same "
-         "day. ICESat-2: measurement noise removed.\n"
-         + ("EngressNet: average over its 80 ensemble members; det-MSE: over its 4 training windows; "
-            if FINAL_SET == "final1" else "EngressNet: average over its 20 ensemble members; det-MSE: one model; ")
-         + "MESACLIP: over its 6 members.", fontsize=8, color=muted)
-fig.tight_layout()
-outpath = f"{BASE}/figures/figures_v1/cice_ceiling_bar.png" if FINAL_SET == "final1" else f"{BASE}/figures/figures_v2/supp/cice_ceiling_bar{SFX}.png"
-fig.savefig(outpath, dpi=250, bbox_inches="tight")
-plt.close(fig)
-if FINAL_SET == "final1":
-    shutil.copy(outpath, f"{BASE}/observations/figures/15b_cice_ceiling_bar.png")
-show(outpath)
