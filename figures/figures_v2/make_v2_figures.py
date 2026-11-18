@@ -283,8 +283,8 @@ def fig05_map(D, ax, field, lon_, lat_, cmap, vmin, vmax, land_on_top):
     return im
 
 
-def fig09_data():
-    """Fig. 9: model fields for the maps and point series (PIOMAS 2021 input) and the ICESat-2 pass-cells with the matched
+def fig12_data():
+    """Fig. 12: model fields for the maps and point series (PIOMAS 2021 input) and the ICESat-2 pass-cells with the matched
     model values (same QC as Table 5: extent >= 2 km, >= 20 segments, median segment uncertainty <= 1 m)."""
     def load():
         year, window = 2021, FS["piomas_window"]
@@ -320,7 +320,7 @@ def fig09_data():
     return cached("fig09", load)
 
 
-def fig09_point_series(D, name, p_lo=16, p_hi=84):
+def fig12_point_series(D, name, p_lo=16, p_hi=84):
     """Daily ensemble mean and the p_lo-p_hi percentile band of the members at a community's nearest cell."""
     row = D.points[(D.points.point == name) & (D.points.method == "stochastic_unet_mean")]
     iy, ix = int(row["grid_iy"].iloc[0]), int(row["grid_ix"].iloc[0])
@@ -373,7 +373,7 @@ def sensitivity_table(ds, groups, columns, direction):
     return labels, vals, kinds, bad
 
 
-SENS_COLUMNS = ["MAE", "RMSE", "Bias", "Grad MAE", "Pattern Corr", "SSIM", "IIEE (1e-4 m)", "IIEE (0.15 m)", "Coastal MAE",
+SENS_COLUMNS = ["MAE", "RMSE", "Bias", "Grad MAE", "Pattern Corr", "SSIM", "IIEE (0.15 m)", "Coastal MAE",
                 "Coastal RMSE", "CRPS", "Energy score", "Spread-skill"]
 SENS_DIRECTION = {"Bias": "zero", "Pattern Corr": "higher", "SSIM": "higher", "Spread-skill": "one"}  # others: lower is better
 SENS_GROUPS = [  # (group, [(config key in the summary CSV, row label)]), top to bottom
@@ -639,9 +639,8 @@ panels = [  # (metric column, y label, value format, y limits or None)
     ("Pattern Corr", "Pattern Correlation (r)", "{:.2f}", (0.8, 1.0)),
     ("Grad MAE", "Gradient MAE (m)", "{:.3f}", None),
     ("SSIM", "SSIM", "{:.2f}", (0.8, 1.0)),
-    ("IIEE (1e-4 m)", "IIEE", "{:.3f}", None),
+    ("IIEE (0.15 m)", "IIEE, 0.15 m threshold", "{:.3f}", None),
     ("ACC", "Anomaly Correlation", "{:.2f}", (0.6, 1.0)),
-    # ("IIEE (0.15 m)", "IIEE, 0.15 m threshold", "{:.3f}", None),
 ]
 methods = ["Bilinear", "Deterministic U-Net", "EngressNet"]
 LEGEND_LABELS = {"EngressNet": "EngressNet Ensemble Mean"}
@@ -919,7 +918,78 @@ show("fig08_rank_spread_skill.png")
 
 
 # %% [markdown]
-# ### Figure 9: Community bias vs. actual values
+# ### Figure 9: Reliability diagrams, P(SIT ≥ t), t = 0.15 m and 0.5 m
+#
+# Observed event frequency against forecast probability, all ocean cells of the 2021 perfect-model test (MESACLIP, FOSI) and the
+# ICESat-2 testbed pass-cells (FOSI-trained models on PIOMAS). One point per member count, no binning: EngressNet k/20 of its members,
+# seed ensemble k/10 of its det-MSE U-Nets; deterministic U-Net and bilinear: 0/1 forecasts (two points each). Inset: share of cells
+# at each forecast probability (log scale; sharpness). Legend: Brier skill score relative to bilinear. Data: `results/revisions_2026-11/{reliability,brier_scores}_<FINAL_SET>.csv` (`evaluation/revisions/brier_scores.py`).
+# Output: `fig09_reliability.png`
+
+# %%
+# --- style ---
+rc = {"font.size": 12, "axes.spines.top": False, "axes.spines.right": False, "axes.edgecolor": MUTED,
+      "axes.grid": True, "grid.color": "#e6e5e0", "grid.linewidth": 0.6, "axes.axisbelow": True, "legend.frameon": False}
+figsize = (14, 9)
+columns = [  # (setting, dataset, region, column title)
+    ("perfect model 2021", "MESACLIP", "all ocean", "MESACLIP (perfect model)"),
+    ("perfect model 2021", "FOSI", "all ocean", "FOSI (perfect model)"),
+    ("ICESat-2 testbed", "FOSI on PIOMAS", "Table 5 pass-cells", "ICESat-2 testbed"),
+]
+thresholds = [0.15, 0.5]
+methods = ["Bilinear", "Deterministic U-Net", "EngressNet", "Seed/window ensemble (det.)"]
+LEGEND_LABELS = {"EngressNet": "EngressNet", "Seed/window ensemble (det.)": "Seed ensemble"}
+ENSEMBLES = ["EngressNet", "Seed/window ensemble (det.)"]   # curves; the 0/1 forecasts are drawn as points
+line_width, marker_size, legend_fontsize = 2, 4.5, 9
+diag_line = dict(color=INK, lw=1, ls="--")
+inset_bounds = [0.55, 0.07, 0.42, 0.27]   # sharpness histogram, axes fraction (x0, y0, w, h)
+inset_fontsize = 8
+
+# --- data ---
+R = pd.read_csv(f"{BASE}/results/revisions_2026-11/reliability{SFX}.csv")
+S = pd.read_csv(f"{BASE}/results/revisions_2026-11/brier_scores{SFX}.csv")
+
+# --- plot ---
+with matplotlib.rc_context(rc):
+    fig = plt.figure(figsize=figsize, constrained_layout=True)
+    axs = fig.subplots(len(thresholds), len(columns), sharex=True, sharey=True)
+    for r, t in enumerate(thresholds):
+        for c, (setting, dset, region, title) in enumerate(columns):
+            ax = axs[r, c]
+            ax.plot([0, 1], [0, 1], **diag_line)
+            for m in methods:
+                d = R[(R.setting == setting) & (R.dataset == dset) & (R["threshold (m)"] == t) & (R.region == region) & (R.method == m)]
+                b = S[(S.setting == setting) & (S.dataset == dset) & (S["threshold (m)"] == t) & (S.region == region) & (S.method == m)]
+                lab = LEGEND_LABELS.get(m, m) + ("" if m == "Bilinear" else f" (BSS {b['BSS vs bilinear'].iloc[0]:.2f})")
+                if m in ENSEMBLES:
+                    ax.plot(d["forecast probability"], d["observed frequency"], "-o", color=METHOD_COLORS[m], lw=line_width, ms=marker_size, label=lab)
+                else:
+                    ax.plot(d["forecast probability"], d["observed frequency"], "s", color=METHOD_COLORS[m], ms=marker_size + 3, label=lab)
+            ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.set_aspect("equal")
+            ax.legend(fontsize=legend_fontsize, loc="upper left")
+            # sharpness inset: share of cells at each forecast probability, ensembles only
+            ins = ax.inset_axes(inset_bounds)
+            for m in ENSEMBLES:
+                d = R[(R.setting == setting) & (R.dataset == dset) & (R["threshold (m)"] == t) & (R.region == region) & (R.method == m)]
+                ins.plot(d["forecast probability"], d["count"] / d["count"].sum(), "-", drawstyle="steps-mid", color=METHOD_COLORS[m], lw=1.2)
+            ins.set_yscale("log"); ins.set_xlim(0, 1); ins.set_ylim(1e-4, 1)
+            ins.set_yticks([1e-4, 1e-2, 1]); ins.set_yticklabels(["0.01%", "1%", "100%"])
+            ins.tick_params(labelsize=inset_fontsize, length=2); ins.grid(False)
+            ins.set_xticks([0, 0.5, 1]); ins.set_xticklabels(["0", "0.5", "1"])
+            ins.set_title("share of cells", fontsize=inset_fontsize, loc="left", pad=2)
+            ins.patch.set_alpha(0.9)
+            if r == 0:
+                ax.set_title(title, loc="left")
+            if c == 0:
+                ax.set_ylabel(f"Observed frequency, SIT ≥ {t:g} m")
+            if r == len(thresholds) - 1:
+                ax.set_xlabel("Forecast probability")
+    fig.savefig(out("fig09_reliability.png"), dpi=300)
+    plt.close(fig)
+show("fig09_reliability.png")
+
+# %% [markdown]
+# ### Figure 10: Community bias vs. actual values
 #
 # Left: nearest-cell bias at each community (FOSI hatched). Right: yearly mean SIT at the nearest cell (open = truth).
 
@@ -970,12 +1040,12 @@ with matplotlib.rc_context(rc):
     ax_vals.legend(fontsize=legend_fontsize, **values_legend)
     ax_vals.set_ylim(*values_ylim); ax_vals.grid(axis="x", visible=False)
 
-    fig.savefig(out("fig09_community_bias.png"), dpi=300)
+    fig.savefig(out("fig10_community_bias.png"), dpi=300)
     plt.close(fig)
-show("fig09_community_bias.png")
+show("fig10_community_bias.png")
 
 # %% [markdown]
-# ### Figure 10: Observed seasonal cycle
+# ### Figure 11: Observed seasonal cycle
 
 # %%
 seasonal_df = pd.read_csv(os.path.join(BASE, "figures", "piomas_fosi_mesa_seasonal_cycle_2021.csv"), index_col=0)
@@ -999,9 +1069,9 @@ ax.grid(alpha=0.2)
 ax.legend(fontsize=12, loc="upper right")
 
 fig.tight_layout()
-fig.savefig(out("fig10_obs_seasonal_cycle.png"), dpi=300, bbox_inches="tight")
+fig.savefig(out("fig11_obs_seasonal_cycle.png"), dpi=300, bbox_inches="tight")
 plt.close(fig)
-show("fig10_obs_seasonal_cycle.png")
+show("fig11_obs_seasonal_cycle.png")
 
 # %%
 sc = pd.read_csv(os.path.join(FIG_DATA, "seasonal_cycle_2021.csv"), index_col=0)
@@ -1050,12 +1120,12 @@ plt.close(fig)
 show("supplementary/simulated_seasonal_cycle.png")
 
 # %% [markdown]
-# ### Figure 11: PIOMAS application
+# ### Figure 12: PIOMAS application
 
 # %%
 import matplotlib.dates as mdates
 
-D = fig09_data()
+D = fig12_data()
 MONTHS = {1: "January", 4: "April", 7: "July", 10: "October"}
 DLIM = float(np.ceil(np.nanpercentile(np.abs(D.diff[D.in_year & np.isin(D.dates.month, list(MONTHS))]), 95) / 0.25) * 0.25)
 ph_lon = ((rdeb.POINT_HOPE_LON_360 + 180) % 360) - 180
@@ -1088,7 +1158,7 @@ cb2.ax.tick_params(labelsize=12)
 
 for j, name in enumerate(["Kivalina", "Point Hope"]):   # bottom row: point series
     ax = fig.add_subplot(2, 2, 3 + j)
-    mean, lo, hi, _ = fig09_point_series(D, name, 16, 84)
+    mean, lo, hi, _ = fig12_point_series(D, name, 16, 84)
     ax.plot(D.times.values, mean, color=SODIUM[0], linewidth=2, label="Ensemble Mean")
     ax.fill_between(D.times.values, lo, hi, alpha=0.3, color=SODIUM[1], label="±σ")
     ax.set_title(f"{name} Daily Downscaled PIOMAS SIT ({D.year})", fontsize=16)
@@ -1105,15 +1175,15 @@ for j, name in enumerate(["Kivalina", "Point Hope"]):   # bottom row: point seri
     ax.set_yticks(np.arange(0, 2.51, 0.5))
     ax.set_yticklabels(["0", "0.5", "1", "1.5", "2", "2.5"])
 
-fig.savefig(out("fig11_piomas_application.png"), dpi=300, bbox_inches="tight")
+fig.savefig(out("fig12_piomas_application.png"), dpi=300, bbox_inches="tight")
 plt.close(fig)
-show("fig11_piomas_application.png")
+show("fig12_piomas_application.png")
 
 # %% [markdown]
-# #### Figure 11 supplement: ICESat-2 vs downscaled SIT
+# #### Figure 12 supplement: ICESat-2 vs downscaled SIT
 
 # %%
-D = fig09_data()
+D = fig12_data()
 ok = D.qc & np.isfinite(D.Mm).all(1) & np.isfinite(D.Dm).all(1) & np.isfinite(D.Bl)
 est = {"Bilinear": D.Bl, "Deterministic U-Net": D.Dm.mean(1), "EngressNet": D.Mm.mean(1)}   # drawn in this order
 LABELS = {"Bilinear": "Bilinear", "Deterministic U-Net": "Deterministic", "EngressNet": "EngressNet"}
@@ -1149,9 +1219,9 @@ ax.legend(fontsize=10, frameon=False, loc="upper left")
 ax.set_title(f"ICESat-2 vs downscaled PIOMAS\n(N = {ok.sum():,} pass-cells)", fontsize=12)
 
 fig.tight_layout()
-fig.savefig(out("supplementary/fig11_is2_scatter.png"), dpi=300, bbox_inches="tight")
+fig.savefig(out("supplementary/fig12_is2_scatter.png"), dpi=300, bbox_inches="tight")
 plt.close(fig)
-show("supplementary/fig11_is2_scatter.png")
+show("supplementary/fig12_is2_scatter.png")
 
 # %% [markdown]
 # ### Figure A1: MESACLIP sensitivity tests
@@ -1237,7 +1307,6 @@ panels = [  # (metric column, y label, value format, y limits or None)
     ("Pattern Corr", "Pattern correlation (r)", "{:.3f}", (0.8, 1.0)),
     ("Grad MAE", "Gradient MAE (m)", "{:.4f}", None),
     ("SSIM", "SSIM", "{:.3f}", (0.8, 1.0)),
-    ("IIEE (1e-4 m)", "IIEE, 1e-4 m threshold", "{:.3f}", None),
     ("IIEE (0.15 m)", "IIEE, 0.15 m threshold", "{:.3f}", None),
     ("ACC", "Anomaly correlation", "{:.3f}", (0.6, 1.0)),
 ]
@@ -1268,6 +1337,8 @@ with matplotlib.rc_context(rc):
         ax.set_ylabel(ylabel); ax.grid(axis="x", visible=False)
         lo, hi = ylim if ylim else (0, ax.get_ylim()[1])
         ax.set_ylim(lo, lo + (hi - lo) * headroom)
+    for ax in axs[len(panels):]:   # remove axes the panels don't use
+        ax.remove()
     handles, labels = axs[0].get_legend_handles_labels()
     fig.legend(handles, labels, fontsize=legend_fontsize, frameon=False, loc="outside lower center", ncols=len(methods))
     fig.savefig(out(outfile), dpi=300)
