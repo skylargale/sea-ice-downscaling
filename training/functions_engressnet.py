@@ -1330,7 +1330,7 @@ class EmaWeights:
 
 def train_model(model, optimizer, X_train, Y_train, mask_train, device, K, num_epochs, batch_size,
                  coastal_width=5, coastal_boost=2.0, beta=1.0, verbose=True, deterministic_mse=False,
-                 energy_patch_size=0, ema=None, grad_accum_steps=1):
+                 energy_patch_size=0, ema=None, grad_accum_steps=1, loss_zero_mask=None):
     """deterministic_mse=True trains the same backbone as a plain deterministic baseline: every
     noise stage is zeroed (deterministic=True), K is ignored, and the loss is the same
     coastal-weighted per-pixel MSE in normalized-increment space instead of the energy score.
@@ -1340,7 +1340,10 @@ def train_model(model, optimizer, X_train, Y_train, mask_train, device, K, num_e
 
     Rejected loss/schedule options removed in the 2026-11 cleanup (pre-cleanup snapshot in scratch
     downscaling/archive/records/): per-pixel CRPS term, observation fine-tuning steps, softplus output
-    floor, debiased ensemble-mean MSE term, cosine lr schedule and noise-lr warm-up."""
+    floor, debiased ensemble-mean MSE term, cosine lr schedule and noise-lr warm-up.
+
+    loss_zero_mask (final round 2026-11, --coarse-zero-loss): bool [N, 1, H, W] on the training samples; True cells get loss
+    weight 0 (the coarse-zero rule applied in the loss). None (default) leaves every path unchanged."""
     loss_array = []
     grad_accum_steps = int(grad_accum_steps or 1)
 
@@ -1363,6 +1366,8 @@ def train_model(model, optimizer, X_train, Y_train, mask_train, device, K, num_e
                 for chunk in torch.chunk(batch_idx, grad_accum_steps):
                     Xc, Yc, mc = X_train[chunk].to(device), Y_train[chunk].to(device), mask_train[chunk].to(device)
                     cw = build_coastal_weight_map(mc[:, 0], coastal_width, coastal_boost)
+                    if loss_zero_mask is not None:
+                        cw = cw * (~loss_zero_mask[chunk, 0]).to(device=cw.device, dtype=cw.dtype)
                     b = Xc.shape[0]
                     if deterministic_mse:
                         pc = model(Xc, up_size=Yc.shape[-2:], mask=mc, deterministic=True)
@@ -1393,6 +1398,9 @@ def train_model(model, optimizer, X_train, Y_train, mask_train, device, K, num_e
             # Per-sample loss weight: land at baseline weight 1, coastal ocean band
             # up-weighted -- built fresh per batch since mask_batch can vary across samples.
             coastal_weight = build_coastal_weight_map(mask_batch[:, 0], coastal_width, coastal_boost)
+            if loss_zero_mask is not None:
+                coastal_weight = coastal_weight * (~loss_zero_mask[batch_idx, 0]).to(device=coastal_weight.device,
+                                                                                   dtype=coastal_weight.dtype)
 
             if deterministic_mse:
                 preds = model(X_batch, up_size=Y_batch.shape[-2:], mask=mask_batch, deterministic=True)
@@ -2415,6 +2423,12 @@ def run_pipeline(config):
     ema = EmaWeights(model.module, ema_decay) if ema_decay > 0 and config.num_epochs > 0 else None
     if ema is not None:
         print(f"  EMA of weights, decay {ema_decay:g} (evaluation and model_state_dict.pt use the EMA weights)")
+    loss_zero_mask = None
+    if getattr(config, "coarse_zero_loss", False):
+        # final round 2026-11 (--coarse-zero-loss): coarse-zero rule in the loss as well (weight 0 where coarse SIT is exactly 0)
+        loss_zero_mask = coarse_zero_mask(baseline_train_phys, mask_train).cpu()
+        print(f"  coarse-zero rule in the loss: {float(loss_zero_mask.sum() / (mask_train[:, :1] <= 0.5).sum()):.3f} "
+              f"of training ocean cells get weight 0")
     loss_array = train_model(
         model, optimizer, X_train, Y_train, mask_train, device, config.k, config.num_epochs, config.batch_size,
         coastal_width=config.coastal_width, coastal_boost=config.coastal_boost, beta=config.beta,
@@ -2422,6 +2436,7 @@ def run_pipeline(config):
         energy_patch_size=int(getattr(config, "energy_patch_size", 0) or 0),
         ema=ema,
         grad_accum_steps=int(getattr(config, "grad_accum_steps", 1) or 1),
+        loss_zero_mask=loss_zero_mask,
     )
 
     if ema is not None:

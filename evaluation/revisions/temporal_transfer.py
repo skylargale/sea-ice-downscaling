@@ -18,7 +18,7 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
 V6 = "/glade/work/skygale/projects/SeaIceDownscaling"
-# method colours: same palette as figures/v2/make_v2_figures.py (Setup cell)
+# method colours: same palette as figures/figures_v2/make_v2_figures.py (Setup cell)
 METHOD_COLORS = {"EngressNet": "#2a78d6", "Deterministic U-Net": "#eb6834", "Bilinear": "#1baf7a"}
 
 C = f"{V6}/evaluation/corrected_calibration"

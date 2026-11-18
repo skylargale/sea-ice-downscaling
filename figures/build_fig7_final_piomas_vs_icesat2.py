@@ -12,7 +12,7 @@ Decision 2026-10-07: final model on PIOMAS input only, compared to ICESat-2 (sup
   (e) all pass-cells: ensemble mean vs ICESat-2 (hexbin) with bias / RMSE / r / CRPS, bilinear PIOMAS for reference
 ICESat-2 is floe thickness and EngressNet a grid-cell mean (see observations/README.md); same QC as the evaluation notebooks
 (extent >= 2 km, >= 20 segments, median segment uncertainty <= 1 m).
-Output: figures/final_figures/07b_piomas_vs_icesat2_evaluation.png (supplementary since 2026-10-08).
+Output: figures/figures_v1/07b_piomas_vs_icesat2_evaluation.png (supplementary since 2026-10-08).
 """
 import glob
 import os
@@ -30,7 +30,7 @@ V6 = "/glade/work/skygale/projects/SeaIceDownscaling"
 BATCH = f"{V6}/results/PIOMAS_2018-2022_FOSI_final_ema"  # 2026-10-18: EMA model
 IS2C = "/glade/derecho/scratch/skygale/observations/ICESat2_IS2SITDAT4_cells"
 NPZ = f"{IS2C}/eval/ema_piomas_cells.npz"
-OUT = f"{V6}/figures/final_figures/07b_piomas_vs_icesat2_evaluation.png"  # supplementary; Fig 7 = build_fig7_final_piomas_application.py
+OUT = f"{V6}/figures/figures_v1/07b_piomas_vs_icesat2_evaluation.png"  # supplementary; Fig 7 = build_fig7_final_piomas_application.py
 DAY = pd.Timestamp("2021-03-10")
 GRANULE = "IS2SITDAT4_01_20210310204006_11741001_005_01_bnum5gt1r_001"
 MEMBER_WINDOW, MEMBER = "2015-2020", 0

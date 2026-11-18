@@ -75,6 +75,7 @@ ENERGY_PATCH_SIZE="${ENERGY_PATCH_SIZE:-0}"            # energy score over N x N
 NOISE_LR_MULT="${NOISE_LR_MULT:-1}"                    # lr multiplier for the noise parameters (final: 10)
 EMA_DECAY="${EMA_DECAY:-0}"                            # EMA of weights (final: 0.997 FOSI / 0.9995 MESACLIP); 0 = off
 COARSE_ZERO="${COARSE_ZERO:-false}"                    # at evaluation, members exactly 0 where coarse SIT is 0 (final: true)
+COARSE_ZERO_LOSS="${COARSE_ZERO_LOSS:-false}"          # also apply the coarse-zero rule in the training loss (final: false)
 TRAIN_RANDOM_DAYS="${TRAIN_RANDOM_DAYS:-0}"            # N random dates from TRAIN_YEARS (the pool) instead of all (final: 1825); 0 = off
 RANDOM_DAYS_SEED="${RANDOM_DAYS_SEED:-}"               # seed of the date draw (blank = SEED)
 RANDOM_DAYS_EXCLUDE_YEARS="${RANDOM_DAYS_EXCLUDE_YEARS:-}"   # inference of a random-days model on other years: the training run's test years
@@ -138,6 +139,7 @@ ARGS=(--x-path "$X_PATH" --y-path "$Y_PATH" --num-epochs "$NUM_EPOCHS" --k "$K" 
 [ "$NOISE_LR_MULT" != 1 ] && ARGS+=(--noise-lr-mult "$NOISE_LR_MULT")
 [ "$EMA_DECAY" != 0 ] && ARGS+=(--ema-decay "$EMA_DECAY")
 [ "$COARSE_ZERO" = true ] && ARGS+=(--coarse-zero)
+[ "$COARSE_ZERO_LOSS" = true ] && ARGS+=(--coarse-zero-loss)
 [ "$TRAIN_RANDOM_DAYS" != 0 ] && ARGS+=(--train-random-days "$TRAIN_RANDOM_DAYS")
 [ -n "$RANDOM_DAYS_SEED" ] && ARGS+=(--random-days-seed "$RANDOM_DAYS_SEED")
 [ -n "$RANDOM_DAYS_EXCLUDE_YEARS" ] && ARGS+=(--random-days-exclude-years "$RANDOM_DAYS_EXCLUDE_YEARS")

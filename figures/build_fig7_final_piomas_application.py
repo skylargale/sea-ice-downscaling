@@ -4,7 +4,7 @@ colours and labels, now driven by the final EngressNet (T2 amplitude maps + 10 p
 PIOMAS 2021, results/PIOMAS_2010-2023_cdrv6_finalFOSI_4win) instead of PIOMAS_2021avg_scratchFOSI_4win. The only addition: the
 month's ICESat-2 tracks (QC'd 0.1 deg pass-cell means, same colour scale) overlaid on the maps. ICESat-2 has no summer data, so the
 July map has no tracks. Point time series are unchanged (too few ICESat-2 passes near the coast to add).
-Output: figures/final_figures/07_piomas_application.png.
+Output: figures/figures_v1/07_piomas_application.png.
 """
 import glob
 import os
@@ -105,7 +105,7 @@ for j, point_name in enumerate(["Kivalina", "Point Hope"]):
     ax.tick_params(axis="both", labelsize=14)
     ax.tick_params(axis="x", rotation=30)
 
-out = os.path.join(BASE, "figures", "final_figures", "07_piomas_application.png")
+out = os.path.join(BASE, "figures", "figures_v1", "07_piomas_application.png")
 plt.savefig(out, dpi=300, bbox_inches="tight")
 print("wrote", out, "| run", os.path.basename(RUN_DIR_FIG8), "| ICESat-2 cells per month",
       {MONTH_NAMES[m]: int((is2.date.dt.month == m).sum()) for m in MONTHS})

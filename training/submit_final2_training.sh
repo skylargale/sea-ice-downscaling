@@ -10,7 +10,7 @@
 #   results/FINAL2_<DS>_detmse_seedens      seeds 1-9 of the same det-MSE model on the same days (seed 0 = the run above):
 #                                           the 10-model seed-ensemble baseline
 # Afterwards: evaluation/revisions/submit_final2_eval_chain.sh (truth fix, per-run tables, corrected metrics), then
-# submit_final2_metrics.sh, figures/v2/submit_make_v2_figures.sh, and observations/inference/submit_final2_obs_inference.py for the
+# submit_final2_metrics.sh, figures/figures_v2/submit_make_v2_figures.sh, and observations/inference/submit_final2_obs_inference.py for the
 # PIOMAS / ICESat-2 application (that one needs RANDOM_DAYS_EXCLUDE_YEARS=2021).
 set -euo pipefail
 cd "$(dirname "$0")"

@@ -32,9 +32,9 @@ statistics come from the same 1,825 dates (`observations/inference/submit_final2
 Batches (`results/`): `FINAL2_{MESA,FOSI}_random1825` (EngressNet), `FINAL2_{MESA,FOSI}_detmse_random1825` (deterministic),
 `FINAL2_{MESA,FOSI}_detmse_seedens` (seeds 1-9), `PIOMAS_2018-2022_FINAL2_FOSI{,_detmse}` (ICESat-2 scoring),
 `PIOMAS_2010-2023_cdrv6_FINAL2_FOSI` (application). Evaluation: `evaluation/revisions/submit_final2_eval_chain.sh`,
-`submit_final2_metrics.sh`, then all figures with `figures/v2/submit_make_v2_figures.sh` (code: `figures/v2/make_v2_figures.py`); scripts select the model with `FINAL_SET=final2`
+`submit_final2_metrics.sh`, then all figures with `figures/figures_v2/submit_make_v2_figures.sh` (code: `figures/figures_v2/make_v2_figures.py`); scripts select the model with `FINAL_SET=final2`
 (`evaluation/revisions/final_set.py`; default `final2` since 2026-11-15, `final1` = the old model; outputs written with final2 carry a `_final2` suffix). Paper figures:
-`figures/v2/` (old-model versions in `figures/v2/superseded_final1/`).
+`figures/figures_v2/` (old-model versions in `figures/figures_v2/superseded_final1/`).
 
 Why random days (revision F, 3 seeds each, same number of training days): sampling the whole 2000-2020 range beats one
 consecutive 6-year window on both datasets with non-overlapping seed ranges (RMSE -3.2% MESACLIP / -6.8% FOSI, CRPS -3.5% / -7.6%,
@@ -86,7 +86,7 @@ Only rank histograms moved (FINAL1 MESACLIP pooled rank 0 3.3x -> 1.17x of unifo
 Same configuration as FINAL2 except the training data: four consecutive 5-year windows (2000-05 / 05-10 / 10-15 / 15-20, all
 dates), one model per window, numbers averaged over the windows. Batches `results/{FOSI,MESA}_{final,detmse}_ema`,
 `PIOMAS_2018-2022_FOSI_{final,detmse}_ema`, `PIOMAS_2010-2023_cdrv6_emaFOSI_4win`, selected with `FINAL_SET=final1`
-(the default is `final2` since 2026-11-15). Paper figures: `figures/final_figures/`.
+(the default is `final2` since 2026-11-15). Paper figures: `figures/figures_v1/`.
 
 | (4-window mean) | RMSE | CRPS (det: MAE) | IIEE | pattern corr | spread-skill |
 |---|---|---|---|---|---|
@@ -105,7 +105,9 @@ deterministic U-Net" no longer holds.
 Tried for the open-water rank-0 spike before the truth fix, not adopted (records in `evaluation/corrected_calibration/`):
 - hurdle presence head, 3 variants (`hurdle*_compare.txt`): moved the excess to the top ranks, missed ice x10, less spread in ice
 - coarse-zero rule inside the training loss (`coarse_zero_compare.txt`): same open-water gain, spread -2 to -5% in every ice regime,
-  CRPS +1%
+  CRPS +1%. Re-run on FINAL2 (2026-11-17, FOSI seed 0, flag `--coarse-zero-loss`, default off): spread-skill thin/moderate/thick
+  1.11/0.99/0.99 vs 1.03/0.96/0.98, CRPS -1.3% (inside the 10-seed band), open water more over-dispersed (1.20 -> 1.62); still not
+  adopted (summary.md, final round part 3, item 5)
 - 1-deg block-mean conservation rescaling (no-training check): more cells outside the ensemble in every regime
 - 25 km concentration input (T3): fixed near-edge open water and cut CRPS 13-15%, dropped because the input is not readily available
 
@@ -172,7 +174,7 @@ spread/error: 1 = calibrated. Lower CRPS is better.
   EngressNet's own input.
 - **10 km ICESat-2 sections** (`_sm` files): replaced by full-resolution segments grouped per 0.1 deg cell and pass.
 - **Median of per-cell ratios** for the CICE ceiling: replaced by pooled within-cell variance. The median made CICE look like ~1/3
-  of ICESat-2; pooled, FOSI CICE is 66% and MESACLIP 43% (sub-grid bar cell in `figures/v2/make_v2_figures.py`).
+  of ICESat-2; pooled, FOSI CICE is 66% and MESACLIP 43% (sub-grid bar cell in `figures/figures_v2/make_v2_figures.py`).
 - **Results emails** from Casper (mailx): looked undelivered on 2026-10-09; confirmed working 2026-10-17 (`evaluation/submit_email_summary.sh`).
 
 #### Bugs found and fixed
@@ -313,7 +315,7 @@ spread/error: 1 = calibrated. Lower CRPS is better.
   (`training/check_sensitivity_flags.sh`).
 - Driver `training/submit_sensitivity_final2.sh` (phases phase1 / topup / only:<config>), scorer
   `evaluation/revisions/sensitivity_final2_metrics.py` (+ `submit_sensitivity_final2_eval.sh`), heatmaps = Figs. A1/A2 cells of
-  `figures/v2/make_v2_figures.py`. 2021 conservative truth: `processing/build_conservative_2021.py`.
+  `figures/figures_v2/make_v2_figures.py`. 2021 conservative truth: `processing/build_conservative_2021.py`.
 - Outcome: the final design stands. Average coarsening (vs interp, +23-27% RMSE) and EMA (+2-3%) matter; land threshold, conservative
   truth, Mar-Jul training, domain size, encoder depth, noise kernel/channels/global/uncorrelated and late fusion change RMSE/CRPS by
   <~1.5% like-for-like. Noise lr x10, the amplitude map and energy tile 10 cost ~2% FOSI RMSE/CRPS for more spread (spread-skill

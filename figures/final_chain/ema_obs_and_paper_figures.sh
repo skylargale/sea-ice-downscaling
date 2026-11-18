@@ -23,7 +23,7 @@ cd $O
 run_nb engressnet_obs_evaluation
 run_nb engressnet_inputs_and_ceiling
 cd $V6/figures
-# (sub-grid bar: build_cice_ceiling_bar.py was merged into figures/v2/make_v2_figures.py on 2026-11-15; set FINAL_SET there)
+# (sub-grid bar: build_cice_ceiling_bar.py was merged into figures/figures_v2/make_v2_figures.py on 2026-11-15; set FINAL_SET there)
 python -u build_fig7_final_piomas_application.py || echo "!!!!! fig7 application failed"
 python -u build_fig7_final_piomas_vs_icesat2.py || echo "!!!!! fig7 vs icesat2 failed"
 jupyter nbconvert --to notebook --execute --inplace --ExecutePreprocessor.kernel_name=seaice-downscaling \

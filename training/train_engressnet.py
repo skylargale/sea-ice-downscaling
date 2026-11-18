@@ -105,6 +105,10 @@ def parse_args():
     p.add_argument("--coarse-zero", action="store_true",
                    help="2026-10-23: at evaluation, set members to exactly 0 on ocean cells whose bilinear coarse SIT is exactly 0 "
                         "(the area-mean coarse input is 0 only where the high-res truth is 0). Training is unchanged. Off by default.")
+    p.add_argument("--coarse-zero-loss", action="store_true",
+                   help="Final round 2026-11 (paper section 3.2 test): also apply the coarse-zero rule in the training loss -- loss weight 0 "
+                        "on ocean cells whose bilinear coarse SIT is exactly 0, i.e. members there are treated as equal to the truth "
+                        "(which is <= 4e-5 m). Off by default.")
     # Evaluation
     p.add_argument("--k-eval", type=int, default=6, help="Ensemble size during evaluation.")
     p.add_argument("--eval-batch-size", type=int, default=16)
@@ -238,7 +242,8 @@ def main():
         random_days_exclude_years=fe.parse_years(args.random_days_exclude_years) if args.random_days_exclude_years else None,
     )
     # final-round sensitivity options: recorded only when set, so final-model run configs are unchanged
-    for key, default in (("land_threshold", 0.1), ("global_noise", False), ("encoder_depth", 4), ("attention_end", False)):
+    for key, default in (("land_threshold", 0.1), ("global_noise", False), ("encoder_depth", 4), ("attention_end", False),
+                         ("coarse_zero_loss", False)):
         if getattr(args, key) != default:
             setattr(config, key, getattr(args, key))
 

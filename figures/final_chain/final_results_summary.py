@@ -8,7 +8,7 @@ lr x10) against the separately trained deterministic U-Net (det-MSE) and bilinea
   Observations (ICESat-2 pass-cell means, 2018-2022, from observations/data/alongtrack_eval/):
     PIOMAS input (scoreboard.csv). The pooled-input rows (PIOMAS + CS2SMOS + TOPAZ4-ML) were removed 2026-10-24: their
     input-swap runs were deleted and they predate the coarse-zero rule.
-Writes figures/final_figures/final_results_table.csv and .md.
+Writes figures/figures_v1/final_results_table.csv and .md.
 """
 import glob
 import os
@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 
 V6 = "/glade/work/skygale/projects/SeaIceDownscaling"
-OUT = f"{V6}/figures/final_figures/final_results_table"
+OUT = f"{V6}/figures/figures_v1/final_results_table"
 # 2026-10-18: EngressNet (final) = 2026-10-07 configuration + EMA; det-MSE = matched det-MSE + EMA (seed 0)
 PERFECT = {("FOSI", "EngressNet (final)"): "FOSI_final_ema", ("FOSI", "det-MSE"): "FOSI_detmse_ema",
            ("MESACLIP", "EngressNet (final)"): "MESA_final_ema", ("MESACLIP", "det-MSE"): "MESA_detmse_ema"}
