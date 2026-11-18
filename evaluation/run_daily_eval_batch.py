@@ -69,7 +69,7 @@ def make_polar_proj(bbox, n=50):
 
 
 def style_polar_ax(ax, proj, boundary_path, bbox, candidate_points, lon_=None, lat_=None, pad_frac=0.001,
-                    points=None, point_color="red"):
+                    points=None, point_color="red", grid_labels=False, grid_label_size=9):
     lon_min = bbox["lon_min"] % 360
     lon_max = bbox["lon_max"] % 360
     ax.coastlines(resolution="50m")
@@ -92,7 +92,13 @@ def style_polar_ax(ax, proj, boundary_path, bbox, candidate_points, lon_=None, l
     for name, pt in points.items():
         ax.plot(pt["lon"], pt["lat"], marker="*", color=point_color, markersize=10, transform=ccrs.PlateCarree())
         ax.text(pt["lon"] + 1, pt["lat"], name, color=point_color, fontsize=7, transform=ccrs.PlateCarree())
-    ax.gridlines(draw_labels=False, linestyle="--", alpha=0.4)
+    if grid_labels:   # lat/lon labels around the frame (figures 2-3)
+        gl = ax.gridlines(draw_labels=True, x_inline=False, y_inline=False, linestyle="--", alpha=0.4,
+                          xlocs=np.arange(-180, 181, 10), ylocs=np.arange(50, 90, 5))
+        gl.top_labels = gl.right_labels = False   # longitudes along the bottom, latitudes on the left
+        gl.xlabel_style = gl.ylabel_style = {"size": grid_label_size}
+    else:
+        ax.gridlines(draw_labels=False, linestyle="--", alpha=0.4)
 
 
 def unweighted_pattern_corr(pred, truth):
