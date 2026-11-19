@@ -140,9 +140,9 @@ def show(*names, width=900):
 
 
 def panel_labels(axes, fontsize=None, start=0, prefix_titles=False):
-    """(A), (B), ... in the upper left of each axis, as a left-aligned title (prefix_titles: put it in front of the existing title)."""
+    """(a), (b), ... in the upper left of each axis, as a left-aligned title (prefix_titles: put it in front of the existing title)."""
     for i, ax in enumerate(axes):
-        lab = f"({chr(65 + start + i)})"
+        lab = f"({chr(97 + start + i)})"
         kw = {} if fontsize is None else {"fontsize": fontsize}
         if prefix_titles and ax.get_title():
             t = ax.get_title()
@@ -191,7 +191,7 @@ METHOD_COLORS = {
 
 MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 MANGANESE = ncp.pal_sample("Manganese_r", 5)   # (no longer used by the figures: methods use METHOD_COLORS)
-SODIUM = ncp.pal_sample("Sodium", 8)           # Figs. 6, 7, 9 and CRPS by regime
+SODIUM = ncp.pal_sample("Sodium", 8)           # Figs. 6, 7, 9 and CRPS by SIT type
 MAGNESIUM = ncp.pal_sample("Magnesium", 8)
 
 # %% [markdown]
@@ -200,7 +200,7 @@ MAGNESIUM = ncp.pal_sample("Magnesium", 8)
 # %%
 '''
 The summary data of the MESACLIP line and curve figures (domain-mean and community time series, Taylor, power spectra,
-rank histograms, spread-skill and CRPS by regime) are made by `build_figure_data.py` in this folder and saved in
+rank histograms, spread-skill and CRPS by SIT type) are made by `build_figure_data.py` and `evaluation/revisions/sit_type_metrics.py` and saved in
 `data_<FINAL_SET>/`, one CSV per figure input: EngressNet = the final model's run, deterministic = the det-MSE U-Net trained
 on the same days, both pooled over the 6 MESACLIP members per date; `sources.json` lists where each file came from. Run
 `python build_figure_data.py` once per model (`FINAL_SET=final1 python build_figure_data.py` for the submitted model) and
@@ -695,10 +695,10 @@ with matplotlib.rc_context(rc):
             for xi, vi in zip(xs, v):
                 ax.text(xi, vi, " " + fmt.format(vi), ha="center", va="bottom", fontsize=value_fontsize, color=INK, rotation=value_rotation)
         ax.set_xticks(x); ax.set_xticklabels(datasets)
-        ax.set_ylabel(ylabel); ax.grid(axis="x", visible=False)
+        ax.set_title(ylabel, loc="left"); ax.grid(axis="x", visible=False)   # quantity in the panel title, no y label
         lo, hi = ylim if ylim else (0, ax.get_ylim()[1])
         ax.set_ylim(lo, lo + (hi - lo) * headroom)
-    panel_labels(axs[:len(panels)], fontsize=panel_label_fontsize)
+    panel_labels(axs[:len(panels)], fontsize=panel_label_fontsize, prefix_titles=True)
     for ax in axs[len(panels):]:   # remove axes the panels don't use
         ax.remove()
     handles, labels = axs[0].get_legend_handles_labels()
@@ -827,11 +827,9 @@ bar_span, bar_fill = 0.8, 0.92
 value_fontsize, value_rotation, legend_fontsize = 10, 0, 14
 panel_label_fontsize = 14
 headroom = 1.22
-legend_ncols = 3
+legend_ncols = 1
 ideal_line = dict(color=INK, lw=2)          # ideal fraction outside, per bar
 ssr_line = dict(color=INK, lw=1, ls="--")   # spread-skill = 1
-footnote = ("† single prediction: CRPS = MAE. FSS of a single prediction uses its 0/1 exceedance field."
-            " Spread-skill and % outside: ensembles only.")
 outfile = "fig07_probabilistic_metrics.png"
 
 # --- data ---
@@ -862,18 +860,15 @@ with matplotlib.rc_context(rc):
         if row.startswith("Spread"):
             ax.axhline(1.0, **ssr_line)
         ax.set_xticks(x); ax.set_xticklabels(datasets)
-        ax.set_ylabel(ylabel); ax.grid(axis="x", visible=False)
+        ax.set_title(ylabel, loc="left"); ax.grid(axis="x", visible=False)   # quantity in the panel title, no y label
         lo, hi = ylim if ylim else (0, ax.get_ylim()[1])
         ax.set_ylim(lo, lo + (hi - lo) * headroom)
-    panel_labels(axs[:len(panels)], fontsize=panel_label_fontsize)
+    panel_labels(axs[:len(panels)], fontsize=panel_label_fontsize, prefix_titles=True)
     handles, labels = axs[0].get_legend_handles_labels()
     handles.append(plt.Line2D([], [], **ideal_line)); labels.append("Ideal 2/(K+1)")
-    # legend anchored just below the panels (fixed in figure coordinates), footnote under its drawn extent
-    leg = fig.legend(handles, labels, fontsize=legend_fontsize, frameon=False, loc="upper center", bbox_to_anchor=(0.5, 0.0),
-                     ncols=legend_ncols)
-    fig.canvas.draw()
-    leg_box = leg.get_window_extent().transformed(fig.transFigure.inverted())
-    fig.text(0.5, leg_box.y0 - 0.01, footnote, ha="center", va="top", fontsize=10, color=MUTED)
+    # legend anchored just below the panels (fixed in figure coordinates)
+    fig.legend(handles, labels, fontsize=legend_fontsize, frameon=False, loc="upper center", bbox_to_anchor=(0.5, 0.0),
+               ncols=legend_ncols)
     fig.savefig(out(outfile), dpi=300, bbox_inches="tight")
     plt.close(fig)
 show(outfile)
@@ -884,47 +879,46 @@ show(outfile)
 # %%
 # --- data ---
 rank_hist_df = pd.read_csv(os.path.join(FIG_DATA, "rank_histogram.csv"), index_col=0)
-rank_regime_df = pd.read_csv(os.path.join(FIG_DATA, "rank_histogram_by_regime.csv"), index_col=0)
-ss = pd.read_csv(os.path.join(FIG_DATA, "spread_skill_by_regime.csv"), index_col=0)
-ss = ss[ss["SIT regime"] != "All ocean cells"]
+rank_type_df = pd.read_csv(os.path.join(FIG_DATA, "rank_histogram_by_type.csv"), index_col=0)   # evaluation/revisions/sit_type_metrics.py
+ss = pd.read_csv(os.path.join(FIG_DATA, "spread_skill_by_type.csv"), index_col=0)
+ss = ss[ss["SIT type"] != "All ocean cells"]
 K = len(rank_hist_df) - 1
 expected_freq = rank_hist_df["expected_frequency"].iloc[0]
-regime_colors = [SODIUM[0], SODIUM[3], SODIUM[5], SODIUM[6]]   # open water, thin, moderate, thick
-regime_short = {"Open water/frazil (0-0.15 m)": "Open Water/Frazil", "Thin ice (0.15-0.5 m)": "Thin Ice",
-                "Moderate ice (0.5-1.0 m)": "Moderate Ice", "Thick ice (>1.0 m)": "Thick Ice"}
-bins = [b.replace(" (", "\n").replace(")", "") for b in ss["SIT regime"].tolist()]
+type_colors = [cmocean.cm.ice_r(v) for v in np.linspace(0.95, 0.3, 5)]   # thinnest (dark) -> thickest (light) SIT type
+bins = ss["SIT type"].tolist()   # (0.00-0.15], (0.15-0.70], (0.70-1.20], (1.20-3.00], >3.00 (m); grouped by ensemble-mean SIT
+type_xlabel = "SIT Type (m)"
 x = np.arange(len(bins))
 
 fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 10))
 
-# (A) rank histogram, all ocean cells
+# (a) rank histogram, all ocean cells
 ax1.bar(rank_hist_df["rank"], rank_hist_df["frequency"], width=0.85, color=SODIUM[3], alpha=0.85, label="Observed Frequency")
 ax1.axhline(expected_freq, color="black", linestyle="--", linewidth=2, label="Ideal Uniform Frequency")
 ax1.set_xlabel(f"Number of ensemble members below the truth (of {K})", fontsize=14)
 ax1.set_ylabel("Frequency", fontsize=14)
-ax1.set_title("(A) Rank Histogram (All Ocean Cells)", fontsize=16, loc="left")
+ax1.set_title("(a) Rank Histogram (All Ocean Cells)", fontsize=16, loc="left")
 ax1.tick_params(axis="both", labelsize=14)
 ax1.legend(fontsize=14, frameon=True, loc="lower left")
 ax1.set_xlim(-0.5, 20.5)
 ax1.set_ylim(0, 0.059)
 ax1.set_xticks([0, 5, 10, 15, 20])
 
-# (B) rank curves by SIT type
-total = rank_regime_df["count"].sum()
+# (b) rank curves by SIT type
+total = rank_type_df["count"].sum()
 ax2.axhline(1.0, color="black", linestyle="--", linewidth=2)
-for (label, grp), color in zip(rank_regime_df.groupby("SIT regime", sort=False), regime_colors):
+for (label, grp), color in zip(rank_type_df.groupby("SIT type", sort=False), type_colors):
     share = grp["count"].sum() / total
-    ax2.plot(grp["rank"], grp["relative_frequency"], linewidth=4, color=color, label=f"{regime_short.get(label, label)} ({share:.0%} of cells)")
+    ax2.plot(grp["rank"], grp["relative_frequency"], linewidth=4, color=color, label=f"{label} m ({share:.0%} of cells)" if share >= 0.01 else f"{label} m ({share:.1%} of cells)")
 ax2.set_xlabel(f"Number of ensemble members below the truth (of {K})", fontsize=14)
 ax2.set_ylabel("Relative to ideal (calibrated = 1)", fontsize=14)
-ax2.set_title("(B) Rank Curves by SIT Type", fontsize=16, loc="left")
+ax2.set_title("(b) Rank Curves by SIT Type", fontsize=16, loc="left")
 ax2.tick_params(axis="both", labelsize=14)
-ax2.legend(fontsize=14, frameon=False, loc="upper center")
+ax2.legend(fontsize=14, frameon=False, loc="lower left")
 ax2.set_xlim(0, 20)
-ax2.set_ylim(0.75, 1.25)
+ax2.set_ylim(0.6, 1.25)
 ax2.set_xticks([0, 5, 10, 15, 20])
 
-# (C) spread vs error by SIT type
+# (c) spread vs error by SIT type
 width = 0.35
 ax3.bar(x - width / 2, ss["RMS spread, (K+1)/K-corrected (m)"], width, color=SODIUM[3], label=r"Ensemble Spread ($\sqrt{\frac{K+1}{K}\,\overline{s^2}}$)")
 ax3.bar(x + width / 2, ss["RMSE (m)"], width, color=SODIUM[0], label="Ensemble-Mean RMSE")
@@ -932,19 +926,21 @@ ax3.set_xticks(x)
 ax3.set_xticklabels(bins)
 ax3.tick_params(axis="both", labelsize=14)
 ax3.set_ylabel("Sea ice thickness (m)", fontsize=14)
-ax3.set_title("(C) Spread vs. Error by SIT Type", fontsize=16, loc="left")
+ax3.set_xlabel(type_xlabel, fontsize=14)
+ax3.set_title("(c) Spread vs. Error by SIT Type", fontsize=16, loc="left")
 ax3.legend(fontsize=14, frameon=False, loc="upper left")
-ax3.set_yticks([0, 0.05, 0.1, 0.15, 0.2])
-ax3.set_yticklabels(["0", "0.05", "0.1", "0.15", "0.2"])
+ax3.set_yticks(np.arange(0, 0.351, 0.05))
+ax3.set_yticklabels(["0", "0.05", "0.1", "0.15", "0.2", "0.25", "0.3", "0.35"])
 
-# (D) spread-skill ratio by SIT type
+# (d) spread-skill ratio by SIT type
 ax4.bar(x, ss["Spread-skill ratio (1.0 = calibrated)"], color=SODIUM[5], alpha=0.85)
 ax4.axhline(1.0, color="black", linestyle="--", linewidth=2, label="Perfect Calibration")
 ax4.set_xticks(x)
 ax4.set_xticklabels(bins)
 ax4.tick_params(axis="both", labelsize=14)
 ax4.set_ylabel("Spread-Skill Ratio", fontsize=14)
-ax4.set_title("(D) Spread-Skill Ratio by SIT Type", fontsize=16, loc="left")
+ax4.set_xlabel(type_xlabel, fontsize=14)
+ax4.set_title("(d) Spread-Skill Ratio by SIT Type", fontsize=16, loc="left")
 ax4.legend(fontsize=14, frameon=False, loc="upper right")
 ax4.set_yticks([0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0])
 ax4.set_yticklabels(["0", "0.25", "0.5", "0.75", "1.0", "1.25", "1.5", "1.75", "2.0"])
@@ -963,9 +959,9 @@ rc = {"font.size": 12, "axes.spines.top": False, "axes.spines.right": False, "ax
       "axes.grid": True, "grid.color": "#e6e5e0", "grid.linewidth": 0.6, "axes.axisbelow": True, "legend.frameon": False}
 figsize = (14, 5)
 columns = [  # (setting, dataset, region, column title)
-    ("perfect model 2021", "MESACLIP", "all ocean", "(A) MESACLIP (Perfect Model)"),
-    ("perfect model 2021", "FOSI", "all ocean", "(B) FOSI (Perfect Model)"),
-    ("ICESat-2 testbed", "FOSI on PIOMAS", "Table 5 pass-cells", "(C) ICESat-2 Testbed"),
+    ("perfect model 2021", "MESACLIP", "all ocean", "(a) MESACLIP (Perfect Model)"),
+    ("perfect model 2021", "FOSI", "all ocean", "(b) FOSI (Perfect Model)"),
+    ("ICESat-2 testbed", "FOSI on PIOMAS", "Table 5 pass-cells", "(c) ICESat-2 Testbed"),
 ]
 thresholds = [0.15]
 methods = ["Bilinear", "Deterministic U-Net", "EngressNet", "Seed/window ensemble (det.)"]
@@ -1339,11 +1335,11 @@ figsize = (16, 7.5)
 panels = [  # (metric column, y label, value format, y limits or None)
     ("RMSE", "RMSE (m)", "{:.3f}", None),
     ("MAE", "MAE (m)", "{:.3f}", None),
-    ("Pattern Corr", "Pattern correlation (r)", "{:.3f}", (0.8, 1.0)),
+    ("Pattern Corr", "Pattern Correlation (r)", "{:.3f}", (0.8, 1.0)),
     ("Grad MAE", "Gradient MAE (m)", "{:.4f}", None),
     ("SSIM", "SSIM", "{:.3f}", (0.8, 1.0)),
     ("IIEE (0.15 m)", "IIEE, 0.15 m threshold", "{:.3f}", None),
-    ("ACC", "Anomaly correlation", "{:.3f}", (0.6, 1.0)),
+    ("ACC", "Anomaly Correlation", "{:.3f}", (0.6, 1.0)),
 ]
 methods = ["Bilinear", "Deterministic U-Net", "EngressNet", "Seed/window ensemble (det.)"]
 LEGEND_LABELS = {"EngressNet": "EngressNet Ensemble Mean", "Seed/window ensemble (det.)": "Seed-Ensemble Mean (10 det. U-Nets)"}
@@ -1370,10 +1366,10 @@ with matplotlib.rc_context(rc):
             for xi, vi in zip(xs, v):
                 ax.text(xi, vi, " " + fmt.format(vi), ha="center", va="bottom", fontsize=value_fontsize, color=INK, rotation=value_rotation)
         ax.set_xticks(x); ax.set_xticklabels(datasets)
-        ax.set_ylabel(ylabel); ax.grid(axis="x", visible=False)
+        ax.set_title(ylabel, loc="left"); ax.grid(axis="x", visible=False)   # quantity in the panel title, no y label
         lo, hi = ylim if ylim else (0, ax.get_ylim()[1])
         ax.set_ylim(lo, lo + (hi - lo) * headroom)
-    panel_labels(axs[:len(panels)], fontsize=panel_label_fontsize)
+    panel_labels(axs[:len(panels)], fontsize=panel_label_fontsize, prefix_titles=True)
     for ax in axs[len(panels):]:   # remove axes the panels don't use
         ax.remove()
     handles, labels = axs[0].get_legend_handles_labels()
@@ -1466,7 +1462,7 @@ for ax, name in zip(np.atleast_1d(axs), points_to_plot):
     ax.set_yticks([-0.2, 0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2], labels=["-0.2", "0.0", "0.2", "0.4", "0.6", "0.8", "1.0", "1.2"])
     ax.set_ylabel("Pred - Truth SIT (m)")
     if name == "Point Hope":
-        ax.legend(fontsize=12, loc="upper center", ncols=2, frameon=True)
+        ax.legend(fontsize=12, loc="upper right", ncols=2, frameon=True)
 panel_labels(np.atleast_1d(axs), prefix_titles=True)
 fig.autofmt_xdate()
 fig.tight_layout()
@@ -1490,7 +1486,7 @@ for ax, (title, field) in zip(axs, (("Bilinear", M.bilinear), ("Deterministic", 
     im = ax.pcolormesh(M.lon, M.lat, corr, transform=ccrs.PlateCarree(), cmap="RdBu_r", vmin=0, vmax=1, shading="auto")
     polar_frame(M, ax, M.lon, M.lat)
     ax.set_title(title, fontsize=18)
-cbar = fig.colorbar(im, ax=axs, aspect=35, shrink=0.9, pad=0.02)
+cbar = fig.colorbar(im, ax=axs, aspect=25, shrink=0.9, pad=0.02)
 cbar.set_label("Temporal Correlation to Truth (March)", fontsize=14)
 cbar.ax.tick_params(labelsize=14)
 bump_fonts(fig)
@@ -1517,10 +1513,10 @@ for col, (title, field) in enumerate((("Bilinear", M.bilinear), ("Deterministic"
     im1 = axs[1, col].pcolormesh(M.lon, M.lat, np.where(M.land, np.nan, f.std(axis=0) / safe_std), transform=ccrs.PlateCarree(),
                                  cmap="RdBu_r", norm=TwoSlopeNorm(vcenter=1, vmin=0, vmax=2), shading="auto")
     polar_frame(M, axs[1, col], M.lon, M.lat)
-cbar1 = fig.colorbar(im0, ax=axs[0, :], aspect=35, shrink=0.8, pad=0.02)
+cbar1 = fig.colorbar(im0, ax=axs[0, :], aspect=25, shrink=0.8, pad=0.02)
 cbar1.set_label("Time-mean Bias (m)", fontsize=14)
 cbar1.ax.tick_params(labelsize=14)
-cbar2 = fig.colorbar(im1, ax=axs[1, :], aspect=35, shrink=0.8, pad=0.02)
+cbar2 = fig.colorbar(im1, ax=axs[1, :], aspect=25, shrink=0.8, pad=0.02)
 cbar2.set_label("Pred/Truth", fontsize=14)
 cbar2.ax.tick_params(labelsize=14)
 bump_fonts(fig)
@@ -1570,7 +1566,7 @@ for ax, (title, field) in zip(axs, (("Bilinear", M.bilinear), ("Deterministic", 
     im = ax.pcolormesh(M.lon, M.lat, acc, transform=ccrs.PlateCarree(), cmap="RdBu_r", vmin=-1, vmax=1, shading="auto")
     polar_frame(M, ax, M.lon, M.lat)
     ax.set_title(title, fontsize=18)
-cbar = fig.colorbar(im, ax=axs, aspect=35, shrink=0.9, pad=0.02)
+cbar = fig.colorbar(im, ax=axs, aspect=25, shrink=0.9, pad=0.02)
 cbar.set_label("Anomaly Correlation", fontsize=14)
 cbar.ax.tick_params(labelsize=14)
 bump_fonts(fig)
@@ -1644,6 +1640,38 @@ plt.close(fig)
 show("supplementary/domain_mean_psd.png")
 
 # %% [markdown]
+# ### Figure S9b: Domain power spectra on single days (1 Jan, 1 Apr, 11 Nov 2021)
+#
+# As S9 but for three single days instead of the 2021 annual mean. Data: `data_<FINAL_SET>/psd_dates.csv` (`evaluation/revisions/psd_dates.py`).
+
+# %%
+psdd = pd.read_csv(os.path.join(FIG_DATA, "psd_dates.csv"), parse_dates=["date"])
+dates = list(psdd["date"].drop_duplicates())
+fig, axs = plt.subplots(1, len(dates), figsize=(6 * len(dates), 4.5), sharey=True)
+for ax, d in zip(axs, dates):
+    sub = psdd[psdd["date"] == d]
+    k = sub["wavenumber_cycles_per_km"].values
+    for label, col, color, ls, lw in [("Truth", "Truth", "k", "-", 2),
+                                      ("EngressNet Ensemble Mean", "Stochastic UNet Mean", METHOD_COLORS["EngressNet"], "-", 1.5),
+                                      ("Deterministic", "Deterministic UNet", METHOD_COLORS["Deterministic U-Net"], "-", 1.5),
+                                      ("Bilinear", "Bilinear", METHOD_COLORS["Bilinear"], "-", 1.5),
+                                      ("PIOMAS", "PIOMAS (obs)", "k", "--", 1.5)]:
+        valid = (k > 0) & (sub[col].values > 0)
+        ax.plot(1 / k[valid], 1 / sub[col].values[valid], label=label, color=color, ls=ls, lw=lw)
+    ax.set_xscale("log"); ax.set_yscale("log")
+    ax.set_xlabel("Wavelength (km)")
+    ax.set_title(f"{d:%-d %B %Y}", loc="left")
+    ax.grid(True, which="both", alpha=0.2)
+axs[0].set_ylabel("PSD")
+axs[0].legend(fontsize=10, ncols=2, loc="upper right")
+panel_labels(axs, prefix_titles=True)
+fig.tight_layout()
+bump_fonts(fig)
+fig.savefig(out("supplementary/domain_mean_psd_dates.png"), dpi=300, bbox_inches="tight")
+plt.close(fig)
+show("supplementary/domain_mean_psd_dates.png")
+
+# %% [markdown]
 # ### Figure S10: Per-member power-spectrum spread
 
 # %%
@@ -1674,26 +1702,27 @@ plt.close(fig)
 show("supplementary/per_member_psd_spread.png")
 
 # %% [markdown]
-# ### Figure S11: CRPS by SIT regime
+# ### Figure S11: CRPS by SIT type
 
 # %%
-crps_df = pd.read_csv(os.path.join(FIG_DATA, "crps_by_regime.csv"), index_col=0)
+crps_df = pd.read_csv(os.path.join(FIG_DATA, "crps_by_type.csv"), index_col=0)   # evaluation/revisions/sit_type_metrics.py (grouped by true SIT)
 rows = crps_df.iloc[1:]
 fig, ax = plt.subplots(figsize=(8, 6))
 ax.bar(np.arange(len(rows)), rows["CRPS (m)"], color=SODIUM[3], alpha=0.85)
 ax.axhline(crps_df.iloc[0]["CRPS (m)"], color="black", linestyle="--", linewidth=2,
            label=f"Domain-mean CRPS ({crps_df.iloc[0]['CRPS (m)']:.2f} m)")
 ax.set_xticks(np.arange(len(rows)))
-ax.set_xticklabels([r.replace(" (", "\n").replace(")", "") for r in rows["SIT regime"]], fontsize=12)
+ax.set_xticklabels(rows["SIT type"], fontsize=12)
+ax.set_xlabel("SIT Type (m)", fontsize=14)
 ax.set_ylabel("CRPS (m)", fontsize=14)
-ax.set_title("CRPS by SIT Regime (test=2021)", fontsize=14)
+ax.set_title("CRPS by SIT Type (test=2021)", fontsize=14)
 ax.legend(fontsize=12, frameon=False)
 ax.tick_params(axis="both", labelsize=12)
 fig.tight_layout()
 bump_fonts(fig)
-fig.savefig(out("supplementary/crps_regime.png"), dpi=300, bbox_inches="tight")
+fig.savefig(out("supplementary/crps_type.png"), dpi=300, bbox_inches="tight")
 plt.close(fig)
-show("supplementary/crps_regime.png")
+show("supplementary/crps_type.png")
 
 # %% [markdown]
 # ### Figure S12: Sub-grid variability bar (ICESat-2 vs CICE truths vs downscaled PIOMAS)

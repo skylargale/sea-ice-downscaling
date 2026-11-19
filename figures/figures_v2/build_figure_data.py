@@ -64,9 +64,8 @@ def main():
         print(f"  {name}.csv  ({how})")
 
     # EngressNet-only quantities: unchanged
-    for src, name in (("13b_psd_per_member_spread_data", "psd_member_spread"), ("14_rank_histogram_data", "rank_histogram"),
-                      ("14b_rank_histogram_by_regime_data", "rank_histogram_by_regime"),
-                      ("15_spread_skill_by_regime_data", "spread_skill_by_regime"), ("16_crps_by_regime_data", "crps_by_regime")):
+    # (rank histogram / spread-skill / CRPS by SIT type: evaluation/revisions/sit_type_metrics.py, five types, 2026-11-19)
+    for src, name in (("13b_psd_per_member_spread_data", "psd_member_spread"), ("14_rank_histogram_data", "rank_histogram")):
         shutil.copy2(os.path.join(ENG_SUMMARY, f"{src}_4window.csv"), os.path.join(OUT, f"{name}.csv"))  # exact copy
         written[f"{name}.csv"] = f"EngressNet summary {src}_4window.csv (copied unchanged)"
         print(f"  {name}.csv  ({written[f'{name}.csv']})")

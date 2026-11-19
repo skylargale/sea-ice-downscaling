@@ -12,4 +12,4 @@
 module load conda
 conda activate seaice-downscaling
 cd /glade/work/skygale/projects/SeaIceDownscaling/figures/figures_v2
-python -u build_figure_data.py && python -u make_v2_figures.py && echo "FIGURES DONE $(date)" || echo "!!!!! figures failed"
+python -u build_figure_data.py && (cd ../.. && python -u evaluation/revisions/sit_type_metrics.py && python -u evaluation/revisions/psd_dates.py) && python -u make_v2_figures.py && echo "FIGURES DONE $(date)" || echo "!!!!! figures failed"
